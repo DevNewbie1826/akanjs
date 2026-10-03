@@ -62,14 +62,26 @@ export async function exec(cmd: string[], options: ExecOptions = {}): Promise<Ex
   const signal = signals.getStore();
   // Inside an API call there is no terminal: streamed output becomes tool lines of the caller's log.
   const stream = options.inherit && isTerminal() ? "inherit" : "pipe";
+  // A process group of its own, killed whole: dash (Linux's /bin/sh) forks a `sh -c` command instead of
+  // exec'ing it, so killing the shell alone leaves the command running and holding the output pipes.
+  const group = !!signal && process.platform !== "win32";
   const proc = Bun.spawn(cmd, {
     cwd: options.cwd,
     env: options.env ? { ...process.env, ...options.env } : process.env,
     stdin: "ignore",
     stdout: stream,
     stderr: stream,
-    ...(signal ? { signal } : {}),
+    ...(group ? { detached: true } : signal ? { signal } : {}),
   });
+  const killGroup = () => {
+    try {
+      process.kill(-proc.pid, "SIGTERM");
+    } catch {
+      // the group already exited
+    }
+  };
+  if (group && signal) signal.addEventListener("abort", killGroup, { once: true });
+  void proc.exited.finally(() => signal?.removeEventListener("abort", killGroup));
   let stdout = "";
   let stderr = "";
   if (options.inherit && stream === "pipe") {

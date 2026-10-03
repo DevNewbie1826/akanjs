@@ -1,5 +1,5 @@
 import { afterEach, beforeAll, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { CodeAgent } from "@akanjs/devkit/codeAgent";
@@ -807,14 +807,20 @@ describe("CodeTui", () => {
   });
 
   test("an @ token completes a file in the repo", async () => {
-    const harness = mount(`${import.meta.dir}/../../../..`);
+    //? A repo of its own: CI unpacks the workspace from a tarball without `.git`, so the checkout lists nothing.
+    const root = mkdtempSync(path.join(tmpdir(), "akan-tui-files-"));
+    mkdirSync(path.join(root, "pkgs/cli/code"), { recursive: true });
+    writeFileSync(path.join(root, "pkgs/cli/code/CodeTuiFiles.ts"), "");
+    Bun.spawnSync(["git", "init", "--quiet"], { cwd: root });
+    const harness = mount(root);
     await settle();
     await harness.press("read @codeTuiFiles");
     await settle();
     const frame = harness.stdout.lastFrame;
-    expect(frame).toContain("@pkgs/@akanjs/cli/code/CodeTuiFiles.ts");
+    expect(frame).toContain("@pkgs/cli/code/CodeTuiFiles.ts");
     await harness.press("\t");
-    expect(harness.stdout.lastFrame).toContain("› read @pkgs/@akanjs/cli/code/CodeTuiFiles.ts");
+    expect(harness.stdout.lastFrame).toContain("› read @pkgs/cli/code/CodeTuiFiles.ts");
+    rmSync(root, { recursive: true, force: true });
   });
 
   test("the banner names the session at the top and survives what clears the conversation", async () => {

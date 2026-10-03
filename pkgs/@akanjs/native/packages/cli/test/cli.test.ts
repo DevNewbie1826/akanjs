@@ -200,7 +200,8 @@ describe("init script", () => {
 });
 
 describe("toPlist", () => {
-  test("writes a valid plist that plutil accepts", async () => {
+  //? plutil ships with macOS only.
+  test.skipIf(process.platform !== "darwin")("writes a valid plist that plutil accepts", async () => {
     const { toPlist } = await import("../src/lib/plist.ts");
     const text = toPlist({
       CFBundleName: "A & <B>",

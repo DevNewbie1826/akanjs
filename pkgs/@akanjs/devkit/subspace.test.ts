@@ -10,7 +10,16 @@ import { isolateEnv, tempDirs, writeText as write } from "./testHelpers";
 //? Each case drives several real git clones and pushes; on a 4-core Windows VM that alone lands at 2-5s.
 setDefaultTimeout(20_000);
 
-isolateEnv({ AKAN_PUBLIC_REPO_NAME: "workspace", AKAN_PUBLIC_SERVE_DOMAIN: "example.com", AKAN_PUBLIC_ENV: "local" });
+//? Subspace commits in its clone with the host's identity, and a CI host has none configured.
+isolateEnv({
+  AKAN_PUBLIC_REPO_NAME: "workspace",
+  AKAN_PUBLIC_SERVE_DOMAIN: "example.com",
+  AKAN_PUBLIC_ENV: "local",
+  GIT_AUTHOR_NAME: "t",
+  GIT_AUTHOR_EMAIL: "t@t",
+  GIT_COMMITTER_NAME: "t",
+  GIT_COMMITTER_EMAIL: "t@t",
+});
 const makeTempRoot = tempDirs("akan-subspace-");
 
 const git = async (cwd: string, args: string[]) =>

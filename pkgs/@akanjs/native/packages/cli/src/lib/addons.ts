@@ -77,7 +77,8 @@ function listFiles(dir: string): string[] {
   if (!existsSync(dir)) return [];
   return (readdirSync(dir, { recursive: true }) as string[])
     .map((file) => join(dir, file))
-    .filter((file) => statSync(file).isFile());
+    .filter((file) => statSync(file).isFile())
+    .sort((a, b) => a.localeCompare(b));
 }
 
 /** The folder of the package a file belongs to: the deepest node_modules/<name> (or <@scope>/<name>) above it. */

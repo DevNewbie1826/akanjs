@@ -269,6 +269,8 @@ export const dictionary = serviceDictionary(["en", "ko"])
         // The dev-plan/hmr assertions match verbose-level lines.
         AKAN_PUBLIC_LOG_LEVEL: "verbose",
         NODE_NO_WARNINGS: "1",
+        //? CI's `.env` names the branch; any env but local makes `akan start` ssh-tunnel to that cluster's Redis.
+        AKAN_PUBLIC_ENV: "local",
         PORT_OFFSET: String(offset),
         // Pinned: `getDevPort()` derives from the fixture's index in `apps/`, which parallel runs keep moving.
         AKAN_DEV_PORT: String(port),

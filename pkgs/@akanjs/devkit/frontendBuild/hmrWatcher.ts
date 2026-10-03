@@ -61,6 +61,12 @@ export class HmrWatcher {
           const abs = path.resolve(root, filename.toString());
           this.#queue(abs);
         });
+        //? Linux emits an unreadable subdirectory as an async EPERM error event, which throws when unhandled.
+        //? The coverage-gap scan already warns about it, so only other errors are worth a warning here.
+        w.on("error", (err: NodeJS.ErrnoException) => {
+          if (err.code === "EACCES" || err.code === "EPERM") this.#logger.verbose(`[hmr] ${err.message}`);
+          else this.#logger.warn(`[hmr] watcher error under ${root}: ${err.message}`);
+        });
         this.#watchers.push(w);
         this.#logger.verbose(`[hmr] watching ${root}`);
       } catch (err) {

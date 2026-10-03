@@ -346,9 +346,12 @@ describe("desktop implementation (the shell's notify.* ops)", () => {
     const delivered = new Map<string, NativeRequest>();
     const native = new Map<string, (e: NativeEvent) => void>();
     const plugin = createDesktopNotifications();
+    const appDataDir = join(mkdtempSync(join(tmpdir(), "akan-native-ln-")), "data");
+    // What every notify.* op carries besides its own arguments: off macOS, the shell's pending-notification store.
+    const target = { app, ...(process.platform === "darwin" ? {} : { store: join(appDataDir, "notifications.json") }) };
     const dispatcher = createDispatcher([plugin], {
       app: { id: "dev.test", name: "Test", version: "1.0.0", build: 1 },
-      appDataDir: join(mkdtempSync(join(tmpdir(), "akan-native-ln-")), "data"),
+      appDataDir,
       emit: (_window, { event, data }) => emitted.push({ event, data }),
       registerFile: () => ({ url: "", mime: "", size: 0 }),
       onNativeEvent: (type, listener) => {
@@ -421,11 +424,11 @@ describe("desktop implementation (the shell's notify.* ops)", () => {
       if (!r.every) pending.delete(id);
       return r;
     };
-    return { ops, emitted, call, native, deliver, delivered };
+    return { ops, emitted, call, native, deliver, delivered, target };
   }
 
   test("schedule → pending → cancel, the iOS layout (id, data as JSON text, repeat)", async () => {
-    const { ops, call } = setup();
+    const { ops, call, target } = setup();
     const at = Date.now() + 60_000;
     const res = await call("schedule", {
       notifications: [
@@ -439,7 +442,7 @@ describe("desktop implementation (the shell's notify.* ops)", () => {
         { id: 1, title: "T", body: "b", at, data: '{"k":[1]}' },
         { id: 2, title: "R", body: "", at, every: "minute" },
       ],
-      app,
+      ...target,
     });
     // Other requests of the app (no marker) are not listed; a repeat reports its next date.
     expect(await call("getPending")).toMatchObject({
@@ -452,7 +455,7 @@ describe("desktop implementation (the shell's notify.* ops)", () => {
     });
     await call("cancel", { ids: [1, 2] });
     expect(await call("getPending")).toMatchObject({ result: { notifications: [] } });
-    expect(ops.find((o) => o.op === "notify.removePending")!.args).toEqual({ ids: ["1", "2"], app });
+    expect(ops.find((o) => o.op === "notify.removePending")!.args).toEqual({ ids: ["1", "2"], ...target });
   });
 
   test("received, and actions buffered until the page listens (C2)", async () => {
@@ -479,7 +482,7 @@ describe("desktop implementation (the shell's notify.* ops)", () => {
   });
 
   test("permission states; schedule without permission is PERMISSION_DENIED; bad arguments", async () => {
-    const { call, ops } = setup(0);
+    const { call, ops, target } = setup(0);
     expect(await call("checkPermission")).toMatchObject({ result: { display: "prompt" } });
     expect(await call("schedule", { notifications: [{ id: 1, title: "T", at: "tomorrow" }] })).toMatchObject({
       ok: false,
@@ -494,8 +497,8 @@ describe("desktop implementation (the shell's notify.* ops)", () => {
     expect(await call("requestPermission")).toMatchObject({ result: { display: "granted" } });
     expect(await call("requestPermission")).toMatchObject({ result: { display: "granted" } });
     expect(ops.filter((o) => o.op === "notify.request").map((o) => o.args)).toEqual([
-      { provisional: true, app },
-      { provisional: false, app },
+      { provisional: true, ...target },
+      { provisional: false, ...target },
     ]);
     expect(permissionState(1)).toBe("denied");
   });
