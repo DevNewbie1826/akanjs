@@ -1,0 +1,39 @@
+import type { McpPromptArgument } from "./mcpProtocol";
+
+export interface PagePromptEntry {
+  name: string;
+  description: string;
+  arguments: McpPromptArgument[];
+  /** The matched route pattern, e.g. `/:lang/project/:projectId`. */
+  pattern: string;
+}
+
+export interface PagePromptRecord {
+  key: string;
+  args: Record<string, unknown>;
+  returns: { refName: string; modelType?: string; arrDepth?: number; nullable?: boolean };
+  value?: unknown;
+  error?: string;
+}
+
+/** `forbidden` is a data call inside the body refused with 401/403: the screen is not this caller's, like a redirect. */
+export type PagePromptRefusal = "unknown" | "argument" | "redirect" | "forbidden" | "not-found" | "error";
+
+export type PagePromptRun =
+  | { ok: true; url: string; records: PagePromptRecord[] }
+  | { ok: false; reason: PagePromptRefusal; message: string };
+
+export interface PagePromptRunInput {
+  name: string;
+  /** `prompts/get` sends a flat string map; the page's own declaration types each value. */
+  arguments: Record<string, string>;
+  headers: [string, string][];
+  /** The synthetic URL's locale segment, which the route needs whether or not the page reads it. */
+  language?: string;
+}
+
+/** Pages live in the RSC worker, a process apart from the one serving `/mcp`, so the router reaches them through this. */
+export interface PagePromptSource {
+  list(): Promise<PagePromptEntry[]>;
+  run(input: PagePromptRunInput): Promise<PagePromptRun>;
+}

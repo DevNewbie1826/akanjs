@@ -1,31 +1,29 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { CommandContainer } from "@akanjs/devkit/commandDecorators";
 import { ModuleExecutor } from "@akanjs/devkit/executors";
-import { cleanupCliTempWorkspace, createCallRecorder, createTempModule } from "../testHelpers";
+import { createCallRecorder, createTempModule, tempRoots } from "@akanjs/devkit/testHelpers";
 import { ModuleRunner } from "./module.runner";
 import { ModuleScript } from "./module.script";
 
-const tempRoots: string[] = [];
-
-afterEach(async () => {
-  CommandContainer.clear();
-  await Promise.all(tempRoots.splice(0).map((root) => cleanupCliTempWorkspace(root)));
-});
+afterEach(() => CommandContainer.clear());
+const track = tempRoots();
 
 describe("ModuleRunner", () => {
   test("creates full module template files in the target module directory", async () => {
-    const { root, module } = await createTempModule("post");
-    tempRoots.push(root);
+    const { module } = track(await createTempModule("post"));
     const runner = new ModuleRunner();
 
     const files = await runner.createModuleTemplate(module);
 
     expect(files.abstract.filename).toBe("post.abstract.md");
-    expect(files.abstract.content).toContain("Post Module Abstract");
+    expect(files.abstract.content).toContain("# post Abstract");
     expect(files.abstract.content).toContain("Post represents post records managed by the app.");
-    expect(files.abstract.content).toContain("Post (Post) is the primary business concept");
-    expect(files.abstract.content).toContain("No lifecycle workflow yet.");
-    expect(files.abstract.content).not.toContain("Describe the business concept");
+    expect(files.abstract.content).toContain("## Rules");
+    expect(files.abstract.content).not.toContain("## Purpose");
+    expect(files.abstract.content).toContain("nobody creates, updates or removes one until the slice names a guard");
+    expect(files.signal.content).toContain("root: None, get: Public, cru: None");
+    expect(files.signal.content).toContain("init({ guards: [Public] })");
+    expect(files.signal.content).not.toContain("@libs/shared/srvkit");
     expect(files.constant.filename).toBe("post.constant.ts");
     expect(files.constant.content).not.toContain("field: field(String).optional()");
     expect(files.dictionary.filename).toBe("post.dictionary.ts");
@@ -42,16 +40,29 @@ describe("ModuleRunner", () => {
     expect(await Bun.file(`${module.cwdPath}/Post.View.tsx`).exists()).toBe(true);
   });
 
+  test("guards the scaffolded slice with libs/shared's Admin when the system mounts it", async () => {
+    const { app, module } = track(await createTempModule("post"));
+    await app.writeFile("lib/srv.ts", 'export * as shared from "@libs/shared/lib/srv";\n');
+
+    const files = await new ModuleRunner().createModuleTemplate(module);
+
+    expect(files.signal.content).toContain('import { Admin } from "@libs/shared/srvkit";');
+    expect(files.signal.content).toContain("root: Admin, get: Public, cru: Admin");
+    expect(files.signal.content).not.toContain("None");
+    expect(files.abstract.content).toContain("only an admin creates, updates or removes one");
+  });
+
   test("creates service module template files without database files", async () => {
-    const { root, app } = await createTempModule("unused");
-    tempRoots.push(root);
+    const { app } = track(await createTempModule("unused"));
     const service = ModuleExecutor.from(app, "_localBuild");
     const runner = new ModuleRunner();
 
     const files = await runner.createService(service);
 
     expect(files.abstract.filename).toBe("localBuild.abstract.md");
-    expect(files.abstract.content).toContain("Service Abstract");
+    expect(files.abstract.content).toStartWith("# localBuild Service Abstract\n");
+    expect(files.abstract.content).toContain("## Rules");
+    expect(files.abstract.content).not.toContain("## Agent Notes");
     expect(files.service.filename).toBe("localBuild.service.ts");
     expect(files.service.content).toContain('serve("localBuild" as const');
     expect(files.signal.content).toContain("LocalBuildEndpoint");
@@ -65,8 +76,7 @@ describe("ModuleRunner", () => {
   });
 
   test("creates individual component templates through the parent system", async () => {
-    const { root, module } = await createTempModule("comment");
-    tempRoots.push(root);
+    const { module } = track(await createTempModule("comment"));
     const runner = new ModuleRunner();
 
     const { component } = await runner.createComponentTemplate(module, "view");

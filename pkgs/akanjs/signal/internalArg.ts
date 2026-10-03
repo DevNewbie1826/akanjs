@@ -6,14 +6,12 @@ export interface InternalArg<ArgType = unknown> {
 }
 export type InternalArgCls<ArgType = unknown> = Cls<InternalArg<ArgType>>;
 
-/** Injects the current Bun request into an endpoint/internal handler. */
 export class Req implements InternalArg {
   getArg(context: SignalContext): Bun.BunRequest {
     const httpContext = context.getHttpContext();
     return httpContext.req;
   }
 }
-/** Injects the current mutable response context into an endpoint/internal handler. */
 export class Res implements InternalArg {
   getArg(context: SignalContext) {
     const httpContext = context.getHttpContext();
@@ -21,15 +19,31 @@ export class Res implements InternalArg {
   }
 }
 
-/** Injects websocket state and subscription hooks into message/pubsub handlers. */
+/** Whatever the account middleware resolved for this call, or `null` for an anonymous one. */
+export class CallerAccount implements InternalArg<unknown> {
+  getArg(context: SignalContext): unknown {
+    return context.get("account") ?? null;
+  }
+}
+
+/** The caller's IP as the nearest proxy recorded it (see `SignalContext.getClientIp`), `null` when unknown. */
+export class Ip implements InternalArg<string | null> {
+  getArg(context: SignalContext): string | null {
+    return context.getClientIp();
+  }
+}
+
+/**
+ * `socketId` is the one minted at the handshake — never mint your own, it would not match the room bookkeeping.
+ * `on`/`off` register cleanup for unsubscribe or socket close.
+ */
 export class Ws implements InternalArg {
-  onDisconnect?: () => void;
-  onUnsubscribe?: () => void;
   getArg(context: SignalContext) {
-    const webSocketContext = context.getWebSocketContext();
+    const webSocketContext = context.getWebSocketContext<{ socketId: string }>();
     const ws = webSocketContext.ws;
     return {
       ws,
+      socketId: ws.data.socketId,
       subscribe: webSocketContext.eventType === "subscribe",
       on: webSocketContext.on,
       off: webSocketContext.off,

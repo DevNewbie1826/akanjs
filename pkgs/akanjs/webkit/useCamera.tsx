@@ -1,104 +1,108 @@
 "use client";
-import { Device, isMobileDevice } from "akanjs/client";
-import { type CapacitorPermissionState, loadCapacitorCamera } from "akanjs/client/capacitor";
+import { Translator } from "akanjs/client";
+import {
+  AkanNativeError,
+  dialog,
+  fileBlob,
+  isNativeApp,
+  loadCamera,
+  opener,
+  type Photo,
+  releaseFile,
+} from "akanjs/client/native";
+import { parseAkanI18nEnv } from "akanjs/common";
 import { useEffect, useState } from "react";
 
-type PermissionStatus = {
-  camera: CapacitorPermissionState;
-  photos: CapacitorPermissionState;
+type PermissionState = "granted" | "denied" | "prompt";
+
+/** The four strings the camera-or-library sheet shows. Omitted ones come from the `base` dictionary. */
+export interface CameraPromptLabels {
+  header?: string;
+  photo?: string;
+  picture?: string;
+  cancel?: string;
+}
+
+// The OS draws the sheet from these strings, so they are translated here: there is no render to call `l()` in.
+const promptLabel = (key: string, override?: string) =>
+  override ?? Translator.translateByLocale(Translator.getActiveLocale() ?? parseAkanI18nEnv().defaultLocale, key);
+
+const toBase64 = (bytes: Uint8Array) => {
+  let binary = "";
+  for (let at = 0; at < bytes.length; at += 0x8000) binary += String.fromCharCode(...bytes.subarray(at, at + 0x8000));
+  return btoa(binary);
 };
 
-/** Capacitor camera/photos hook with permission checks and app-settings fallback. */
-export const useCamera = () => {
-  const [permissions, setPermissions] = useState<PermissionStatus>({ camera: "prompt", photos: "prompt" });
+//* The runtime serves a photo from memory until it is released, so it is read once and let go.
+const toDataUrl = async (photo: Photo) => {
+  try {
+    const bytes = new Uint8Array(await (await fileBlob(photo)).arrayBuffer());
+    return { dataUrl: `data:${photo.mime};base64,${toBase64(bytes)}` };
+  } finally {
+    void releaseFile(photo).catch(() => undefined);
+  }
+};
 
-  /**
-   * 최초로 킬 경우 권한은 prompt 상태이다.
-   * prompt 상태일 경우 권한을 요청한다.
-   * 권한이 denied 상태일 경우 설정으로 이동한다.
-   * 이후 state의 permission을 업데이트해야한다.
-   *
-   */
-  const checkPermission = async (type: "photos" | "camera" | "all") => {
-    try {
-      const { Camera } = await loadCapacitorCamera();
-      if (type === "photos") {
-        if (permissions.photos === "prompt") {
-          const { photos } = await Camera.requestPermissions();
-          setPermissions((prev) => ({ ...prev, photos }));
-        } else if (permissions.photos === "denied") {
-          location.assign("app-settings:");
-          return;
-        }
-      } else if (type === "camera") {
-        if (permissions.camera === "prompt") {
-          const { camera } = await Camera.requestPermissions();
-          setPermissions((prev) => ({ ...prev, camera }));
-        } else if (permissions.camera === "denied") {
-          location.assign("app-settings:");
-          return;
-        }
-      } else {
-        if (permissions.camera === "prompt" || permissions.photos === "prompt") {
-          const permissions = await Camera.requestPermissions();
-          setPermissions(permissions);
-        } else if (permissions.camera === "denied" || permissions.photos === "denied") {
-          location.assign("app-settings:");
-          return;
-        }
-      }
-    } catch {
-      //
-    }
+/** Photos arrive as upright JPEG data URLs; a denied camera opens the app settings instead of resolving. */
+export const useCamera = ({ promptLabels = {} }: { promptLabels?: CameraPromptLabels } = {}) => {
+  const [permissions, setPermissions] = useState<{ camera: PermissionState }>({ camera: "prompt" });
+
+  const openSettingsWhenDenied = async (error: unknown) => {
+    const code = AkanNativeError.from(error).code;
+    if (code === "CANCELLED") return;
+    if (code !== "PERMISSION_DENIED") throw error;
+    setPermissions({ camera: "denied" });
+    await opener.openSettings();
+  };
+
+  const checkPermission = async () => {
+    if (!isNativeApp()) return permissions.camera;
+    const { camera } = await loadCamera();
+    const { camera: state } = await camera.requestPermission();
+    setPermissions({ camera: state });
+    if (state === "denied") await opener.openSettings();
+    return state;
+  };
+
+  const chooseSource = async (): Promise<"camera" | "library" | null> => {
+    const { index } = await dialog.actionSheet({
+      title: promptLabel("base.cameraPromptHeader", promptLabels.header),
+      options: [
+        { title: promptLabel("base.cameraPromptPhoto", promptLabels.photo) },
+        { title: promptLabel("base.cameraPromptPicture", promptLabels.picture) },
+        { title: promptLabel("base.cameraPromptCancel", promptLabels.cancel), style: "cancel" },
+      ],
+    });
+    return index === 0 ? "library" : index === 1 ? "camera" : null;
   };
 
   const getPhoto = async (src: "prompt" | "camera" | "photos" = "prompt") => {
-    const { Camera, CameraResultType, CameraSource } = await loadCapacitorCamera();
-    const source =
-      Device.getDevice().info.platform !== "web"
-        ? src === "prompt"
-          ? CameraSource.Prompt
-          : src === "camera"
-            ? CameraSource.Camera
-            : CameraSource.Photos
-        : CameraSource.Photos;
-    const permission = src === "prompt" ? "all" : src === "camera" ? "camera" : "photos";
-    await checkPermission(permission);
+    const source = !isNativeApp() || src === "photos" ? "library" : src === "camera" ? "camera" : await chooseSource();
+    if (!source) return;
+    const { camera } = await loadCamera();
     try {
-      const photo = await Camera.getPhoto({
-        quality: 100,
-        source,
-        allowEditing: false,
-        resultType: CameraResultType.DataUrl,
-        promptLabelHeader: "프로필 사진을 올려주세요",
-        promptLabelPhoto: "앨범에서 선택하기",
-        promptLabelPicture: "사진 찍기",
-        promptLabelCancel: "취소",
-      });
-      return photo;
-    } catch (e) {
-      if (e === "User cancelled photos app") return;
+      return await toDataUrl(await camera.takePhoto({ source }));
+    } catch (error) {
+      await openSettingsWhenDenied(error);
     }
   };
 
-  const pickImage = async () => {
-    await checkPermission("photos");
-    const { Camera } = await loadCapacitorCamera();
-    const photo = await Camera.pickImages({
-      quality: 90,
-    });
-
-    return photo;
+  const pickImage = async ({ limit }: { limit?: number } = {}) => {
+    const { camera } = await loadCamera();
+    try {
+      const { photos } = await camera.pickImages(limit ? { limit } : {});
+      return await Promise.all(photos.map(toDataUrl));
+    } catch (error) {
+      await openSettingsWhenDenied(error);
+    }
   };
 
   useEffect(() => {
-    void (async () => {
-      if (isMobileDevice()) {
-        const { Camera } = await loadCapacitorCamera();
-        const permissions = await Camera.checkPermissions();
-        setPermissions(permissions);
-      }
-    })();
+    if (!isNativeApp()) return;
+    void loadCamera()
+      .then(({ camera }) => camera.checkPermission())
+      .then(({ camera: state }) => setPermissions({ camera: state }))
+      .catch(() => undefined);
   }, []);
   return { permissions, getPhoto, pickImage, checkPermission };
 };

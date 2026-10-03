@@ -111,6 +111,20 @@ pipeline {
                 }
             }
         }
+        stage("Typecheck"){
+            steps {
+                // `bun test` does not typecheck, so nothing used to notice API drift between the framework and
+                // its own callers until a build broke — and 148 errors had accumulated behind that, including a
+                // `refName` whose declared type disagreed with its runtime value and a type-level regression
+                // guard that had silently stopped guarding. Tests included: they are where the drift shows.
+                //
+                // All three published packages, not just `akanjs`: `@akanjs/devkit` and `@akanjs/cli` were in no
+                // gate at all, which is how 64 errors accumulated in them — among those a `.file` scan view whose
+                // declared type said `string[]` where every reader called `.has()`, and a test file that had lost
+                // its `bun:test` import and reported 20 errors from one line.
+                sh "ssh -i $SSH_KEY $BUILD_USER@$BUILD_HOST -p $BUILD_PORT \"cd $REPO_NAME/$BRANCH && bun run typecheckPkgs\""
+            }
+        }
         stage("Test"){
             steps {
                 // The framework unit suites, gating Dockerize and Deploy. `testPkgs` is the same command
@@ -123,10 +137,80 @@ pipeline {
                 sh "ssh -i $SSH_KEY $BUILD_USER@$BUILD_HOST -p $BUILD_PORT \"cd $REPO_NAME/$BRANCH && bun run testPkgs\""
             }
         }
-        // The app and lib suites (ALL_PROJECTS + TEST_LIBS) are still not run anywhere. Their testing
-        // credentials are already fetched in Prepare Build, so the missing piece is only a command —
-        // but they have never been green in CI, so enabling them belongs in its own change rather than
-        // silently blocking every deploy.
+        stage("Dev Stability"){
+            steps {
+                // The 1113-line dev-host harness — the only coverage for the interlocked RSS-recycle, idle-suspend,
+                // and builder-gap timers — ran nowhere automatically: `AKAN_DEV_STABILITY_INTEGRATION` is set by
+                // this script alone, and nothing called it. `testPkgs` skips all 19 tests without it.
+                //
+                // Non-gating on purpose, for now. Each test boots a real dev server and several assert RSS
+                // ceilings, so the suite is host-sensitive and budgets up to 180s per test; it has never run on
+                // this host. Marking the build unstable puts the result in front of someone without letting a
+                // first red measurement block a deploy. Promote it to a gating `sh` once it has been green here.
+                catchError(buildResult: "UNSTABLE", stageResult: "FAILURE") {
+                    timeout(time: 45, unit: "MINUTES") {
+                        sh "ssh -i $SSH_KEY $BUILD_USER@$BUILD_HOST -p $BUILD_PORT \"cd $REPO_NAME/$BRANCH && bun run testDevStability\""
+                    }
+                }
+            }
+        }
+        stage("Dev Registry E2E"){
+            steps {
+                // `akan start` in a real browser, both dev CSR modes: a package the dev module registry compiles
+                // wrong kills its whole vendor file there, and a unit suite cannot show it. The host must run the Bun
+                // the root package.json pins (`engines.bun`), so a Bun upgrade is a change to that pin, landed with
+                // the host's own upgrade, and either one alone fails here naming both versions.
+                //
+                // `testDevRegistryE2e` exits 2 for that mismatch and 3 when the host cannot drive a browser (off
+                // macOS, `Bun.WebView` needs an installed Chrome), so a missing browser is a skip, never a failure.
+                //
+                // TODO: gate on it, a plain `sh` as in "Test", once it has passed on this host in 10 consecutive
+                // builds with no environment skip.
+                catchError(buildResult: "UNSTABLE", stageResult: "FAILURE") {
+                    timeout(time: 20, unit: "MINUTES") {
+                        script {
+                            def status = sh(returnStatus: true, script: "ssh -i $SSH_KEY $BUILD_USER@$BUILD_HOST -p $BUILD_PORT \"cd $REPO_NAME/$BRANCH && bun run testDevRegistryE2e\"")
+                            if (status == 3) {
+                                catchError(buildResult: "SUCCESS", stageResult: "NOT_BUILT") {
+                                    error("Dev Registry E2E skipped: the build host cannot drive a browser; see the [dev-registry-e2e] line above")
+                                }
+                            } else if (status == 2) {
+                                error("Dev Registry E2E: the build host's Bun is not the one package.json pins; see the [dev-registry-e2e] line above")
+                            } else if (status != 0) {
+                                error("Dev Registry E2E failed")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        stage("Lib Suites"){
+            steps {
+                // TEST_LIBS in the default (single) database mode, with the testing credentials Prepare Build
+                // fetched. Non-gating until they have been green here: `shared` still needs its lexical packages
+                // and phone fixtures on this host.
+                catchError(buildResult: "UNSTABLE", stageResult: "FAILURE") {
+                    timeout(time: 20, unit: "MINUTES") {
+                        script {
+                            TEST_LIBS.tokenize(",").each { lib ->
+                                sh "ssh -i $SSH_KEY $BUILD_USER@$BUILD_HOST -p $BUILD_PORT \"cd $REPO_NAME/$BRANCH && bun run runAkan test $lib\""
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        stage("Database Mode Conformance"){
+            steps {
+                // The same suites against Redis and Postgres (infra/test/compose.yaml, oldest and newest supported
+                // versions), plus TEST_LIBS in multiple and cluster mode. A lib test counts only if it passed in
+                // single mode, so what this host lacks for "Lib Suites" does not fail it; red means a mode regressed,
+                // or a fixed defect still carries its `test.failing` marker.
+                timeout(time: 30, unit: "MINUTES") {
+                    sh "ssh -i $SSH_KEY $BUILD_USER@$BUILD_HOST -p $BUILD_PORT \"cd $REPO_NAME/$BRANCH && BRANCH=$BRANCH TEST_LIBS=$TEST_LIBS bun run testConformance --libs\""
+                }
+            }
+        }
         stage("Dockerize"){
             steps {
                 script {

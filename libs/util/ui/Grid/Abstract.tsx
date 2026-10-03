@@ -1,13 +1,14 @@
-import { clsx } from "akanjs/client";
+import { cn } from "akanjs/client";
+import type { ReactNode } from "react";
 
 interface AbstractProps {
   className?: string;
-  children: any;
+  children: ReactNode;
 }
 export const Abstract = ({ className, children }: AbstractProps) => {
   return (
     <div
-      className={clsx(
+      className={cn(
         "hover:z-20 hover:scale-105",
         className,
         // "group-data-[open=true]/gridunit:hidden"

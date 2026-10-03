@@ -1,5 +1,6 @@
 import { INJECT_META } from "akanjs/base";
-import { lowerlize } from "akanjs/common";
+import { lowerlize, toError } from "akanjs/common";
+import { ConstantRegistry } from "akanjs/constant";
 import type { InjectInfo } from "akanjs/service";
 import type { DatabaseModule, ServiceModule } from "../akanLib";
 
@@ -67,30 +68,57 @@ export const getModuleDependencyRefNames = (mod: DatabaseModule | ServiceModule)
   return dependencies;
 };
 
-/**
- * Run every task in parallel and, if any rejects, throw a single
- * `AggregateError` that enumerates every failing label + cause. This replaces
- * the previous `Promise.all` flow where a second concurrent failure in the
- * same stage would hide the first, making boot errors hard to localize.
- */
+// Cascade targets are boot deps the inject graph misses (seal fails without them); polymorphic owners are exempt.
+export const getModuleCascadeRefNames = (mod: DatabaseModule | ServiceModule) => {
+  const dependencies = new Set<string>();
+  if (!("constant" in mod)) return dependencies;
+  const { cascade } = mod.constant.full;
+  for (const modelRef of cascade.removeRef.values()) dependencies.add(ConstantRegistry.getRefName(modelRef));
+  for (const path of cascade.removeWith.values()) {
+    if (path.anyOwner || path.typeValues.length) continue;
+    dependencies.add(path.refName ?? ConstantRegistry.getRefName(path.modelRef as never));
+  }
+  return dependencies;
+};
+
+export interface Registration {
+  key: string;
+  /** What claimed the key, phrased for a boot error: `predefined adaptor "storage"`, `lib "shared"`. */
+  owner: string;
+}
+
+// Downstream maps are last-write-wins, so a duplicate would silently skip the other's `onInit`.
+export const assertUniqueRegistrations = (kind: string, registrations: Registration[]) => {
+  const claimed = new Map<string, string>();
+  const clashes: string[] = [];
+  for (const { key, owner } of registrations) {
+    const previous = claimed.get(key);
+    if (previous) clashes.push(`  • "${key}" is registered by ${previous} and by ${owner}`);
+    else claimed.set(key, owner);
+  }
+  if (!clashes.length) return;
+  throw new Error(`[DI:${kind}] ${clashes.length} duplicate registration(s):\n${clashes.join("\n")}`);
+};
+
+// allSettled, not Promise.all: every failing task of a stage is reported, not just the first.
 export const runStage = async (stageLabel: string, tasks: StageTask[]): Promise<void> => {
   if (tasks.length === 0) return;
   const settled = await Promise.allSettled(tasks.map((t) => t.run()));
-  const failures: { label: string; reason: unknown }[] = [];
-  settled.forEach((res, i) => {
-    if (res.status === "rejected") {
-      const task = tasks[i];
-      failures.push({ label: task ? task.label : `#${i}`, reason: res.reason });
-    }
-  });
+  const failures = settled.flatMap((res, i) =>
+    res.status === "rejected" ? [{ label: tasks[i]?.label ?? `#${i}`, reason: res.reason }] : [],
+  );
+  throwStageFailures(stageLabel, failures, tasks.length);
+};
+
+export const throwStageFailures = (
+  stageLabel: string,
+  failures: { label: string; reason: unknown }[],
+  total: number,
+) => {
   if (failures.length === 0) return;
   const summary = failures.map((f) => `  • ${f.label}: ${reasonMessage(f.reason)}`).join("\n");
   const errors = failures.map((f) => toError(f.reason));
-  throw new AggregateError(errors, `[DI:${stageLabel}] ${failures.length}/${tasks.length} task(s) failed:\n${summary}`);
-};
-
-export const toError = (reason: unknown): Error => {
-  return reason instanceof Error ? reason : new Error(String(reason));
+  throw new AggregateError(errors, `[DI:${stageLabel}] ${failures.length}/${total} task(s) failed:\n${summary}`);
 };
 
 export const reasonMessage = (reason: unknown): string => {

@@ -1,12 +1,16 @@
 import { createHash } from "node:crypto";
 import { readdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
+import { RESERVED_ROUTE_CONFIG_EXPORTS } from "akanjs/common";
 import ignore from "ignore";
 import ts from "typescript";
 import { AbstractDoc } from "./abstractDoc";
+import { FormSetterScanner } from "./formSetterScanner";
+import { fileWarning, formatSsrBalance, type SsrBalanceEntry, SsrScanner } from "./ssrScanner";
+import { isAllowedLibFacetRootFile, rootAllowedDirs, rootAllowedFiles, rootEntryHintOf } from "./workspaceLayout";
 
 type QualitySeverity = "warning";
-type QualityScope = "global" | "file" | "convention" | "layout";
+type QualityScope = "global" | "file" | "convention" | "layout" | "ssr" | "agent";
 
 export interface QualityWarning {
   rule: string;
@@ -23,10 +27,11 @@ export interface QualityScanResult {
   workspaceRoot: string;
   scannedFiles: number;
   warnings: QualityWarning[];
+  ssrBalance: SsrBalanceEntry[];
   suggestedRules: string[];
 }
 
-interface SourceFileInfo {
+export interface SourceFileInfo {
   file: string;
   absolutePath: string;
   content: string;
@@ -84,32 +89,10 @@ const SUGGESTED_RULES = [
   "Keep apps/*/lib and libs/*/lib root files limited to generated support facets such as cnst.ts, db.ts, dict.ts, sig.ts, srv.ts, st.ts, useClient.ts, and useServer.ts.",
   "Use domain module folders consistently: lib/<model> for database modules, lib/_<service> for service modules, and lib/__scalar/<scalar> for scalar modules.",
   "Keep module UI filenames predictable: database modules use <Model>.Template/Unit/Util/View/Zone.tsx, service modules use <Service>.Util/Zone.tsx, and scalar modules use <Scalar>.Template/Unit.tsx.",
-  "Move shared app utilities to apps/*/common instead of creating apps/*/base.",
+  "Hand a form control its store setter by reference so the field publishes an agent tool; put normalization in the control's transform prop and a multi-write in a _postSet<Field> hook on the store.",
+  "Move shared app and lib utilities to common/ instead of creating apps/*/base or libs/*/base.",
   "Avoid large mixed-purpose class files; class export files should import helpers from neighboring utility files instead of declaring them inline.",
 ];
-
-const APP_ROOT_FILES = new Set([
-  "akan.app.json",
-  "akan.config.ts",
-  "capacitor.config.ts",
-  "client.ts",
-  "main.ts",
-  "package.json",
-  "server.ts",
-  "tsconfig.json",
-]);
-
-const LIB_ROOT_FILES = new Set([
-  "cnst.ts",
-  "db.ts",
-  "dict.ts",
-  "option.ts",
-  "sig.ts",
-  "srv.ts",
-  "st.ts",
-  "useClient.ts",
-  "useServer.ts",
-]);
 
 const CONVENTION_SUFFIXES = [
   ".constant.ts",
@@ -120,26 +103,6 @@ const CONVENTION_SUFFIXES = [
   ".store.ts",
 ] as const;
 
-// Non-PascalCase exports the framework recognizes on page/layout route modules (see PageModule/LayoutModule
-// in pkgs/akanjs/client/csrTypes.ts). PascalCase route exports (Loading, NotFound, Error) pass the component
-// check, and the `default` export is handled separately.
-const PAGE_RESERVED_EXPORTS = new Set([
-  "pageConfig",
-  "head",
-  "metadata",
-  "generateHead",
-  "generateMetadata",
-  "fonts",
-  "manifest",
-  "theme",
-  "reconnect",
-  "wsConnect",
-  "layoutStyle",
-  "gaTrackingId",
-]);
-
-// How to remediate each rule, keyed by rule id. Surfaced as a `fix:` line per warning (text + JSON output)
-// so the scan result tells the reader what to do, not just what is wrong.
 const RULE_FIXES: Record<string, string> = {
   "akan.global.duplicate-exported-function-name":
     "Rename one of the exports, or if they are the same thing, extract it into one shared module and import it in both places.",
@@ -149,9 +112,11 @@ const RULE_FIXES: Record<string, string> = {
     "Split the file by responsibility — move Zones, Utils, or subcomponents into sibling files.",
   "akan.file.max-lines": "Break the file into smaller focused modules; keep one primary responsibility per file.",
   "akan.file.abstract-max-lines":
-    "Run `akan compact <app-or-lib>` to rewrite the abstract with the AI editor, keeping only the invariants and workflows the source files cannot show.",
+    "Trim the abstract by hand to a title, one sentence naming what the module owns, a `## Rules` list of the invariants the source cannot show, and an optional workflow chain.",
   "akan.file.placeholder-export":
     "Remove the placeholder export; generated indexes should only re-export real modules.",
+  "akan.file.bang-comment-in-client":
+    "Rewrite the marker as `// FIXME:` or `// TODO:`. Keep the bang form for server, srvkit, and CLI files.",
   "akan.file.dictionary-stale-text": "Replace the scaffold text with real localized copy for this dictionary entry.",
   "akan.file.global-declaration":
     "Move the global declaration into an approved low-level integration file (e.g. webkit) and keep it isolated.",
@@ -159,16 +124,36 @@ const RULE_FIXES: Record<string, string> = {
     "Move the Window augmentation into an approved browser integration file and keep it isolated.",
   "akan.file.prototype-mutation": "Avoid prototype mutation, or isolate it in an approved low-level integration file.",
   "akan.file.class-export-global-declaration": "Move the helper to a sibling file and import it into the class module.",
+  "akan.agent.unpublished-form-setter":
+    "Pass the setter by reference where the wrapper only forwards (onChange={st.do.setTitleOnTask}); move normalization into the control's own transform prop; move a multi-write into a _postSet<Field> hook on the store, keeping the generated setter on the control.",
   "akan.file.component-internal-declaration":
     "Move the type or helper to a type/util file in ui/, webkit/, or common/ by purpose. If it is the component's props, declare it as `interface <Component>Props`.",
   "akan.file.component-export":
     "Move the value or type to a util/constant/type file in ui/, webkit/, or common/ and import it. Adding `export` is not a valid fix — only PascalCase components and their `<Component>Props` interface belong here.",
   "akan.layout.app-root-file":
     "Move the file into a conventional app folder (common, env, lib, page, private, public, script, srvkit, ui, or webkit).",
+  "akan.layout.app-root-folder":
+    "Move the folder's contents into a conventional app folder (common, env, lib, page, private, public, script, srvkit, ui, or webkit) and delete it.",
   "akan.layout.lib-root-file":
-    "Move the file into a domain module folder under lib/; keep lib root limited to generated support facets.",
+    "Move the file into a conventional lib folder (common, env, lib, page, private, public, srvkit, ui, or webkit).",
+  "akan.layout.lib-root-folder":
+    "Move the folder's contents into a conventional lib folder (common, env, lib, page, private, public, srvkit, ui, or webkit) and delete it.",
+  "akan.layout.lib-facet-file":
+    "Move the file into a domain module folder under lib/; keep the lib facet root limited to generated support facets.",
   "akan.layout.module-ui-file":
     "Rename the file to an allowed module UI name, or move it to ui/ if it is not a module component.",
+  "akan.ssr.unnecessary-use-client":
+    'Delete the "use client" directive so the file renders on the server. If it exists only to wrap one client child, drop the wrapper and use the child directly.',
+  "akan.ssr.client-static-component":
+    "Move the component to a server file — a <Model>.Unit.tsx / <Model>.View.tsx for a module, or a ui/ file with no directive — and reference it from the client file.",
+  "akan.ssr.client-static-markup":
+    "Keep the interactive element in the client component and hoist the static subtree into a server component, then accept it as `children` or render it through a Unit/View reference.",
+  "akan.ssr.client-mount-load":
+    "Load the data in the route with `fetch.initX(...)` / `fetch.viewX(...)` and pass the init/view object down as a prop; the client store hydrates from it and the effect goes away.",
+  "akan.ssr.module-missing-server-view":
+    "Add a <Model>.Unit.tsx for list/card rendering and a <Model>.View.tsx for the detail surface, then have the Zone delegate to them.",
+  "akan.ssr.template-client-state":
+    "Bind the field to the store instead: `value={xForm.field}` with `onChange={st.do.setFieldOnX}`.",
 };
 
 function getRuleFix(rule: string): string | undefined {
@@ -190,6 +175,7 @@ export class AkanQualityScanner {
         .filter((file) => AbstractDoc.isAbstractPath(file))
         .map((file) => this.#readTextFile(workspaceRoot, file)),
     );
+    const ssr = new SsrScanner().scan(sourceFiles);
     const warnings = [
       ...this.#scanGlobalQuality(sourceFiles),
       ...sourceFiles.flatMap((sourceFile) => this.#scanSingleFileQuality(sourceFile)),
@@ -197,6 +183,8 @@ export class AkanQualityScanner {
       ...sourceFiles.flatMap((sourceFile) => this.#scanConventionQuality(sourceFile)),
       ...sourceFiles.flatMap((sourceFile) => this.#scanLayoutQuality(sourceFile)),
       ...abstractFiles.flatMap((abstractFile) => this.#scanAbstractQuality(abstractFile)),
+      ...new FormSetterScanner().scan(sourceFiles),
+      ...ssr.warnings,
     ];
 
     return {
@@ -205,6 +193,7 @@ export class AkanQualityScanner {
       warnings: warnings
         .map((warning) => ({ ...warning, fix: warning.fix ?? getRuleFix(warning.rule) }))
         .sort(compareWarnings),
+      ssrBalance: ssr.balance,
       suggestedRules: SUGGESTED_RULES,
     };
   }
@@ -306,25 +295,26 @@ export class AkanQualityScanner {
     const warnings: QualityWarning[] = [];
     const lineCount = sourceFile.content.split(/\r?\n/).length;
     const recommendedLineLimit = getRecommendedLineLimit(sourceFile.file);
-    if (recommendedLineLimit && lineCount > recommendedLineLimit) {
-      warnings.push({
-        rule: "akan.file.recommended-max-lines",
-        scope: "file",
-        severity: "warning",
-        file: sourceFile.file,
-        message: `File has ${lineCount} lines. Recommended limit for this file type is ${recommendedLineLimit} lines.`,
-      });
-    }
-    if (lineCount > MAX_FILE_LINES) {
-      warnings.push({
-        rule: "akan.file.max-lines",
-        scope: "file",
-        severity: "warning",
-        file: sourceFile.file,
-        message: `File has ${lineCount} lines. Keep single files under ${MAX_FILE_LINES} lines.`,
-      });
-    }
+    if (recommendedLineLimit && lineCount > recommendedLineLimit)
+      warnings.push(
+        fileWarning(
+          "akan.file.recommended-max-lines",
+          "file",
+          sourceFile.file,
+          `File has ${lineCount} lines. Recommended limit for this file type is ${recommendedLineLimit} lines.`,
+        ),
+      );
+    if (lineCount > MAX_FILE_LINES)
+      warnings.push(
+        fileWarning(
+          "akan.file.max-lines",
+          "file",
+          sourceFile.file,
+          `File has ${lineCount} lines. Keep single files under ${MAX_FILE_LINES} lines.`,
+        ),
+      );
 
+    warnings.push(...getBangCommentWarnings(sourceFile));
     warnings.push(...getPlaceholderExportWarnings(sourceFile));
     warnings.push(...getDictionaryTextWarnings(sourceFile));
     warnings.push(...getGlobalMutationWarnings(sourceFile));
@@ -335,14 +325,15 @@ export class AkanQualityScanner {
     for (const declaration of getTopLevelDeclarations(sourceFile)) {
       if (declaration.kind === "class" && exportedClassNames.includes(declaration.name)) continue;
       if (declaration.kind === "interface" && allowedInterfaceNames.has(declaration.name)) continue;
-      warnings.push({
-        rule: "akan.file.class-export-global-declaration",
-        scope: "file",
-        severity: "warning",
-        file: sourceFile.file,
-        line: declaration.line,
-        message: `Class export files should not declare top-level ${declaration.kind} "${declaration.name}". Move helpers to another file and import them.`,
-      });
+      warnings.push(
+        fileWarning(
+          "akan.file.class-export-global-declaration",
+          "file",
+          sourceFile.file,
+          `Class export files should not declare top-level ${declaration.kind} "${declaration.name}". Move helpers to another file and import them.`,
+          declaration.line,
+        ),
+      );
     }
     return warnings;
   }
@@ -351,9 +342,7 @@ export class AkanQualityScanner {
     if (!isComponentDeclarationFile(sourceFile.file)) return [];
     const isPage = isPageRouteFile(sourceFile.file);
     const declarations = getComponentFileDeclarations(sourceFile.sourceFile);
-    // Compound/namespaced components (e.g. `Like.WithDislike = WithDislike`) are valid without being exported.
     const compoundComponentNames = getCompoundComponentNames(sourceFile.sourceFile);
-    // Components are the exported (or compound) PascalCase values; their "<Component>Props" interface may live here.
     const componentNames = declarations
       .filter((declaration) => declaration.exported && isComponentValueKind(declaration.kind))
       .filter((declaration) => isPascalCaseName(declaration.name))
@@ -366,28 +355,28 @@ export class AkanQualityScanner {
       if (declaration.kind === "interface" && allowedPropsInterfaces.has(declaration.name)) continue;
       if (declaration.exported) {
         if (isAllowedComponentExport(declaration, isPage)) continue;
-        warnings.push({
-          rule: "akan.file.component-export",
-          scope: "file",
-          severity: "warning",
-          file: sourceFile.file,
-          line: declaration.line,
-          message: `Component file exports ${declaration.kind} "${declaration.name}", which is not a PascalCase component${isPage ? " or reserved route export" : ""}.`,
-        });
+        warnings.push(
+          fileWarning(
+            "akan.file.component-export",
+            "file",
+            sourceFile.file,
+            `Component file exports ${declaration.kind} "${declaration.name}", which is not a PascalCase component${isPage ? " or reserved route export" : ""}.`,
+            declaration.line,
+          ),
+        );
         continue;
       }
-      // A non-exported PascalCase component attached as a compound member is an accepted pattern.
       if (isComponentValueKind(declaration.kind) && compoundComponentNames.has(declaration.name)) continue;
-      if (isRestrictedInternalKind(declaration.kind)) {
-        warnings.push({
-          rule: "akan.file.component-internal-declaration",
-          scope: "file",
-          severity: "warning",
-          file: sourceFile.file,
-          line: declaration.line,
-          message: `Component file declares non-exported ${declaration.kind} "${declaration.name}". Only "interface <Component>Props" may stay internal.`,
-        });
-      }
+      if (isRestrictedInternalKind(declaration.kind))
+        warnings.push(
+          fileWarning(
+            "akan.file.component-internal-declaration",
+            "file",
+            sourceFile.file,
+            `Component file declares non-exported ${declaration.kind} "${declaration.name}". Only "interface <Component>Props" may stay internal.`,
+            declaration.line,
+          ),
+        );
     }
     return warnings;
   }
@@ -397,61 +386,62 @@ export class AkanQualityScanner {
     if (!suffix) return [];
 
     const modelName = toPascalCase(path.basename(sourceFile.file, suffix));
-    const warnings: QualityWarning[] = [];
-    for (const declaration of getTopLevelDeclarations(sourceFile)) {
-      if (isAllowedConventionDeclaration(suffix, modelName, declaration)) continue;
-      warnings.push({
-        rule: `akan.convention${suffix.replace(".ts", "")}`,
-        scope: "convention",
-        severity: "warning",
-        file: sourceFile.file,
-        line: declaration.line,
-        message: `${path.basename(sourceFile.file)} should not declare top-level ${declaration.kind} "${declaration.name}". Allowed declarations: ${getConventionDescription(
-          suffix,
-          modelName,
-        )}.`,
-      });
-    }
-    return warnings;
+    return getTopLevelDeclarations(sourceFile)
+      .filter((declaration) => !isAllowedConventionDeclaration(suffix, modelName, declaration))
+      .map((declaration) =>
+        fileWarning(
+          `akan.convention${suffix.replace(".ts", "")}`,
+          "convention",
+          sourceFile.file,
+          `${path.basename(sourceFile.file)} should not declare top-level ${declaration.kind} "${declaration.name}". Allowed declarations: ${getConventionDescription(suffix, modelName)}.`,
+          declaration.line,
+        ),
+      );
   }
 
   #scanAbstractQuality({ file, content }: TextFileInfo): QualityWarning[] {
     const lineCount = AbstractDoc.lineCountOf(content);
     if (lineCount <= AbstractDoc.maxLines) return [];
     return [
-      {
-        rule: "akan.file.abstract-max-lines",
-        scope: "file",
-        severity: "warning",
+      fileWarning(
+        "akan.file.abstract-max-lines",
+        "file",
         file,
-        message: `Abstract has ${lineCount} lines. Keep abstracts under ${AbstractDoc.maxLines} lines and compact them periodically.`,
-      },
+        `Abstract has ${lineCount} lines. Keep abstracts under ${AbstractDoc.maxLines} lines and compact them periodically.`,
+      ),
     ];
   }
 
   #scanLayoutQuality(sourceFile: SourceFileInfo): QualityWarning[] {
-    const segments = sourceFile.file.split("/");
     const warnings: QualityWarning[] = [];
-    if (segments[0] === "apps" && segments.length === 3 && !APP_ROOT_FILES.has(segments[2])) {
-      warnings.push({
-        rule: "akan.layout.app-root-file",
-        scope: "layout",
-        severity: "warning",
-        file: sourceFile.file,
-        message: `Unexpected app root file "${segments[2]}". Keep application code in conventional app folders.`,
-      });
+    const rootEntry = getSysRootEntry(sourceFile.file);
+    if (rootEntry) {
+      const { type, name, isDir } = rootEntry;
+      const allowed = isDir ? rootAllowedDirs[type].has(name) : rootAllowedFiles[type].has(name);
+      const kind = isDir ? "folder" : "file";
+      if (!allowed)
+        warnings.push(
+          fileWarning(
+            `akan.layout.${type}-root-${kind}`,
+            "layout",
+            sourceFile.file,
+            `Unexpected ${type} root ${kind} "${name}". ${
+              rootEntryHintOf(type, name) ?? `Keep ${type} code in conventional ${type} folders.`
+            }`,
+          ),
+        );
     }
 
-    const libRootFile = getLibRootFile(sourceFile.file);
-    if (libRootFile && !LIB_ROOT_FILES.has(libRootFile)) {
-      warnings.push({
-        rule: "akan.layout.lib-root-file",
-        scope: "layout",
-        severity: "warning",
-        file: sourceFile.file,
-        message: `Unexpected lib root file "${libRootFile}". Keep direct lib root files limited to generated support facets.`,
-      });
-    }
+    const libFacetFile = getLibFacetRootFile(sourceFile.file);
+    if (libFacetFile && !isAllowedLibFacetRootFile(libFacetFile))
+      warnings.push(
+        fileWarning(
+          "akan.layout.lib-facet-file",
+          "layout",
+          sourceFile.file,
+          `Unexpected lib facet root file "${libFacetFile}". Keep direct lib/ root files limited to generated support facets.`,
+        ),
+      );
 
     const moduleUiWarning = getModuleUiWarning(sourceFile.file);
     if (moduleUiWarning) warnings.push(moduleUiWarning);
@@ -470,9 +460,31 @@ export function formatQualityScanResult(result: QualityScanResult) {
     "",
     ...formatQualityWarnings(result.warnings),
     "",
+    "SSR balance (component files, JSX elements rendered per side):",
+    "",
+    ...formatSsrBalance(result.ssrBalance),
+    "",
     "Suggested quality rules:",
     "",
     ...result.suggestedRules.map((rule) => `  - ${rule}`),
+  ];
+  return sections.join("\n");
+}
+
+export function formatSsrScanResult(result: QualityScanResult) {
+  const sections = [
+    "Akan SSR Balance Scan",
+    `workspace: ${result.workspaceRoot}`,
+    `scanned files: ${result.scannedFiles}`,
+    `ssr warnings: ${result.warnings.length}`,
+    "",
+    "Server render share (component files, JSX elements rendered per side):",
+    "",
+    ...formatSsrBalance(result.ssrBalance),
+    "",
+    "Warnings:",
+    "",
+    ...formatQualityWarnings(result.warnings),
   ];
   return sections.join("\n");
 }
@@ -498,77 +510,57 @@ function formatQualityLocation(file: string | undefined, line: number | undefine
 
 function getExportedFunctionLikes(sourceFile: SourceFileInfo): ExportedFunctionLike[] {
   const declarations: ExportedFunctionLike[] = [];
-  // UI component names (e.g. Card, Button) naturally repeat across apps/libs, so exempt ui files from the
-  // duplicate-exported-name check. This only relaxes the name check; the shared-body check still applies.
+  // UI component names (Card, Button) repeat across apps and libs by design; only the name check is relaxed.
   const nameExempt = isPageRouteFile(sourceFile.file) || isUiComponentFile(sourceFile.file);
+  const add = (
+    name: string,
+    kind: ExportedFunctionLike["kind"],
+    node: ts.Node,
+    body: ts.Node | undefined,
+    isEnumClass = false,
+  ) =>
+    declarations.push({
+      name,
+      kind,
+      file: sourceFile.file,
+      line: getLine(sourceFile.sourceFile, node),
+      bodyFingerprint: getBodyFingerprint(sourceFile.sourceFile, body),
+      duplicateNameExempt: nameExempt || isConventionDuplicateNameExempt(sourceFile.file, isEnumClass),
+    });
   for (const statement of sourceFile.sourceFile.statements) {
-    if (ts.isFunctionDeclaration(statement) && statement.name && isExported(statement)) {
-      declarations.push({
-        name: statement.name.text,
-        kind: "function",
-        file: sourceFile.file,
-        line: getLine(sourceFile.sourceFile, statement),
-        bodyFingerprint: getBodyFingerprint(sourceFile.sourceFile, statement.body),
-        duplicateNameExempt: nameExempt || isConventionDuplicateNameExempt(sourceFile.file, false),
-      });
-    }
-    if (ts.isClassDeclaration(statement) && statement.name && isExported(statement)) {
-      declarations.push({
-        name: statement.name.text,
-        kind: "class",
-        file: sourceFile.file,
-        line: getLine(sourceFile.sourceFile, statement),
-        bodyFingerprint: getBodyFingerprint(sourceFile.sourceFile, statement),
-        duplicateNameExempt:
-          nameExempt ||
-          isConventionDuplicateNameExempt(sourceFile.file, isEnumClassStatement(sourceFile.sourceFile, statement)),
-      });
-    }
+    if (ts.isFunctionDeclaration(statement) && statement.name && isExported(statement))
+      add(statement.name.text, "function", statement, statement.body);
+    if (ts.isClassDeclaration(statement) && statement.name && isExported(statement))
+      add(statement.name.text, "class", statement, statement, isEnumClassStatement(sourceFile.sourceFile, statement));
     if (ts.isVariableStatement(statement) && isExported(statement)) {
       for (const declaration of statement.declarationList.declarations) {
         if (!ts.isIdentifier(declaration.name) || !isFunctionLikeInitializer(declaration.initializer)) continue;
-        declarations.push({
-          name: declaration.name.text,
-          kind: "function-variable",
-          file: sourceFile.file,
-          line: getLine(sourceFile.sourceFile, declaration),
-          bodyFingerprint: getBodyFingerprint(sourceFile.sourceFile, declaration.initializer),
-          duplicateNameExempt: nameExempt || isConventionDuplicateNameExempt(sourceFile.file, false),
-        });
+        add(declaration.name.text, "function-variable", declaration, declaration.initializer);
       }
     }
   }
   return declarations;
 }
 
-function isPageRouteFile(file: string) {
+function sysSegments(file: string) {
   const segments = file.split("/");
-  return (segments[0] === "apps" || segments[0] === "libs") && segments[2] === "page";
+  return segments[0] === "apps" || segments[0] === "libs" ? segments : null;
+}
+
+function isPageRouteFile(file: string) {
+  return sysSegments(file)?.[2] === "page";
 }
 
 function isUiComponentFile(file: string) {
-  const segments = file.split("/");
-  return (segments[0] === "apps" || segments[0] === "libs") && segments[2] === "ui";
+  return sysSegments(file)?.[2] === "ui";
 }
 
 function isConventionDuplicateNameExempt(file: string, isEnumClass: boolean) {
-  if (!isInLibModule(file)) return false;
-  if (file.endsWith(".tsx")) return true;
-  if (
-    file.endsWith(".document.ts") ||
-    file.endsWith(".service.ts") ||
-    file.endsWith(".signal.ts") ||
-    file.endsWith(".store.ts")
-  )
-    return true;
+  if (!sysSegments(file)?.includes("lib")) return false;
+  if (file.endsWith(".tsx") || /\.(document|service|signal|store)\.ts$/.test(file)) return true;
   // Model view classes may repeat across modules; enum classes must stay uniquely named.
   if (file.endsWith(".constant.ts")) return !isEnumClass;
   return false;
-}
-
-function isInLibModule(file: string) {
-  const segments = file.split("/");
-  return (segments[0] === "apps" || segments[0] === "libs") && segments.includes("lib");
 }
 
 function isEnumClassStatement(sourceFile: ts.SourceFile, statement: ts.Statement) {
@@ -580,9 +572,10 @@ function isEnumClassStatement(sourceFile: ts.SourceFile, statement: ts.Statement
 
 function getExportedClassNames(sourceFile: ts.SourceFile) {
   return sourceFile.statements
-    .filter((statement): statement is ts.ClassDeclaration => ts.isClassDeclaration(statement) && !!statement.name)
+    .filter((statement): statement is ts.ClassDeclaration => ts.isClassDeclaration(statement))
     .filter((statement) => isExported(statement))
-    .map((statement) => statement.name!.text);
+    .map((statement) => statement.name?.text)
+    .filter((name): name is string => !!name);
 }
 
 function isComponentDeclarationFile(file: string) {
@@ -626,9 +619,7 @@ function getComponentFileDeclarations(sourceFile: ts.SourceFile): ComponentFileD
   return declarations;
 }
 
-// Detects compound/namespaced component assignments like `Like.WithDislike = WithDislike`. The PascalCase
-// member is the public component name; when the right side is a PascalCase identifier it is the local
-// definition. Both are treated as valid components so the definition and its "<Component>Props" may stay local.
+// `Like.WithDislike = WithDislike` makes both names components, so the local definition and its Props may stay unexported.
 function getCompoundComponentNames(sourceFile: ts.SourceFile): Set<string> {
   const names = new Set<string>();
   for (const statement of sourceFile.statements) {
@@ -652,84 +643,97 @@ function isRestrictedInternalKind(kind: ComponentFileDeclaration["kind"]) {
 
 function isAllowedComponentExport(declaration: ComponentFileDeclaration, isPage: boolean) {
   if (isComponentValueKind(declaration.kind) && isPascalCaseName(declaration.name)) return true;
-  return isPage && PAGE_RESERVED_EXPORTS.has(declaration.name);
+  return isPage && RESERVED_ROUTE_CONFIG_EXPORTS.has(declaration.name);
 }
 
 function isPascalCaseName(name: string) {
-  // PascalCase component names start uppercase and are not SCREAMING_SNAKE_CASE constants.
   return /^[A-Z]/.test(name) && !/^[A-Z0-9_]+$/.test(name);
 }
 
 function isDefaultExportStatement(statement: ts.Statement) {
   if (ts.isExportAssignment(statement)) return !statement.isExportEquals;
-  return !!(ts.getCombinedModifierFlags(statement as ts.Declaration) & ts.ModifierFlags.Default);
+  if (!ts.canHaveModifiers(statement)) return false;
+  return !!ts.getModifiers(statement)?.some((modifier) => modifier.kind === ts.SyntaxKind.DefaultKeyword);
+}
+
+// Bun keeps `//!` and `/*!` through minification. GritQL's `file($name, $body)` spans tokens only, so the grit rule
+// misses a marker in the file's leading or trailing trivia; the raw text is read here.
+function getBangCommentWarnings(sourceFile: SourceFileInfo): QualityWarning[] {
+  if (!isClientReachableFile(sourceFile.file)) return [];
+  // Anchored to line start or to whitespace after code, so a literal like `"https://host//!path"` is not a hit.
+  return findPatternLines(sourceFile.content, /(?:^|[^\s/][ \t]+)\/[*/]!/).map((line) =>
+    fileWarning(
+      "akan.file.bang-comment-in-client",
+      "file",
+      sourceFile.file,
+      "A `//!` or `/*!` marker survives minification and ships to the browser.",
+      line,
+    ),
+  );
+}
+
+// Mirrors the path scope of `no-bang-comment-in-client.grit` in `biome.base.json`.
+function isClientReachableFile(file: string) {
+  if (/\.(test|spec)\.tsx?$/.test(file)) return false;
+  if (/\.(constant|store)\.ts$/.test(file)) return true;
+  if (/\.(Template|Unit|Util|View|Zone)\.tsx$/.test(file)) return true;
+  const segments = file.split("/");
+  if (segments.includes("ui") || segments.includes("webkit")) return /\.tsx?$/.test(file);
+  if (segments.includes("common")) return file.endsWith(".ts");
+  return segments.includes("page") && file.endsWith(".tsx");
 }
 
 function getPlaceholderExportWarnings(sourceFile: SourceFileInfo): QualityWarning[] {
   if (!sourceFile.file.endsWith("/index.ts") && !sourceFile.file.endsWith("/index.tsx")) return [];
   return getTopLevelDeclarations(sourceFile)
     .filter((declaration) => declaration.exported && PLACEHOLDER_EXPORT_NAMES.has(declaration.name))
-    .map((declaration) => ({
-      rule: "akan.file.placeholder-export",
-      scope: "file",
-      severity: "warning",
-      file: sourceFile.file,
-      line: declaration.line,
-      message: `Generated or barrel index file should not export placeholder "${declaration.name}".`,
-    }));
+    .map((declaration) =>
+      fileWarning(
+        "akan.file.placeholder-export",
+        "file",
+        sourceFile.file,
+        `Generated or barrel index file should not export placeholder "${declaration.name}".`,
+        declaration.line,
+      ),
+    );
 }
 
 function getDictionaryTextWarnings(sourceFile: SourceFileInfo): QualityWarning[] {
   if (!sourceFile.file.endsWith(".dictionary.ts")) return [];
   const stalePatterns = [{ pattern: /\b[A-Z][A-Za-z0-9]* description\b/, label: "scaffold description text" }];
   return stalePatterns.flatMap(({ pattern, label }) =>
-    findPatternLines(sourceFile.content, pattern).map((line) => ({
-      rule: "akan.file.dictionary-stale-text",
-      scope: "file",
-      severity: "warning",
-      file: sourceFile.file,
-      line,
-      message: `Dictionary text appears to contain ${label}.`,
-    })),
+    findPatternLines(sourceFile.content, pattern).map((line) =>
+      fileWarning(
+        "akan.file.dictionary-stale-text",
+        "file",
+        sourceFile.file,
+        `Dictionary text appears to contain ${label}.`,
+        line,
+      ),
+    ),
   );
 }
 
 function getGlobalMutationWarnings(sourceFile: SourceFileInfo): QualityWarning[] {
   const warnings: QualityWarning[] = [];
   for (const statement of sourceFile.sourceFile.statements) {
-    if (ts.isModuleDeclaration(statement) && statement.name.getText(sourceFile.sourceFile) === "global") {
-      warnings.push({
-        rule: "akan.file.global-declaration",
-        scope: "file",
-        severity: "warning",
-        file: sourceFile.file,
-        line: getLine(sourceFile.sourceFile, statement),
-        message: "Global declarations require an explicit low-level integration allowlist.",
-      });
-    }
-    if (ts.isInterfaceDeclaration(statement) && statement.name.text === "Window") {
-      warnings.push({
-        rule: "akan.file.window-augmentation",
-        scope: "file",
-        severity: "warning",
-        file: sourceFile.file,
-        line: getLine(sourceFile.sourceFile, statement),
-        message: "Window augmentation should be isolated to approved browser integration files.",
-      });
-    }
+    const warn = (rule: string, message: string) =>
+      warnings.push(fileWarning(rule, "file", sourceFile.file, message, getLine(sourceFile.sourceFile, statement)));
+    if (ts.isModuleDeclaration(statement) && statement.name.getText(sourceFile.sourceFile) === "global")
+      warn("akan.file.global-declaration", "Global declarations require an explicit low-level integration allowlist.");
+    if (ts.isInterfaceDeclaration(statement) && statement.name.text === "Window")
+      warn(
+        "akan.file.window-augmentation",
+        "Window augmentation should be isolated to approved browser integration files.",
+      );
     if (
       ts.isExpressionStatement(statement) &&
       statement.expression.getText(sourceFile.sourceFile).includes(".prototype.")
-    ) {
-      warnings.push({
-        rule: "akan.file.prototype-mutation",
-        scope: "file",
-        severity: "warning",
-        file: sourceFile.file,
-        line: getLine(sourceFile.sourceFile, statement),
-        message: "Prototype mutation should be avoided or isolated to approved low-level integration files.",
-      });
-    }
+    )
+      warn(
+        "akan.file.prototype-mutation",
+        "Prototype mutation should be avoided or isolated to approved low-level integration files.",
+      );
   }
   return warnings;
 }
@@ -742,35 +746,35 @@ function getTopLevelDeclarations(sourceFile: SourceFileInfo): TopLevelDeclaratio
 
 function getTopLevelDeclaration(sourceFile: ts.SourceFile, statement: ts.Statement): TopLevelDeclaration[] {
   const line = getLine(sourceFile, statement);
-  if (ts.isClassDeclaration(statement) && statement.name) {
-    return [{ name: statement.name.text, kind: "class", line, exported: isExported(statement), node: statement }];
-  }
-  if (ts.isFunctionDeclaration(statement) && statement.name) {
-    return [{ name: statement.name.text, kind: "function", line, exported: isExported(statement), node: statement }];
-  }
-  if (ts.isInterfaceDeclaration(statement)) {
-    return [{ name: statement.name.text, kind: "interface", line, exported: isExported(statement), node: statement }];
-  }
-  if (ts.isTypeAliasDeclaration(statement)) {
-    return [{ name: statement.name.text, kind: "type", line, exported: isExported(statement), node: statement }];
-  }
-  if (ts.isEnumDeclaration(statement)) {
-    return [{ name: statement.name.text, kind: "enum", line, exported: isExported(statement), node: statement }];
-  }
-  if (ts.isVariableStatement(statement)) {
+  const declared = (name: string, kind: string, at = line) => ({
+    name,
+    kind,
+    line: at,
+    exported: isExported(statement),
+    node: statement,
+  });
+  if (ts.isClassDeclaration(statement) && statement.name) return [declared(statement.name.text, "class")];
+  if (ts.isFunctionDeclaration(statement) && statement.name) return [declared(statement.name.text, "function")];
+  if (ts.isInterfaceDeclaration(statement)) return [declared(statement.name.text, "interface")];
+  if (ts.isTypeAliasDeclaration(statement)) return [declared(statement.name.text, "type")];
+  if (ts.isEnumDeclaration(statement)) return [declared(statement.name.text, "enum")];
+  if (ts.isVariableStatement(statement))
     return statement.declarationList.declarations
       .filter((declaration) => ts.isIdentifier(declaration.name))
-      .map((declaration) => ({
-        name: (declaration.name as ts.Identifier).text,
-        kind: "variable",
-        line: getLine(sourceFile, declaration),
-        exported: isExported(statement),
-        node: statement,
-      }));
-  }
-  if (ts.isExportDeclaration(statement)) {
+      .map((declaration) =>
+        declared((declaration.name as ts.Identifier).text, "variable", getLine(sourceFile, declaration)),
+      );
+  if (ts.isExportDeclaration(statement))
     return [{ name: "export declaration", kind: "export", line, exported: true, node: statement }];
-  }
+  return [];
+}
+
+function getConventionClassNames(suffix: (typeof CONVENTION_SUFFIXES)[number], model: string) {
+  if (suffix === ".constant.ts") return [`${model}Input`, `${model}Object`, model, `Light${model}`, `${model}Insight`];
+  if (suffix === ".document.ts") return [`${model}Filter`, model, `${model}Model`];
+  if (suffix === ".service.ts") return [`${model}Service`];
+  if (suffix === ".signal.ts") return [`${model}Internal`, `${model}Slice`, `${model}Endpoint`];
+  if (suffix === ".store.ts") return [`${model}Store`];
   return [];
 }
 
@@ -780,48 +784,33 @@ function isAllowedConventionDeclaration(
   declaration: TopLevelDeclaration,
 ) {
   if (suffix === ".dictionary.ts") return isExportedConst(declaration) && declaration.name === "dictionary";
-  if (suffix === ".constant.ts") return isAllowedConstantDeclaration(modelName, declaration);
-  if (suffix === ".document.ts")
-    return (
-      declaration.kind === "class" && [`${modelName}Filter`, modelName, `${modelName}Model`].includes(declaration.name)
-    );
-  if (suffix === ".service.ts") return declaration.kind === "class" && declaration.name === `${modelName}Service`;
-  if (suffix === ".signal.ts")
-    return (
-      declaration.kind === "class" &&
-      [`${modelName}Internal`, `${modelName}Slice`, `${modelName}Endpoint`].includes(declaration.name)
-    );
-  if (suffix === ".store.ts") return declaration.kind === "class" && declaration.name === `${modelName}Store`;
-  return false;
-}
-
-function isAllowedConstantDeclaration(modelName: string, declaration: TopLevelDeclaration) {
   if (declaration.kind !== "class") return false;
-  if (
-    [`${modelName}Input`, `${modelName}Object`, modelName, `Light${modelName}`, `${modelName}Insight`].includes(
-      declaration.name,
-    )
-  )
-    return true;
-  if (!ts.isClassDeclaration(declaration.node)) return false;
-  const heritageClause = declaration.node.heritageClauses?.find(
-    (clause) => clause.token === ts.SyntaxKind.ExtendsKeyword,
-  );
-  const expression = heritageClause?.types[0]?.expression;
-  return !!expression && expression.getText().startsWith("enumOf(");
+  if (getConventionClassNames(suffix, modelName).includes(declaration.name)) return true;
+  return suffix === ".constant.ts" && isEnumClassStatement(declaration.node.getSourceFile(), declaration.node);
 }
 
 function getConventionDescription(suffix: (typeof CONVENTION_SUFFIXES)[number], modelName: string) {
   if (suffix === ".dictionary.ts") return "export const dictionary";
-  if (suffix === ".constant.ts")
-    return `${modelName}Input, ${modelName}Object, ${modelName}, Light${modelName}, ${modelName}Insight, or enumOf classes`;
-  if (suffix === ".document.ts") return `${modelName}Filter, ${modelName}, or ${modelName}Model`;
-  if (suffix === ".service.ts") return `${modelName}Service`;
-  if (suffix === ".signal.ts") return `${modelName}Internal, ${modelName}Slice, or ${modelName}Endpoint`;
-  return `${modelName}Store`;
+  const names = [
+    ...getConventionClassNames(suffix, modelName),
+    ...(suffix === ".constant.ts" ? ["enumOf classes"] : []),
+  ];
+  return names.length > 1 ? `${names.slice(0, -1).join(", ")}, or ${names.at(-1)}` : names[0];
 }
 
-function getLibRootFile(file: string) {
+const sysRootTypes = { apps: "app", libs: "lib" } as const;
+
+function getSysRootEntry(file: string) {
+  const segments = file.split("/");
+  const root = segments[0];
+  const name = segments[2];
+  if (!root || !name || segments.length < 3) return null;
+  const type = sysRootTypes[root as keyof typeof sysRootTypes];
+  if (!type) return null;
+  return { type, name, isDir: segments.length > 3 };
+}
+
+function getLibFacetRootFile(file: string) {
   const segments = file.split("/");
   if ((segments[0] === "libs" || segments[0] === "apps") && segments.length === 4 && segments[2] === "lib")
     return segments[3];
@@ -842,13 +831,12 @@ function getModuleUiWarning(file: string): QualityWarning | null {
         : ["Template", "Unit"];
   const allowedFileNames = new Set(allowedSuffixes.map((suffix) => `${pascalName}.${suffix}.tsx`));
   if (allowedFileNames.has(fileName) || fileName.endsWith(".test.tsx") || fileName.endsWith(".spec.tsx")) return null;
-  return {
-    rule: "akan.layout.module-ui-file",
-    scope: "layout",
-    severity: "warning",
+  return fileWarning(
+    "akan.layout.module-ui-file",
+    "layout",
     file,
-    message: `Unexpected ${kind} module UI filename "${fileName}". Expected one of: ${[...allowedFileNames].join(", ")}.`,
-  };
+    `Unexpected ${kind} module UI filename "${fileName}". Expected one of: ${[...allowedFileNames].join(", ")}.`,
+  );
 }
 
 function getModuleInfo(file: string) {
@@ -862,10 +850,7 @@ function getModuleInfo(file: string) {
   }
   if (segments.length !== libIndex + 3) return null;
   const fileName = segments[libIndex + 2];
-  if (moduleName.startsWith("__")) {
-    const scalarName = moduleName === "__scalar" ? segments[libIndex + 2] : moduleName;
-    return { moduleName: scalarName, fileName, kind: "scalar" as const };
-  }
+  if (moduleName.startsWith("__")) return { moduleName, fileName, kind: "scalar" as const };
   if (moduleName.startsWith("_")) return { moduleName, fileName, kind: "service" as const };
   return { moduleName, fileName, kind: "database" as const };
 }
@@ -879,10 +864,7 @@ function isExportedConst(declaration: TopLevelDeclaration) {
 }
 
 function isExported(node: ts.Node) {
-  return (
-    !!ts.getCombinedModifierFlags(node as ts.Declaration) &&
-    !!(ts.getCombinedModifierFlags(node as ts.Declaration) & ts.ModifierFlags.Export)
-  );
+  return !!(ts.getCombinedModifierFlags(node as ts.Declaration) & ts.ModifierFlags.Export);
 }
 
 function isFunctionLikeInitializer(node: ts.Expression | undefined) {

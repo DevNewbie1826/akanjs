@@ -1,11 +1,12 @@
 import path from "node:path";
 import { optimize } from "@tailwindcss/node";
+import type { AkanNativeAppId, AkanWebConfig } from "akanjs";
 import type { BaseBuildArtifact } from "akanjs/server";
 import { resolveSsrPageEntriesForApp } from "../artifact/implicitRootLayout";
 import { computeRouteSeedIndex, type RouteSeedIndex, saveRouteSeedIndex } from "../artifact/routeSeedIndex";
 import type { App } from "../commandDecorators";
 import { ClientEntriesBundler } from "./clientEntriesBundler";
-import { CssCompiler } from "./cssCompiler";
+import { CssCompiler, type ImportedStylesheet } from "./cssCompiler";
 import { FontOptimizer } from "./fontOptimizer";
 import { PagesBundleBuilder } from "./pagesBundleBuilder";
 import { RouteClientBuilder } from "./routeClientBuilder";
@@ -34,6 +35,12 @@ export class SsrBaseArtifactBuilder {
     this.#command = command;
     this.#artifactDir = `${command === "build" ? app.dist.cwdPath : app.cwdPath}/.akan/artifact`;
     this.#absArtifactDir = path.resolve(this.#artifactDir);
+  }
+
+  //? The web router reads this, so `akan start` writes the whole surface: a native shell asks the dev server for the
+  //? CSR page even when the app ships none, and a narrowed dev artifact hands it the SSR page, which cannot run there.
+  static servedWeb(command: "build" | "start", web: AkanWebConfig): AkanWebConfig {
+    return command === "start" ? { ssr: true, csr: true } : web;
   }
 
   async build(): Promise<BuildSsrBaseArtifactResult> {
@@ -77,14 +84,16 @@ export class SsrBaseArtifactBuilder {
       branches: [...akanConfig.branches],
       i18n: akanConfig.i18n,
       imageConfig: akanConfig.images,
-      deepLinkAssociations: Object.values(akanConfig.mobile.targets)
+      web: SsrBaseArtifactBuilder.servedWeb(this.#command, akanConfig.web),
+      deepLinkAssociations: Object.values(akanConfig.native.targets)
         .filter((target) => (target.deepLinks?.domains?.length ?? 0) > 0)
         .map((target) => ({
           targetName: target.name,
-          appId: target.appId,
+          iosAppId: SsrBaseArtifactBuilder.#appIdOn(target.appId, "ios"),
+          androidAppId: SsrBaseArtifactBuilder.#appIdOn(target.appId, "android"),
           domains: target.deepLinks?.domains ?? [],
-          iosTeamId: target.deepLinks?.ios?.teamId,
-          androidSha256CertFingerprints: target.deepLinks?.android?.sha256CertFingerprints,
+          iosTeamId: target.ios?.teamId,
+          androidSha256CertFingerprints: target.android?.sha256CertFingerprints,
         })),
     };
     await Bun.write(path.join(this.#absArtifactDir, "base-artifact.json"), `${JSON.stringify(artifact, null, 2)}\n`);
@@ -110,7 +119,7 @@ export class SsrBaseArtifactBuilder {
     const ssrBundle = await new ClientEntriesBundler({
       app: this.#app,
       entries: [rscSegmentOutletEntry],
-      ...RouteClientBuilder.resolveSsrClientExternalOptions(this.#command),
+      ...RouteClientBuilder.resolveSsrClientBundleOptions(this.#command),
       outputSubdir: "client-ssr",
       command: this.#command,
     }).bundle();
@@ -184,13 +193,14 @@ export class SsrBaseArtifactBuilder {
   }> {
     const cssCompiler = new CssCompiler(this.#app);
     const cssByBasePath = await cssCompiler.getCssByBasePath();
+    // The style contract (vocabulary closure, WCAG contrast) is enforced by `akan lint`, not by the build.
     const optimizedFonts = await new FontOptimizer(this.#app, this.#command).optimize();
     const cssAssets = Object.fromEntries(
       await Promise.all(
         Object.entries(cssByBasePath).flatMap(([basePath, baseCssText]) => {
           const cssText = [baseCssText, optimizedFonts.css].filter(Boolean).join("\n");
           if (!cssText) return [];
-          return [this.#writeCssAsset(basePath, cssText)];
+          return [this.#writeCssAsset(basePath, cssText, cssCompiler.importedStylesheetsByBasePath[basePath] ?? [])];
         }),
       ),
     );
@@ -199,7 +209,7 @@ export class SsrBaseArtifactBuilder {
     return { cssCompiler, optimizedFonts, cssAssets };
   }
 
-  async #writeCssAsset(basePath: string, cssText: string) {
+  async #writeCssAsset(basePath: string, cssText: string, imported: ImportedStylesheet[]) {
     const cssAssetName = basePath || "root";
     const preparedCssText = await prepareCssAsset(this.#command, basePath, cssText);
     const cssHash = Bun.hash(`${basePath}\n${preparedCssText}`).toString(36);
@@ -208,7 +218,22 @@ export class SsrBaseArtifactBuilder {
       `/_akan/styles/${cssAssetName}-${cssHash}.css`,
     ];
     await Bun.write(path.join(this.#absArtifactDir, cssRelPath), preparedCssText);
+    SsrBaseArtifactBuilder.#warnDroppedImports(this.#app, cssRelPath, preparedCssText, imported);
     this.#app.verbose(`[base-artifact] wrote ${preparedCssText.length} bytes of CSS for ${basePath} -> ${cssRelPath}`);
     return [basePath, { cssUrl, cssRelPath }] as const;
+  }
+
+  // Checked against the written asset, not the compiled text: it is the only stylesheet an SSR render serves.
+  static #appIdOn(appId: AkanNativeAppId, platform: "ios" | "android"): string | null {
+    return typeof appId === "string" ? appId : (appId[platform] ?? appId.default ?? null);
+  }
+
+  static #warnDroppedImports(app: App, cssRelPath: string, css: string, imported: ImportedStylesheet[]) {
+    for (const { cssPath, declaredNames } of imported) {
+      if (declaredNames.length === 0 || declaredNames.some((name) => css.includes(`${name}:`))) continue;
+      app.logger.warn(
+        `[base-artifact] @import ${cssPath} declares ${declaredNames.length} custom propert${declaredNames.length === 1 ? "y" : "ies"} and none of them are in ${cssRelPath}`,
+      );
+    }
   }
 }

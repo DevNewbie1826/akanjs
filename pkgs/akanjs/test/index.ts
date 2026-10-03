@@ -1,5 +1,5 @@
-export { sample } from "./sample";
-export { sampleOf } from "./sampleOf";
+export { type ConformanceCacheKind, ConformanceEnv, type SqlDriver, type SqlDriverKind } from "./conformance";
+export { sample, sampleOf } from "./sampleOf";
 export {
   configureSignalTest,
   getOrSetupSignalTestContext,
@@ -13,4 +13,4 @@ export {
   setupSignalTestTarget,
   terminateSignalTestContext,
 } from "./signalTestRuntime";
-export { TestServer, type TestServerOptions } from "./testServer";
+export { type TestEnv, TestServer, type TestServerOptions } from "./testServer";

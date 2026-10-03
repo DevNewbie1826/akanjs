@@ -1,12 +1,12 @@
-import type { BackendEnv } from "akanjs/base";
+import type { BackendEnv, BaseEnv } from "akanjs/base";
 import type { FetchProxy } from "akanjs/fetch";
 import type { AkanLib } from "akanjs/server";
-import { TestServer, type TestServerOptions } from "./testServer";
+import { type TestEnv, TestServer, type TestServerOptions } from "./testServer";
 
 export interface SignalTestTarget {
   type: "app" | "lib";
   name: string;
-  env: BackendEnv;
+  env: TestEnv;
   fetch: FetchProxy;
   libs: AkanLib[];
 }
@@ -17,10 +17,10 @@ export interface SignalTestContext<Fetch = FetchProxy> {
   terminate: () => Promise<void>;
 }
 
-export type SignalTestOptions = Pick<TestServerOptions, "databaseMode" | "workerId" | "port" | "serverMode">;
+export type SignalTestOptions = Pick<TestServerOptions, "storage" | "workerId" | "port" | "serverMode">;
 
 type SignalServerModule = {
-  env: BackendEnv;
+  env?: BackendEnv;
   fetch: FetchProxy;
   lib: AkanLib;
 };
@@ -33,9 +33,8 @@ let configuredOptions: SignalTestOptions = {};
 export const hasSignalTestContext = () => currentContext !== undefined || pendingContext !== undefined;
 
 export const getSignalTestContext = <Fetch = FetchProxy>() => {
-  if (!currentContext) {
+  if (!currentContext)
     throw new Error("Signal test context is not initialized. Run through `akan test` or call setupSignalTestTarget().");
-  }
   return currentContext as SignalTestContext<Fetch>;
 };
 
@@ -64,13 +63,17 @@ export const terminateSignalTestContext = async () => {
   terminatingContext = undefined;
 };
 
-const importServerModule = async (type: "app" | "lib", name: string): Promise<SignalServerModule> => {
-  return type === "app" ? await import(`@apps/${name}/server`) : await import(`@libs/${name}/server`);
-};
+const importServerModule = async (type: "app" | "lib", name: string): Promise<SignalServerModule> =>
+  type === "app" ? await import(`@apps/${name}/server`) : await import(`@libs/${name}/server`);
 
-const importLibModule = async (name: string): Promise<SignalServerModule> => {
-  return await import(`@libs/${name}/server`);
-};
+const importLibModule = async (name: string): Promise<SignalServerModule> => await import(`@libs/${name}/server`);
+
+//? An app's server.ts is an image entry, so its testing env is read from the file; a lib's server.ts still exports
+//? it, since every app's env.server.type.ts spreads it.
+const importTestingEnv = async (type: "app" | "lib", name: string, targetModule: SignalServerModule) =>
+  type === "app"
+    ? ((await import(`@apps/${name}/env/env.server.testing`)) as { env?: BackendEnv }).env
+    : targetModule.env;
 
 export const setupSignalTestTarget = async <Fetch = FetchProxy>(
   {
@@ -87,14 +90,12 @@ export const setupSignalTestTarget = async <Fetch = FetchProxy>(
   pendingContext = (async () => {
     terminatingContext = undefined;
     const resolvedOptions = { ...configuredOptions, ...options };
-    const env: BackendEnv = {
+    const env: BaseEnv = {
       repoName: process.env.AKAN_PUBLIC_REPO_NAME ?? "akanjs",
       serveDomain: process.env.AKAN_PUBLIC_SERVE_DOMAIN ?? "akanjs.com",
       appName: name,
       environment: "testing",
       operationMode: "local",
-      tunnelUsername: process.env.SSH_TUNNEL_USERNAME ?? "username",
-      tunnelPassword: process.env.SSH_TUNNEL_PASSWORD ?? process.env.AKAN_PUBLIC_REPO_NAME ?? "password",
     };
     TestServer.applyProcessEnv(env, resolvedOptions);
 
@@ -102,15 +103,16 @@ export const setupSignalTestTarget = async <Fetch = FetchProxy>(
       Promise.all((libNames ?? []).filter((libName) => libName !== name).map(importLibModule)),
       importServerModule(type, name),
     ]);
+    const testingEnv = await importTestingEnv(type, name, targetModule);
     const target: SignalTestTarget = {
       type,
       name,
-      env: targetModule.env,
+      env: { ...env, ...testingEnv },
       fetch: targetModule.fetch,
       libs: [...dependencyModules.map((mod) => mod.lib), targetModule.lib],
     };
     const testServer = new TestServer(target.env, target.libs, {
-      databaseMode: "memory",
+      storage: "memory",
       ...resolvedOptions,
     });
     await testServer.init();

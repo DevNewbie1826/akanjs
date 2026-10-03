@@ -1,14 +1,12 @@
+import path from "node:path";
 import type { SysExecutor } from "./executors";
 
 export type AbstractKind = "domain" | "service" | "scalar" | "other";
 
-/** One `*.abstract.md` file: the agent-facing summary a module carries next to its source. */
 export class AbstractDoc {
   static readonly suffix = ".abstract.md";
-  /** `akan quality` warns above this and points at `akan compact`. */
+  /** `akan quality` warns above this. */
   static readonly maxLines = 300;
-  /** `akan compact` floor, and the line budget it compacts down to, so a compacted file is never a candidate again. */
-  static readonly compactMinLines = 40;
   // Abstracts only live in facet folders; globbing the sys root instead would walk node_modules.
   static readonly #facetRoots = "{lib,ui,webkit,srvkit,common,plugin}";
 
@@ -18,7 +16,6 @@ export class AbstractDoc {
   static lineCountOf(content: string) {
     return content.split(/\r?\n/).length;
   }
-  /** Module kind read off the sys-relative path; anything outside a `lib/` module folder is "other". */
   static kindOf(filePath: string): AbstractKind {
     const [root, folder, ...rest] = filePath.split("/");
     if (root !== "lib" || !folder) return "other";
@@ -27,7 +24,9 @@ export class AbstractDoc {
     return folder.startsWith("_") ? "service" : "domain";
   }
   static async findAll(sys: SysExecutor, { module }: { module?: string | null } = {}) {
-    const filePaths = (await sys.getAllFiles(`${AbstractDoc.#facetRoots}/**/*${AbstractDoc.suffix}`)).sort();
+    const filePaths = (await sys.getAllFiles(`${AbstractDoc.#facetRoots}/**/*${AbstractDoc.suffix}`))
+      .map((filePath) => filePath.split(path.sep).join("/"))
+      .sort();
     const docs = await Promise.all(filePaths.map((filePath) => AbstractDoc.read(sys, filePath)));
     if (!module) return docs;
     return docs.filter((doc) => doc.moduleName === module || doc.folderName === module);
@@ -59,8 +58,7 @@ export class AbstractDoc {
   get lineCount() {
     return AbstractDoc.lineCountOf(this.content);
   }
-  // An AI editor answers in prose when it decides nothing needs changing, and that prose would silently
-  // replace the abstract — so a candidate must look like a markdown file and be shorter than what it replaces.
+  // An AI editor that decides nothing needs changing answers in prose, which must not replace the abstract.
   canReplaceWith(candidate: string) {
     const next = candidate.trim();
     if (!next.startsWith("#")) return false;

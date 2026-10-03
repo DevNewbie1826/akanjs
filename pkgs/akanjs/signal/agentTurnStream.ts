@@ -1,0 +1,67 @@
+import { EventStream } from "akanjs/common";
+import type { AgentWireToolCall, LlmLimits, LlmUsage } from "akanjs/service";
+
+interface StreamedTurn {
+  text?: string;
+  toolCalls?: AgentWireToolCall[];
+  stop?: "end" | "toolUse" | "length";
+  usage?: LlmUsage;
+  limits?: LlmLimits;
+}
+
+type RunTurn = (onDelta: (delta: string) => void) => Promise<StreamedTurn>;
+
+// use-agentic WIRE.md: one RunnerEvent JSON per SSE `data:` line, ending with `done`. The signal layer passes a raw
+// `Response` through untouched, which is what lets one mutation serve both shapes.
+export class AgentTurnStream {
+  static wants(request: Bun.BunRequest): boolean {
+    return !!request.headers.get("accept")?.includes("text/event-stream");
+  }
+
+  /** A domain `Err`'s `data` travels with its key, or the chat could not fill the text's placeholders. */
+  static failure(error: unknown): {
+    message: string;
+    data?: Record<string, string | number>;
+    overflow?: { limit?: number };
+  } {
+    const message = error instanceof Error ? error.message : String(error);
+    const raw = (error as { data?: unknown } | null)?.data;
+    const data =
+      raw && typeof raw === "object" && !Array.isArray(raw) ? (raw as Record<string, string | number>) : null;
+    // A wire flag, since a non-akan client cannot be expected to know `agent.error.contextOverflow`.
+    const overflow =
+      message === "agent.error.contextOverflow" ? (typeof data?.limit === "number" ? { limit: data.limit } : {}) : null;
+    return { message, ...(data ? { data } : {}), ...(overflow ? { overflow } : {}) };
+  }
+
+  static response(run: RunTurn): Response {
+    // Nothing to cancel: `run` takes no signal, so a turn whose reader went away finishes with nobody holding it.
+    const stream = new EventStream(() => undefined);
+    void AgentTurnStream.#deliver(stream, run);
+    return stream.response();
+  }
+
+  static async #deliver(stream: EventStream, run: RunTurn) {
+    try {
+      let streamed = 0;
+      const turn = await run((delta) => {
+        if (!delta) return;
+        streamed += delta.length;
+        stream.write({ type: "text", delta });
+      });
+      // An adapter that ignores onDelta still resolves the whole text; deliver it as one late delta.
+      if (!streamed && turn.text) stream.write({ type: "text", delta: turn.text });
+      const toolCalls = turn.toolCalls ?? [];
+      for (const call of toolCalls) stream.write({ type: "toolCall", id: call.id, name: call.name, args: call.args });
+      const stop = turn.stop === "length" ? "length" : turn.stop === "toolUse" || toolCalls.length ? "toolUse" : "end";
+      const usage = turn.usage ? { input: turn.usage.inputTokens, output: turn.usage.outputTokens } : null;
+      const limits = turn.limits && (turn.limits.window || turn.limits.output) ? turn.limits : null;
+      stream.write({ type: "done", stop, ...(usage ? { usage } : {}), ...(limits ? { limits } : {}) });
+    } catch (error) {
+      // The status line is long gone once the stream is open.
+      stream.write({ type: "error", ...AgentTurnStream.failure(error) });
+    } finally {
+      stream.close();
+    }
+  }
+}

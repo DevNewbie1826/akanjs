@@ -1,6 +1,8 @@
 "use client";
 import { cnst, msg, st, usePage } from "@libs/shared/client";
-import { clsx } from "akanjs/client";
+import { buttonRecipe } from "@libs/util/ui";
+import { Int } from "akanjs/base";
+import { cn } from "akanjs/client";
 import { Input, Radio } from "akanjs/ui";
 import { useEffect, useState } from "react";
 
@@ -15,6 +17,23 @@ export const LeaveInfo = ({ className, redirect, leaveReasons, comeBackReasons }
   useEffect(() => {
     st.do.setLeaveInfo(new cnst.LeaveInfo());
   }, []);
+  st.tool("answerLeaveSurvey")
+    .desc(
+      "Answer the leaving survey — why you are going, how satisfied you were, and anything else. It does not close the account.",
+    )
+    .opt("type", cnst.LeaveType)
+    .opt("reason", String)
+    .opt("satisfaction", Int)
+    .opt("voc", String)
+    .exec((type, reason, satisfaction, voc) =>
+      st.do.setLeaveInfo({
+        ...leaveInfo,
+        ...(type ? { type } : {}),
+        ...(reason ? { reason } : {}),
+        ...(satisfaction ? { satisfaction } : {}),
+        ...(voc ? { voc } : {}),
+      }),
+    );
   if (leaveInfo.type === "noReply")
     return (
       <LeaveTypeStep
@@ -70,12 +89,12 @@ export const LeaveTypeStep = ({ className, value, onChange }: LeaveTypeStepProps
   const { l } = usePage();
   const [type, setType] = useState<cnst.LeaveType["value"]>(value);
   return (
-    <div className={clsx("flex h-full flex-col items-center justify-center gap-4", className)}>
+    <div className={cn("flex h-full flex-col items-center justify-center gap-4", className)}>
       <div className="mb-10 w-full text-xl">
-        탈퇴를 선택하셨습니다.
+        {l("leaveInfo.leaveChosen")}
         <br />
         <br />
-        탈퇴 후 재가입 의향이 있으신가요?
+        {l("leaveInfo.askComeback")}
       </div>
       <Radio
         className="flex flex-col items-start justify-start gap-5 px-2"
@@ -91,7 +110,7 @@ export const LeaveTypeStep = ({ className, value, onChange }: LeaveTypeStepProps
         ))}
       </Radio>
       <button
-        className="btn btn-primary w-full"
+        className={buttonRecipe({ variant: "primary" }, "w-full")}
         onClick={() => {
           onChange(type);
         }}
@@ -109,28 +128,29 @@ interface ReasonProps {
   value: string | null;
   onChange: (value: string) => void;
 }
-
-export const Reason = ({
-  className,
-  leaveReasons = [
-    "사용해보니 서비스를 사용할 의사가 없어서",
-    "동일한 다른 서비스 앱을 사용하기 위해서",
-    "광고(푸시, 알림)이 번거로워서",
-    "이벤트, 호기심 등으로 일시적으로 가입했기 때문에",
-    "보기에 없음",
-  ],
-  comeBackReasons = ["가입정보를 수정하기 위해서", "시간이 지나고 다시 사용하기 위해서", "보기에 없음"],
-  value,
-  onChange,
-}: ReasonProps) => {
+export const Reason = ({ className, leaveReasons, comeBackReasons, value, onChange }: ReasonProps) => {
   const { l } = usePage();
   const leaveInfo = st.use.leaveInfo();
-  const askText =
-    leaveInfo.type === "comeback" ? "재가입 의향이 있으신 이유는 무엇인가요?" : "탈퇴의 가장 큰 이유는 무엇인가요?";
-  const reasons = leaveInfo.type === "comeback" ? comeBackReasons : leaveReasons;
+  const askText = leaveInfo.type === "comeback" ? l("leaveInfo.askComebackReason") : l("leaveInfo.askLeaveReason");
+  const defaultComebackReasonKeys = [
+    "leaveInfo.comebackReasonEditInfo",
+    "leaveInfo.comebackReasonLater",
+    "leaveInfo.reasonNone",
+  ] as const;
+  const defaultLeaveReasonKeys = [
+    "leaveInfo.leaveReasonNoIntent",
+    "leaveInfo.leaveReasonOtherService",
+    "leaveInfo.leaveReasonAds",
+    "leaveInfo.leaveReasonTemporary",
+    "leaveInfo.reasonNone",
+  ] as const;
+  const reasons =
+    leaveInfo.type === "comeback"
+      ? (comeBackReasons ?? defaultComebackReasonKeys.map((key) => l(key)))
+      : (leaveReasons ?? defaultLeaveReasonKeys.map((key) => l(key)));
   const [reason, setReason] = useState<string | null>(value);
   return (
-    <div className={clsx("flex flex-col items-center justify-center gap-4", className)}>
+    <div className={cn("flex flex-col items-center justify-center gap-4", className)}>
       <div className="mb-10 w-full text-xl">{askText}</div>
       <Radio
         className="flex flex-col items-start justify-start gap-5 px-2"
@@ -146,7 +166,7 @@ export const Reason = ({
         ))}
       </Radio>
       <button
-        className="btn btn-primary w-full"
+        className={buttonRecipe({ variant: "primary" }, "w-full")}
         disabled={!reason}
         onClick={() => {
           if (reason) onChange(reason);
@@ -165,11 +185,18 @@ interface SatisfactionProps {
 }
 export const Satisfaction = ({ className, value, onChange }: SatisfactionProps) => {
   const { l } = usePage();
-  const satisfyLevel = ["매우 만족", "만족", "보통", "불만족", "매우 불만족"];
   const [satisfaction, setSatisfaction] = useState<number | null>(value);
+
+  const satisfactionKeys = [
+    "leaveInfo.satisfactionVerySatisfied",
+    "leaveInfo.satisfactionSatisfied",
+    "leaveInfo.satisfactionNeutral",
+    "leaveInfo.satisfactionUnsatisfied",
+    "leaveInfo.satisfactionVeryUnsatisfied",
+  ] as const;
   return (
-    <div className={clsx("flex flex-col items-center justify-center gap-4", className)}>
-      <div className="mb-10 w-full text-xl">서비스에 대해 얼마나 만족하셨나요?</div>
+    <div className={cn("flex flex-col items-center justify-center gap-4", className)}>
+      <div className="mb-10 w-full text-xl">{l("leaveInfo.askSatisfaction")}</div>
       <Radio
         className="flex flex-col items-start justify-start gap-5 px-2"
         value={satisfaction}
@@ -177,14 +204,15 @@ export const Satisfaction = ({ className, value, onChange }: SatisfactionProps) 
           if (typeof satisfaction !== "string") setSatisfaction(satisfaction);
         }}
       >
-        {satisfyLevel.map((answer, idx) => (
-          <Radio.Item className="pl-1 text-start" key={idx} value={idx}>
-            {answer}
+        {/* satisfaction is 1–5; a 0-based index would drop the first option */}
+        {satisfactionKeys.map((key, idx) => (
+          <Radio.Item className="pl-1 text-start" key={idx} value={idx + 1}>
+            {l(key)}
           </Radio.Item>
         ))}
       </Radio>
       <button
-        className="btn btn-primary w-full"
+        className={buttonRecipe({ variant: "primary" }, "w-full")}
         disabled={satisfaction === null}
         onClick={() => {
           if (satisfaction !== null) onChange(satisfaction);
@@ -203,30 +231,38 @@ interface VocProps {
   redirect?: string;
 }
 export const Voc = ({ className, value, onChange, redirect }: VocProps) => {
+  const { l } = usePage();
+  st.tool("leaveService", { confirm: l("leaveInfo.leaveConfirmPermanent") })
+    .desc("Close this account for good and submit the leaving survey with it.")
+    .exec(async () => {
+      await st.do.setLeaveInfoOfSelf();
+      await st.do.removeSelf({ redirect });
+      msg.success("user.leaveSuccess");
+    });
   return (
-    <div className={clsx("flex flex-col items-center justify-center gap-4", className)}>
-      <div className="mb-10 w-full text-xl">운영진에 바라는 개선사항을 알려주세요.</div>
+    <div className={cn("flex flex-col items-center justify-center gap-4", className)}>
+      <div className="mb-10 w-full text-xl">{l("leaveInfo.askVoc")}</div>
       <Input.TextArea
         autoFocus
         className="w-full"
-        inputClassName="p-2 w-full rounded-md h-[300px] resize-none bg-base-100"
+        inputClassName="p-2 w-full rounded-md h-[300px] resize-none bg-background"
         value={value ?? ""}
         validate={(value) => true}
-        placeholder="기타 의견을 남겨주세요."
+        placeholder={l("leaveInfo.vocPlaceholder")}
         onChange={(voc) => {
           onChange(voc);
         }}
       />
       <button
-        className="btn btn-secondary w-full"
+        className={buttonRecipe({ variant: "secondary" }, "w-full")}
         onClick={async () => {
           await st.do.setLeaveInfoOfSelf();
-          if (!window.confirm("탈퇴하시겠습니까?")) return;
+          if (!window.confirm(l("leaveInfo.leaveConfirm"))) return;
           await st.do.removeSelf({ redirect });
           msg.success("user.leaveSuccess");
         }}
       >
-        제출후 탈퇴하기
+        {l("leaveInfo.submitAndLeave")}
       </button>
     </div>
   );

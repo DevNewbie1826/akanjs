@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, test } from "bun:test";
-import { dayjs, INJECT_META, Int } from "akanjs/base";
+import { Any, dayjs, INJECT_META, Int } from "akanjs/base";
 import { ConstantRegistry, via } from "akanjs/constant";
 import { by, type DatabaseCls, DatabaseRegistry, from, getFilterInfoByKey, into } from "akanjs/document";
 import type { ServerSignal, ServerSignalCls } from "akanjs/signal";
@@ -47,8 +47,11 @@ class TestItemFilter extends from(TestItemFull, (filter) => ({
       .opt("category", String)
       .query((category) => ({ category })),
     withMeta: filter()
-      .arg("meta", Object)
-      .query((meta) => ({ meta })),
+      .arg("meta", Any)
+      .query((meta) => ({ meta: meta as string })),
+    scoredAbove: filter()
+      .arg("score", Int)
+      .query((score, q) => ({ score: q.gt(score) })),
   },
   sort: {
     scoreHigh: { score: -1 },
@@ -65,7 +68,7 @@ const testItemDatabase = DatabaseRegistry.buildModel(
   TestItemDoc,
   TestItemModel,
   TestItemObject,
-  TestItemInsight,
+  TestItemInsight as unknown as Parameters<typeof DatabaseRegistry.buildModel>[5],
   TestItemFilter,
 );
 
@@ -94,7 +97,7 @@ const promoteParentDatabase = DatabaseRegistry.buildModel(
   PromoteParentDoc,
   PromoteParentModel,
   PromoteParentObject,
-  PromoteParentInsight,
+  PromoteParentInsight as unknown as Parameters<typeof DatabaseRegistry.buildModel>[5],
   PromoteParentFilter,
 );
 
@@ -124,7 +127,7 @@ const promoteChildDatabase = DatabaseRegistry.buildModel(
   PromoteChildDoc,
   PromoteChildModel,
   PromoteChildObject,
-  PromoteChildInsight,
+  PromoteChildInsight as unknown as Parameters<typeof DatabaseRegistry.buildModel>[5],
   PromoteChildFilter,
 );
 
@@ -225,14 +228,21 @@ const makeFakeDatabaseModel = () => {
   return model;
 };
 
+const CallStateInput = via((f) => ({ status: f(String), muted: f(Boolean, { default: false }) }));
+ConstantRegistry.buildScalar("serviceTestCallState", CallStateInput, { CallStateInput });
+
 const dbMethods = ServiceModel.getDefaultDbServiceMethods("ServiceTestItem");
 const filterMethods = ServiceModel.getFilterServiceMethods(
   "inCategory",
-  getFilterInfoByKey(TestItemFilter, "inCategory").queryFn as (...args: unknown[]) => Record<string, unknown>,
+  getFilterInfoByKey(TestItemFilter, "inCategory"),
 );
 const metaFilterMethods = ServiceModel.getFilterServiceMethods(
   "withMeta",
-  getFilterInfoByKey(TestItemFilter, "withMeta").queryFn as (...args: unknown[]) => Record<string, unknown>,
+  getFilterInfoByKey(TestItemFilter, "withMeta"),
+);
+const scoreFilterMethods = ServiceModel.getFilterServiceMethods(
+  "scoredAbove",
+  getFilterInfoByKey(TestItemFilter, "scoredAbove"),
 );
 type ServiceInstance = Service &
   DatabaseService &
@@ -289,8 +299,65 @@ describe("adapt and serve factories", () => {
     const adaptor = new TestAdaptor();
 
     expect(adaptor.logger).toBeDefined();
-    await expect(adaptor.onInit()).resolves.toBeUndefined();
-    await expect(adaptor.onDestroy()).resolves.toBeUndefined();
+    expect(await adaptor.onInit()).toBeUndefined();
+    expect(await adaptor.onDestroy()).toBeUndefined();
+  });
+
+  test("runs sync lifecycle hooks on adaptors and services", async () => {
+    const calls: string[] = [];
+    class SyncAdaptor extends adapt("serviceTestSyncAdaptor" as const, () => ({})) {
+      override onInit() {
+        calls.push("adaptor:init");
+      }
+      override onDestroy() {
+        calls.push("adaptor:destroy");
+      }
+    }
+    class SyncParent extends serve("serviceTestSyncParent" as const, () => ({})) {
+      override onInit() {
+        calls.push("parent:init");
+      }
+      override onDestroy() {
+        calls.push("parent:destroy");
+      }
+    }
+    class SyncChild extends serve("serviceTestSyncChild" as const, () => ({}), SyncParent) {
+      override onInit() {
+        calls.push("child:init");
+      }
+      override async onDestroy() {
+        await Promise.resolve();
+        calls.push("child:destroy");
+      }
+    }
+
+    const adaptor = new SyncAdaptor();
+    await adaptor.onInit();
+    await adaptor.onDestroy();
+
+    const child = new SyncChild();
+    await child._libsOnInit();
+    await child._libsOnDestroy();
+
+    expect(calls).toEqual([
+      "adaptor:init",
+      "adaptor:destroy",
+      "parent:init",
+      "child:init",
+      "parent:destroy",
+      "child:destroy",
+    ]);
+  });
+
+  test("rejects _libsOnInit when a sync hook throws", async () => {
+    class ThrowingParent extends serve("serviceTestSyncThrower" as const, () => ({})) {
+      override onInit() {
+        throw new Error("sync boom");
+      }
+    }
+    class ThrowingChild extends serve("serviceTestSyncThrowerChild" as const, () => ({}), ThrowingParent) {}
+
+    await expect(new ThrowingChild()._libsOnInit()).rejects.toThrow("sync boom");
   });
 
   test("creates plain services with lowerlized names, enabled flags, and lifecycle mixins", async () => {
@@ -342,6 +409,35 @@ describe("adapt and serve factories", () => {
     await child._libsOnDestroy();
 
     expect(calls).toEqual(["parentOne:init", "parentTwo:init", "child:init", "parentOne:destroy", "child:destroy"]);
+  });
+
+  test("resolves a thunk enabled option once, on first read", () => {
+    let evaluations = 0;
+    let allowed = false;
+    class LazyService extends serve(
+      "serviceTestLazyEnabled" as const,
+      {
+        enabled: () => {
+          evaluations += 1;
+          return allowed;
+        },
+      },
+      () => ({}),
+    ) {}
+
+    expect(evaluations).toBe(0);
+    allowed = true;
+    expect(LazyService.enabled).toBe(true);
+    allowed = false;
+    expect(LazyService.enabled).toBe(true);
+    expect(evaluations).toBe(1);
+  });
+
+  test("keeps a falsy thunk result cached", () => {
+    class DisabledService extends serve("serviceTestLazyDisabled" as const, { enabled: () => false }, () => ({})) {}
+
+    expect(DisabledService.enabled).toBe(false);
+    expect(DisabledService.enabled).toBe(false);
   });
 
   test("creates database services with database injection metadata", () => {
@@ -541,6 +637,15 @@ describe("dependency injection resolution", () => {
         map.set(key, value);
         hashValues.set(hashKey, map);
       },
+      async hsetIfAbsent(topic: string, prop: string, key: string, value: unknown, option?: CacheSetOptions) {
+        calls.push({ method: "hsetIfAbsent", args: [topic, prop, key, value, option] });
+        const hashKey = `${topic}:${prop}`;
+        const map = hashValues.get(hashKey) ?? new Map<string, unknown>();
+        if (map.has(key)) return false;
+        map.set(key, value);
+        hashValues.set(hashKey, map);
+        return true;
+      },
       async hdelete(topic: string, prop: string, key: string) {
         calls.push({ method: "hdelete", args: [topic, prop, key] });
         hashValues.get(`${topic}:${prop}`)?.delete(key);
@@ -571,6 +676,71 @@ describe("dependency injection resolution", () => {
     expect(() => builder.memory(Map)).toThrow("of should be provided");
   });
 
+  test("carries a structured memory value as text so both caches hold the same thing", async () => {
+    const cache = makeFakeCache();
+    class CacheAdaptorRef extends adapt("solidCache") {}
+    const registry = getDefaultInjectRegistry();
+    registry.adaptorCls.set("solidCache", CacheAdaptorRef);
+    registry.adaptor.set(CacheAdaptorRef, cache as unknown as Adaptor);
+
+    class StateService extends serve("serviceTestState" as const, ({ memory }) => ({
+      participants: memory(Map, { of: CallStateInput }),
+    })) {}
+    const instance = new StateService() as StateService & {
+      participants: {
+        get: (key: string) => Promise<{ status: string; muted: boolean } | undefined>;
+        set: (key: string, value: { status: string; muted: boolean }) => Promise<void>;
+      };
+    };
+    await InjectInfo.resolveInjection(instance, StateService, registry, {} as never);
+
+    await instance.participants.set("user-1", { status: "speaking", muted: false });
+
+    // Redis coerces an object to "[object Object]" while the sqlite cache JSONs it, so objects must leave encoded.
+    const stored = cache.calls.at(-1)?.args[3];
+    expect(typeof stored).toBe("string");
+    expect(JSON.parse(stored as string)).toMatchObject({ status: "speaking", muted: false });
+    expect(await instance.participants.get("user-1")).toMatchObject({ status: "speaking", muted: false });
+  });
+
+  test("keeps each service's memory its own and applies the declared get, set and default", async () => {
+    const cache = makeFakeCache();
+    class CacheAdaptorRef extends adapt("solidCache") {}
+    const registry = getDefaultInjectRegistry();
+    registry.adaptorCls.set("solidCache", CacheAdaptorRef);
+    registry.adaptor.set(CacheAdaptorRef, cache as unknown as Adaptor);
+
+    class FirstService extends serve("serviceTestFirst" as const, ({ memory }) => ({
+      token: memory(String),
+      counter: memory(Int, { default: 7 }),
+      tags: memory(Map, {
+        of: String,
+        get: (value: string) => value.split(","),
+        set: (tags: string[]) => tags.join(","),
+      }),
+      seen: memory(Map, { of: Int, local: true }),
+    })) {}
+    class SecondService extends serve("serviceTestSecond" as const, ({ memory }) => ({ token: memory(String) })) {}
+    const first = new FirstService();
+    const second = new SecondService();
+    await InjectInfo.resolveInjection(first, FirstService, registry, {} as never);
+    await InjectInfo.resolveInjection(second, SecondService, registry, {} as never);
+
+    await first.token.set("first");
+    await second.token.set("second");
+    expect(await first.token.get()).toBe("first");
+    expect(await second.token.get()).toBe("second");
+
+    expect(await first.counter.get()).toBe(7);
+
+    await first.tags.set("post-1", ["a", "b"]);
+    expect(cache.calls.at(-1)?.args[3]).toBe("a,b");
+    expect(await first.tags.get("post-1")).toEqual(["a", "b"]);
+    expect(await first.tags.entries()).toEqual([["post-1", ["a", "b"]]]);
+
+    expect(first.seen).toBeInstanceOf(Map);
+  });
+
   test("resolves use, env, plug, service, database, signal, and memory injections", async () => {
     const cache = makeFakeCache();
     class CacheAdaptorRef extends adapt("solidCache") {}
@@ -587,7 +757,6 @@ describe("dependency injection resolution", () => {
     const cacheAdaptor = cache as unknown as Adaptor;
     const plugAdaptor = new PlugAdaptor() as unknown as PlugAdaptor & Adaptor;
     const depService = new DepService();
-    const defaultExpireAt = dayjs().add(1, "hour");
 
     registry.uses.set("plainUse", "use-value");
     registry.adaptorCls.set("solidCache", CacheAdaptorRef);
@@ -611,8 +780,8 @@ describe("dependency injection resolution", () => {
       depService: service<DepService>(),
       testSignal: signal<typeof signal>(),
       localCounter: memory(Int, { local: true, default: 3 }),
-      remoteValue: memory(String, { expireAt: defaultExpireAt }),
-      remoteMap: memory(Map, { of: String, expireAt: defaultExpireAt }),
+      remoteValue: memory(String, { ttl: 3_600_000 }),
+      remoteMap: memory(Map, { of: String, ttl: 3_600_000 }),
     })) {}
     Object.assign(TargetService[INJECT_META], {
       serviceTestItemModel: new InjectInfo("database", { parentRefName: "serviceTestItem" }),
@@ -668,8 +837,10 @@ describe("dependency injection resolution", () => {
     await instance.remoteValue.set("hello");
     let lastCacheCall = cache.calls.at(-1);
     expect(lastCacheCall?.method).toBe("set");
-    expect(lastCacheCall?.args.slice(0, 3)).toEqual(["akan:memory", "remoteValue", "hello"]);
-    expect(lastCacheCall?.args[3]).toEqual({ expireAt: defaultExpireAt });
+    expect(lastCacheCall?.args.slice(0, 3)).toEqual(["akan:memory:serviceTestTarget", "remoteValue", "hello"]);
+    const expireAtOf = (call = cache.calls.at(-1), idx = 3) =>
+      Math.round((call?.args[idx] as CacheSetOptions | undefined)?.expireAt?.diff(dayjs(), "minute", true) ?? 0);
+    expect(expireAtOf(lastCacheCall)).toBe(60);
     expect(await instance.remoteValue.get()).toBe("hello");
     await instance.remoteValue.delete();
     expect(await instance.remoteValue.get()).toBeNull();
@@ -683,7 +854,7 @@ describe("dependency injection resolution", () => {
     await instance.remoteMap.delete("ko");
     expect(await instance.remoteMap.get("ko")).toBeUndefined();
     expect(await instance.remoteMap.getOrInsert("ko", "다시 안녕")).toBe("다시 안녕");
-    expect(cache.calls.at(-1)?.args[4]).toEqual({ expireAt: defaultExpireAt });
+    expect(expireAtOf(cache.calls.at(-1), 4)).toBe(60);
     const hsetCountAfterInsert = cache.calls.filter((call) => call.method === "hset").length;
     expect(await instance.remoteMap.getOrInsert("ko", "덮어쓰기")).toBe("다시 안녕");
     expect(cache.calls.filter((call) => call.method === "hset")).toHaveLength(hsetCountAfterInsert);
@@ -827,5 +998,33 @@ describe("filter query and sort utility methods", () => {
     await service.listWithMeta(meta);
 
     expect(fakeDb.calls).toEqual([{ method: "__list", args: [{ meta }, {}] }]);
+  });
+
+  test("reads a trailing query option the way the runtime filter methods do", async () => {
+    const fakeDb = makeFakeDatabaseModel();
+    const service = { __databaseModel: fakeDb } as unknown as RuntimeServiceInstance;
+    Object.assign(service, dbMethods, filterMethods);
+
+    await service.listInCategory("notice", { sample: 2 });
+    await service.listInCategory({ sort: null, limit: null });
+    await service.countInCategory();
+
+    expect(fakeDb.calls).toEqual([
+      { method: "__list", args: [{ category: "notice" }, { sample: 2 }] },
+      { method: "__list", args: [{ category: undefined }, { sort: null, limit: null }] },
+      { method: "__count", args: [{ category: undefined }] },
+    ]);
+  });
+
+  test("hands a filter's query the query helper", async () => {
+    const fakeDb = makeFakeDatabaseModel();
+    const service = { __databaseModel: fakeDb } as unknown as RuntimeServiceInstance;
+    Object.assign(service, dbMethods, scoreFilterMethods);
+    const scoreAboveThree = { score: { kind: "op", op: "gt", value: 3 } };
+
+    expect(service.queryScoredAbove(3)).toEqual(scoreAboveThree);
+    await service.existsScoredAbove(3);
+
+    expect(fakeDb.calls).toEqual([{ method: "__exists", args: [scoreAboveThree] }]);
   });
 });

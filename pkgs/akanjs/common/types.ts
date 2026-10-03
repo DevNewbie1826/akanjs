@@ -5,7 +5,10 @@ export interface FetchPolicy<Returns = unknown> {
   onError?: (error: string) => void;
   token?: string;
   partial?: string[];
-  timeout?: number;
+  /** Milliseconds, or `false` to wait as long as the runtime will; overrides the endpoint's declared `timeout`. */
+  timeout?: number | false;
+  /** `pubsub` only: called after a resubscribe, since whatever was published while the socket was down is gone. */
+  onResync?: () => void;
 }
 
 export type SnakeCase<S extends string> = S extends `${infer T}_${infer U}` ? `${Lowercase<T>}_${SnakeCase<U>}` : S;
@@ -13,3 +16,6 @@ export type SnakeCaseObj<T> = {
   [K in keyof T as SnakeCase<K & string>]: T[K] extends object ? SnakeCaseObj<T[K]> : T[K];
 };
 export type SnakeMsg<Msg> = SnakeCaseObj<Msg>;
+
+/** Name-based dispatch over a generated surface: `as DynamicRecord` to index, then cast the read, never `as any`. */
+export type DynamicRecord<Value = unknown> = { [key: string]: Value };

@@ -1,11 +1,47 @@
 import type { DataList, GetStateObject, PromiseOrObject } from "akanjs/base";
 import type { ExtractSort, FilterInstance } from "akanjs/document";
 
-/** Metadata that identifies a generated slice list/insight request. */
 export type SliceMeta = {
   refName: string;
   sliceName: string;
   argLength: number;
+};
+
+/** What the root slice takes: one of the model's declared filter queries, and the args that filter asks for. */
+export interface QuerySetting {
+  queryKey: string;
+  /** Read when the query is applied, so a thunk keeps an arg relative to now. */
+  args?: unknown[] | (() => unknown[]);
+  /** `args` under the framework's usual name (`queryArgsOf<Model>`, a field's `.meta(...)`); `args` wins over it. */
+  queryArgs?: unknown[] | (() => unknown[]);
+}
+
+type ServerInitShape<
+  RefName extends string,
+  QueryArgs,
+  CapRefName extends string,
+  LightObj,
+  InsightObj,
+  Sort,
+> = SliceMeta & {
+  [K in `${RefName}ObjList`]: LightObj[];
+} & {
+  /** `null` when the caller passed `{ insight: false }`: the aggregate query was never made. */
+  [K in `${RefName}ObjInsight`]: InsightObj | null;
+} & {
+  [K in `pageOf${CapRefName}`]: number;
+} & {
+  [K in `lastPageOf${CapRefName}`]: number;
+} & {
+  [K in `limitOf${CapRefName}`]: number;
+} & {
+  [K in `hasMoreOf${CapRefName}`]: boolean;
+} & {
+  [K in `queryArgsOf${CapRefName}`]: QueryArgs;
+} & {
+  [K in `sortOf${CapRefName}`]: Sort;
+} & {
+  [K in `${RefName}InitAt`]: Date;
 };
 
 export type ServerInit<
@@ -14,48 +50,27 @@ export type ServerInit<
   Insight = any,
   QueryArgs = any,
   Filter extends FilterInstance = any,
-  _CapitalizedRefName extends string = Capitalize<RefName>,
-  _LightObj = GetStateObject<Light>,
-  _InsightObj = GetStateObject<Insight>,
-  _Sort = ExtractSort<Filter>,
-> = SliceMeta & {
-  [K in `${RefName}ObjList`]: _LightObj[];
-} & {
-  [K in `${RefName}ObjInsight`]: _InsightObj;
-} & {
-  [K in `pageOf${_CapitalizedRefName}`]: number;
-} & {
-  [K in `lastPageOf${_CapitalizedRefName}`]: number;
-} & {
-  [K in `limitOf${_CapitalizedRefName}`]: number;
-} & {
-  [K in `queryArgsOf${_CapitalizedRefName}`]: QueryArgs;
-} & {
-  [K in `sortOf${_CapitalizedRefName}`]: _Sort;
-} & {
-  [K in `${RefName}InitAt`]: Date;
-};
-/** Client/server-friendly return type for initialized list and insight data. */
+> = ServerInitShape<
+  RefName,
+  QueryArgs,
+  Capitalize<RefName>,
+  GetStateObject<Light>,
+  GetStateObject<Insight>,
+  ExtractSort<Filter>
+>;
 export type ClientInit<
   RefName extends string,
   Light,
   Insight = any,
   QueryArgs = any,
   Filter extends FilterInstance = any,
-  _CapitalizedRefName extends string = Capitalize<RefName>,
-  _LightObj = GetStateObject<Light>,
-  _InsightObj = GetStateObject<Insight>,
-  _Sort = ExtractSort<Filter>,
-> = PromiseOrObject<
-  ServerInit<RefName, Light, Insight, QueryArgs, Filter, _CapitalizedRefName, _LightObj, _InsightObj, _Sort>
->;
+> = PromiseOrObject<ServerInit<RefName, Light, Insight, QueryArgs, Filter>>;
 
 export type ServerView<RefName extends string, Model> = { refName: RefName } & {
   [K in `${RefName}Obj`]: GetStateObject<Model>;
 } & {
   [K in `${RefName}ViewAt`]: Date;
 };
-/** Client/server-friendly return type for a single model view payload. */
 export type ClientView<RefName extends string, Model> = PromiseOrObject<ServerView<RefName, Model>>;
 
 export type ServerEdit<RefName extends string, Model> = { refName: RefName } & {
@@ -77,6 +92,39 @@ export type EditReturn<RefName extends string, Full> = {
   [K in `${RefName}Edit`]: ServerEdit<RefName, Full>;
 };
 
+/** Awaitable as the shape the helper always gave, and destructurable into one promise per field. */
+export type FetchHandleOf<Awaited, Fields> = PromiseLike<Awaited> & Fields;
+
+export type ViewHandle<RefName extends string, Full> = FetchHandleOf<
+  ViewReturn<RefName, Full>,
+  {
+    [K in RefName]: Promise<Full>;
+  } & {
+    [K in `${RefName}View`]: Promise<ServerView<RefName, Full>>;
+  }
+>;
+
+export type EditHandle<RefName extends string, Full> = FetchHandleOf<
+  EditReturn<RefName, Full>,
+  {
+    [K in RefName]: Promise<Full>;
+  } & {
+    [K in `${RefName}Edit`]: Promise<ServerEdit<RefName, Full>>;
+  }
+>;
+
+type InitReturnShape<
+  RefName extends string,
+  CapSuffix extends string,
+  Init,
+  ListItem extends { id: string },
+  Insight,
+> = {
+  [K in `${RefName}Init${CapSuffix}`]: Init;
+} & {
+  [K in `${RefName}List${CapSuffix}`]: DataList<ListItem>;
+} & { [K in `${RefName}Insight${CapSuffix}`]: Insight };
+
 export type InitReturn<
   RefName extends string,
   Suffix extends string,
@@ -84,26 +132,44 @@ export type InitReturn<
   Insight,
   Args,
   Filter extends FilterInstance,
-  _CapitalizedRefName extends string = Capitalize<RefName>,
-  _CapitalizedSuffix extends string = Capitalize<Suffix>,
-  _Light extends { id: string } = Light extends { id: string } ? Light : { id: string },
-  _LightObj = GetStateObject<_Light>,
-  _InsightObj = GetStateObject<Insight>,
-  _Sort = ExtractSort<Filter>,
-> = {
-  [K in `${RefName}Init${_CapitalizedSuffix}`]: ServerInit<
-    RefName,
-    Light,
-    Insight,
-    Args,
-    Filter,
-    _CapitalizedRefName,
-    _LightObj,
-    _InsightObj,
-    _Sort
-  >;
-} & {
-  [K in `${RefName}List${_CapitalizedSuffix}`]: DataList<_Light>;
-} & { [K in `${RefName}Insight${_CapitalizedSuffix}`]: Insight };
+> = InitReturnShape<
+  RefName,
+  Capitalize<Suffix>,
+  ServerInit<RefName, Light, Insight, Args, Filter>,
+  Light extends { id: string } ? Light : { id: string },
+  Insight
+>;
 
-// ============= Method Generators =============
+/**
+ * `x<Slice>List` lands before `x<Slice>Init`, which needs the count. List and Insight hold hydrated instances React
+ * Flight refuses as client props: consume them in a server component and hand `x<Slice>Init` to a `Zone`.
+ */
+type InitHandleShape<
+  RefName extends string,
+  CapSuffix extends string,
+  Init,
+  ListItem extends { id: string },
+  Insight,
+> = {
+  [K in `${RefName}Init${CapSuffix}`]: Promise<Init>;
+} & {
+  [K in `${RefName}List${CapSuffix}`]: Promise<DataList<ListItem>>;
+} & { [K in `${RefName}Insight${CapSuffix}`]: Promise<Insight> };
+
+export type InitHandle<
+  RefName extends string,
+  Suffix extends string,
+  Light,
+  Insight,
+  Args,
+  Filter extends FilterInstance,
+> = FetchHandleOf<
+  InitReturn<RefName, Suffix, Light, Insight, Args, Filter>,
+  InitHandleShape<
+    RefName,
+    Capitalize<Suffix>,
+    ServerInit<RefName, Light, Insight, Args, Filter>,
+    Light extends { id: string } ? Light : { id: string },
+    Insight
+  >
+>;

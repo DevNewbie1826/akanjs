@@ -4,15 +4,13 @@ import type { ReactNode } from "react";
 import { PageCSR } from "./PageCSR";
 
 export interface PageProps<Return> {
-  /** Route component used by the CSR page wrapper. */
+  /** The route component, which keys the CSR loader cache. */
   of: (props: unknown) => ReactNode | null;
-  /** Async data loader shared by SSR and CSR rendering. */
   loader: () => Promise<Return>;
-  /** Render callback invoked with the loaded data. */
   render: (data: Return) => ReactNode;
-  /** Optional loading renderer used while CSR data is pending. */
+  /** Shown while CSR data is pending. */
   loading?: () => ReactNode;
-  /** Disable cached CSR loader results when fresh data is required. */
+  /** Skips the per-path CSR loader cache. */
   noCache?: boolean;
 }
 const Page: <Return>(props: PageProps<Return>) => ReactNode =
@@ -29,9 +27,8 @@ const Page: <Return>(props: PageProps<Return>) => ReactNode =
                 error instanceof Error ? error.message : typeof error === "string" ? error : "Unknown error";
               if (message === "NEXT_REDIRECT") reject(error);
               else {
-                // eslint-disable-next-line no-console
                 console.error(error);
-                resolve(<div className="text-red-500">{message}</div>);
+                resolve(<div className="text-destructive">{message}</div>);
               }
             });
         });

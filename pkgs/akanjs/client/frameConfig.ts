@@ -1,3 +1,4 @@
+import { isRecord } from "akanjs/common";
 import type { PageConfig, PageSafeAreaConfig, PageState, SsrRenderMode, TransitionType } from "./csrTypes";
 
 export type DevicePlatform = "ios" | "android" | "web" | (string & {});
@@ -31,9 +32,6 @@ const transitionTypes = new Set<TransitionType>(["none", "fade", "bottomUp", "st
 const ssrRenderModes = new Set<SsrRenderMode>(["stream", "block"]);
 const DEFAULT_BOOLEAN_INSET = 48;
 
-const isRecord = (value: unknown): value is Record<string, unknown> =>
-  typeof value === "object" && value !== null && !Array.isArray(value);
-
 const hasOwn = <Key extends PropertyKey>(value: object, key: Key) => Object.hasOwn(value, key);
 
 export function validatePageConfig(routeKey: string, config?: PageConfig) {
@@ -54,15 +52,11 @@ export function validatePageConfig(routeKey: string, config?: PageConfig) {
   if (pageConfig.ssr !== undefined && !ssrRenderModes.has(pageConfig.ssr)) {
     throw new Error(`[route-convention] unsupported pageConfig.ssr "${pageConfig.ssr}" in ${routeKey}`);
   }
-  if (pageConfig.topInset !== undefined && !isValidInsetValue(pageConfig.topInset)) {
-    throw new Error(
-      `[route-convention] pageConfig.topInset in ${routeKey} must be a boolean or non-negative px number.`,
-    );
-  }
-  if (pageConfig.bottomInset !== undefined && !isValidInsetValue(pageConfig.bottomInset)) {
-    throw new Error(
-      `[route-convention] pageConfig.bottomInset in ${routeKey} must be a boolean or non-negative px number.`,
-    );
+  for (const key of ["topInset", "bottomInset"] as const) {
+    if (pageConfig[key] !== undefined && !isValidInsetValue(pageConfig[key]))
+      throw new Error(
+        `[route-convention] pageConfig.${key} in ${routeKey} must be a boolean or non-negative px number.`,
+      );
   }
   validateSafeAreaConfig(routeKey, pageConfig.safeArea);
 }
@@ -79,11 +73,9 @@ function validateSafeAreaConfig(routeKey: string, safeArea?: PageSafeAreaConfig)
       throw new Error(`[route-convention] unsupported pageConfig.safeArea option "${key}" in ${routeKey}`);
     }
   }
-  if (safeArea.top !== undefined && typeof safeArea.top !== "boolean") {
-    throw new Error(`[route-convention] pageConfig.safeArea.top in ${routeKey} must be a boolean.`);
-  }
-  if (safeArea.bottom !== undefined && typeof safeArea.bottom !== "boolean") {
-    throw new Error(`[route-convention] pageConfig.safeArea.bottom in ${routeKey} must be a boolean.`);
+  for (const side of ["top", "bottom"] as const) {
+    if (safeArea[side] !== undefined && typeof safeArea[side] !== "boolean")
+      throw new Error(`[route-convention] pageConfig.safeArea.${side} in ${routeKey} must be a boolean.`);
   }
   if (
     safeArea.android !== undefined &&
@@ -121,6 +113,21 @@ export function getExplicitPageConfigKeys(configChain: PageConfig[] = []): Parti
   return explicitKeys;
 }
 
+//? Not in `csrTypes.ts`: under `react-server`, `react` exports no `createContext` or hooks, so the RSC worker (via
+//? `routeTreeBuilder.ts`) needs this react-free half of the page frame contract.
+export const defaultPageState: PageState = {
+  transition: "none",
+  topSafeArea: 0,
+  bottomSafeArea: 0,
+  topInset: 0,
+  bottomInset: 0,
+  gesture: true,
+  cache: false,
+  ssr: "stream",
+  topSafeAreaColor: "var(--color-background, Canvas)",
+  bottomSafeAreaColor: "var(--color-background, Canvas)",
+};
+
 export function resolvePageState({
   configChain = [],
   path,
@@ -153,8 +160,8 @@ export function resolvePageState({
         : (config.gesture ?? false),
     cache: config.cache ?? false,
     ssr: config.ssr ?? "stream",
-    topSafeAreaColor: config.topSafeAreaColor ?? "var(--color-base-100, Canvas)",
-    bottomSafeAreaColor: config.bottomSafeAreaColor ?? "var(--color-base-100, Canvas)",
+    topSafeAreaColor: config.topSafeAreaColor ?? defaultPageState.topSafeAreaColor,
+    bottomSafeAreaColor: config.bottomSafeAreaColor ?? defaultPageState.bottomSafeAreaColor,
   };
 }
 
@@ -196,14 +203,11 @@ function resolveSafeArea({
   cssSafeArea?: SafeAreaInsets;
 }): SafeAreaInsets {
   if (safeArea === false) return { top: 0, bottom: 0 };
-  const topEnabled =
+  const enabledAt = (side: "top" | "bottom") =>
     safeArea === true ||
-    safeArea === "top" ||
-    (isRecord(safeArea) ? safeArea.top !== false : safeArea === undefined && platform !== "web");
-  const bottomEnabled =
-    safeArea === true ||
-    safeArea === "bottom" ||
-    (isRecord(safeArea) ? safeArea.bottom !== false : safeArea === undefined && platform !== "web");
+    safeArea === side ||
+    (isRecord(safeArea) ? safeArea[side] !== false : safeArea === undefined && platform !== "web");
+  const [topEnabled, bottomEnabled] = [enabledAt("top"), enabledAt("bottom")];
   if (platform === "android") {
     const androidMode = isRecord(safeArea)
       ? (safeArea.android as "auto" | "edge-to-edge" | "none" | undefined)
@@ -237,8 +241,8 @@ export function readCssSafeAreaInsets(): SafeAreaInsets {
   if (typeof window === "undefined") return { top: 0, bottom: 0 };
   const style = window.getComputedStyle?.(document.documentElement);
   return {
-    top: readCssPixel(style?.getPropertyValue("--safe-area-inset-top")) || readCssEnvProbe("top"),
-    bottom: readCssPixel(style?.getPropertyValue("--safe-area-inset-bottom")) || readCssEnvProbe("bottom"),
+    top: readCssPixel(style?.getPropertyValue("--akan-native-safe-area-top")) || readCssEnvProbe("top"),
+    bottom: readCssPixel(style?.getPropertyValue("--akan-native-safe-area-bottom")) || readCssEnvProbe("bottom"),
   };
 }
 

@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { DEFAULT_AKAN_I18N } from "akanjs/common";
 import { createRequestStore } from "akanjs/fetch";
+import type { RouteSeedIndex, RoutesManifest } from "./artifact";
 import {
   createRouteCacheEntry,
   isPublicRouteCacheableRequest,
@@ -22,7 +23,6 @@ import {
   createRscRedirectResponse,
   createRscStreamResponse,
   DEFAULT_HTML_RESULT_CACHE_MAX_BODY_BYTES,
-  isHtmlRouteCachePathAllowed,
   normalizeRscTargetUrlForHostBasePath,
   resolveHtmlRouteCacheStoreTtl,
   WebRouter,
@@ -35,6 +35,29 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+const streamOf = (text: string) =>
+  new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(encoder.encode(text));
+      controller.close();
+    },
+  });
+
+const setEnv = (key: string, value: string | undefined) => {
+  if (value === undefined) delete process.env[key];
+  else process.env[key] = value;
+};
+
+const withEnv = async <T>(key: string, value: string | undefined, run: () => Promise<T>) => {
+  const previous = process.env[key];
+  setEnv(key, value);
+  try {
+    return await run();
+  } finally {
+    setEnv(key, previous);
+  }
+};
+
 type FullSsrHandler = (req: Request) => Response | Promise<Response>;
 type RouteHandler = (req: Request) => Response | Promise<Response>;
 
@@ -42,10 +65,10 @@ interface FakeRscWorker {
   renderCalls: Request[];
   invalidations: Array<string | RouteCacheInvalidation | undefined>;
   ready: Promise<void>;
-  renderWithMeta(req: Request): Promise<RscRenderResult>;
+  renderWithMeta(req: Request, input?: { clientManifest?: Record<string, unknown> }): Promise<RscRenderResult>;
   invalidateRouteResultCache(invalidation?: string | RouteCacheInvalidation): void;
   kill(): void;
-  reload(): Promise<void>;
+  reload(): Promise<unknown>;
   getMetrics(): Record<string, unknown>;
 }
 
@@ -68,12 +91,7 @@ function createFakeRscWorker(
       const state = resolveRenderState(req, this.renderCalls.length);
       return {
         type: "stream",
-        stream: new ReadableStream<Uint8Array>({
-          start(controller) {
-            controller.enqueue(encoder.encode("0:null\n"));
-            controller.close();
-          },
-        }),
+        stream: streamOf("0:null\n"),
         status: state.status,
         lateControl: Promise.resolve(state.lateControl ?? null),
         cacheState: Promise.resolve(state.cacheState ?? { cacheable: true, revalidate: 5 }),
@@ -118,15 +136,20 @@ async function withFullSsrCacheHarness<T>(
     artifact?: BaseBuildArtifact;
     worker?: FakeRscWorker;
     nodeEnv?: string;
+    commandType?: string;
     htmlCacheEnabled?: string;
     htmlCachePaths?: string;
     htmlCacheMaxBodyBytes?: string;
     appDir?: string;
+    web?: { ssr: boolean; csr: boolean };
+    prebuilt?: RoutesManifest;
+    seedIndex?: RouteSeedIndex;
     onRenderInput?: (input: Parameters<SsrFromRscRenderer["render"]>[0]) => void;
   } = {},
 ): Promise<T> {
   const envSnapshot = {
     NODE_ENV: process.env.NODE_ENV,
+    AKAN_COMMAND_TYPE: process.env.AKAN_COMMAND_TYPE,
     AKAN_PUBLIC_APP_NAME: process.env.AKAN_PUBLIC_APP_NAME,
     AKAN_PUBLIC_REPO_NAME: process.env.AKAN_PUBLIC_REPO_NAME,
     AKAN_PUBLIC_SERVE_DOMAIN: process.env.AKAN_PUBLIC_SERVE_DOMAIN,
@@ -139,20 +162,17 @@ async function withFullSsrCacheHarness<T>(
     AKAN_HTML_RESULT_CACHE_MAX_BODY_BYTES: process.env.AKAN_HTML_RESULT_CACHE_MAX_BODY_BYTES,
   };
   process.env.NODE_ENV = options.nodeEnv ?? "production";
+  setEnv("AKAN_COMMAND_TYPE", options.commandType);
   process.env.AKAN_PUBLIC_APP_NAME = "akan-test";
   process.env.AKAN_PUBLIC_REPO_NAME = "akan";
   process.env.AKAN_PUBLIC_SERVE_DOMAIN = "example.test";
   process.env.AKAN_PUBLIC_OPERATION_MODE = "local";
-  if (options.appDir === undefined) delete process.env.AKAN_APP_DIR;
-  else process.env.AKAN_APP_DIR = options.appDir;
-  if (options.htmlCacheEnabled === undefined) delete process.env.AKAN_HTML_RESULT_CACHE;
-  else process.env.AKAN_HTML_RESULT_CACHE = options.htmlCacheEnabled;
-  if (options.htmlCachePaths === undefined) delete process.env.AKAN_HTML_RESULT_CACHE_PATHS;
-  else process.env.AKAN_HTML_RESULT_CACHE_PATHS = options.htmlCachePaths;
+  setEnv("AKAN_APP_DIR", options.appDir);
+  setEnv("AKAN_HTML_RESULT_CACHE", options.htmlCacheEnabled);
+  setEnv("AKAN_HTML_RESULT_CACHE_PATHS", options.htmlCachePaths);
   delete process.env.AKAN_HTML_RESULT_CACHE_EXCLUDE_PATHS;
   process.env.AKAN_HTML_RESULT_CACHE_TTL = "30";
-  if (options.htmlCacheMaxBodyBytes === undefined) delete process.env.AKAN_HTML_RESULT_CACHE_MAX_BODY_BYTES;
-  else process.env.AKAN_HTML_RESULT_CACHE_MAX_BODY_BYTES = options.htmlCacheMaxBodyBytes;
+  setEnv("AKAN_HTML_RESULT_CACHE_MAX_BODY_BYTES", options.htmlCacheMaxBodyBytes);
 
   const originalRender = SsrFromRscRenderer.prototype.render;
   let renderCount = 0;
@@ -162,21 +182,18 @@ async function withFullSsrCacheHarness<T>(
     options.onRenderInput?.(input);
     renderCount += 1;
     const pathname = input.request ? new URL(input.request.url).pathname : "/unknown";
-    return new ReadableStream<Uint8Array>({
-      start(controller) {
-        controller.enqueue(encoder.encode(`<html><body>${pathname}:render-${renderCount}</body></html>`));
-        controller.close();
-      },
-    });
+    return streamOf(`<html><body>${pathname}:render-${renderCount}</body></html>`);
   };
 
   const fakeWorker = options.worker ?? createFakeRscWorker();
   const router = new WebRouter({
     artifact: options.artifact ?? createTestArtifact(),
+    web: options.web ?? { ssr: true, csr: true },
     cssBytesByUrl: {},
     rsc: fakeWorker as never,
-    seedIndex: { entries: [], globalLayoutFiles: [] },
+    seedIndex: options.seedIndex ?? { entries: [], globalLayoutFiles: [] },
     upgradeHmrWs: () => false,
+    prebuilt: options.prebuilt,
   });
 
   try {
@@ -186,10 +203,7 @@ async function withFullSsrCacheHarness<T>(
   } finally {
     router.dispose();
     SsrFromRscRenderer.prototype.render = originalRender;
-    for (const [key, value] of Object.entries(envSnapshot)) {
-      if (value === undefined) delete process.env[key];
-      else process.env[key] = value;
-    }
+    for (const [key, value] of Object.entries(envSnapshot)) setEnv(key, value);
   }
 }
 
@@ -237,6 +251,33 @@ describe("WebRouter RSC target normalization", () => {
     expect(normalized.url.href).toBe("https://akanjs.com/en/akanjs/docs/intro/quickstart");
     expect(normalized.basePath).toBe("akanjs");
   });
+
+  test("confines a sub-route host to its own basePath, as a page load on that host is", () => {
+    const seedEntries = [
+      { routeId: "/:lang/soft/home", pattern: "/:lang/soft/home", seeds: [] },
+      { routeId: "/:lang/office/admin", pattern: "/:lang/office/admin", seeds: [] },
+    ];
+    const onSoftHost = (
+      pathname: string,
+      basePaths = ["soft", "office"],
+      seeds: typeof seedEntries | undefined = seedEntries,
+    ) => {
+      const normalized = normalizeRscTargetUrlForHostBasePath(new URL(`https://soft.akanjs.com${pathname}?tab=1`), {
+        basePath: "soft",
+        basePaths,
+        i18n: DEFAULT_AKAN_I18N,
+        seedEntries: seeds,
+      });
+      return `${normalized.url.pathname}${normalized.url.search} [${normalized.basePath}]`;
+    };
+
+    expect(onSoftHost("/en/home")).toBe("/en/soft/home?tab=1 [soft]");
+    expect(onSoftHost("/en/soft/home")).toBe("/en/soft/home?tab=1 [soft]");
+    expect(onSoftHost("/en/admin")).toBe("/en/soft/admin?tab=1 [soft]");
+    expect(onSoftHost("/en/office/admin")).toBe("/en/soft/office/admin?tab=1 [soft]");
+    expect(onSoftHost("/en")).toBe("/en/soft?tab=1 [soft]");
+    expect(onSoftHost("/en/soft/foo", ["office", "soft"], undefined)).toBe("/en/soft/foo?tab=1 [soft]");
+  });
 });
 
 describe("WebRouter sub route host resolution", () => {
@@ -250,21 +291,15 @@ describe("WebRouter sub route host resolution", () => {
     headers: Record<string, string>,
     { env }: { env?: string } = {},
   ): Promise<string | null> {
-    const previous = process.env.AKAN_SUB_ROUTE_HOSTS;
-    if (env === undefined) delete process.env.AKAN_SUB_ROUTE_HOSTS;
-    else process.env.AKAN_SUB_ROUTE_HOSTS = env;
-    try {
-      return await withFullSsrCacheHarness(
+    return await withEnv("AKAN_SUB_ROUTE_HOSTS", env, () =>
+      withFullSsrCacheHarness(
         async ({ renderEnvRoutes, fakeWorker }) => {
           await renderEnvRoutes["/__rsc"](new Request("http://internal/__rsc?url=%2Fen%2Fhome", { headers }));
           return fakeWorker.renderCalls[0]?.headers.get("x-base-path") ?? null;
         },
         { artifact: artifactWithSubRoutes() },
-      );
-    } finally {
-      if (previous === undefined) delete process.env.AKAN_SUB_ROUTE_HOSTS;
-      else process.env.AKAN_SUB_ROUTE_HOSTS = previous;
-    }
+      ),
+    );
   }
 
   test("falls back to a host injected through AKAN_SUB_ROUTE_HOSTS", async () => {
@@ -290,6 +325,196 @@ describe("WebRouter sub route host resolution", () => {
     await expect(rscBasePathFor({ host: "soft.example.test", "x-base-path": "nonsense" })).resolves.toBe("soft");
     await expect(rscBasePathFor({ host: "akanjs.example.test", "x-base-path": "soft" })).resolves.toBe("soft");
   });
+
+  test("matches the first host of a multi-hop x-forwarded-host", async () => {
+    await expect(
+      rscBasePathFor({ host: "internal", "x-forwarded-host": "soft.example.test, lb.internal:8080" }),
+    ).resolves.toBe("soft");
+  });
+
+  test("hands an RSC navigation the locale and public path LocaleWebProxy gives a page load of the same URL", async () => {
+    const renderHeaders = await withFullSsrCacheHarness(
+      async ({ renderEnvRoutes, fakeWorker }) => {
+        await renderEnvRoutes["/__rsc"](
+          new Request("http://internal/__rsc?url=%2Fko%2Fdocs%2Fintro", {
+            headers: { host: "soft.example.test", "x-path": "/spoofed" },
+          }),
+        );
+        return fakeWorker.renderCalls[0]?.headers;
+      },
+      { artifact: artifactWithSubRoutes() },
+    );
+
+    expect(renderHeaders?.get("x-base-path")).toBe("soft");
+    expect(renderHeaders?.get("x-locale")).toBe("ko");
+    expect(renderHeaders?.get("x-path")).toBe("/docs/intro");
+  });
+
+  test("renders an RSC navigation on a sub-route host inside that host's basePath only", async () => {
+    const rendered = await withFullSsrCacheHarness(
+      async ({ renderEnvRoutes, fakeWorker }) => {
+        await renderEnvRoutes["/__rsc"](
+          new Request("http://internal/__rsc?url=%2Fen%2Foffice%2Fadmin", { headers: { host: "soft.example.test" } }),
+        );
+        const call = fakeWorker.renderCalls[0];
+        return call ? `${new URL(call.url).pathname} [${call.headers.get("x-base-path")}]` : null;
+      },
+      { artifact: { ...artifactWithSubRoutes(), basePaths: ["soft", "office"] } },
+    );
+
+    expect(rendered).toBe("/en/soft/office/admin [soft]");
+  });
+});
+
+describe("WebRouter local sub route index", () => {
+  const artifactWithSubRoutes = (): BaseBuildArtifact => ({
+    ...createTestArtifact(),
+    subRoutes: { soft: ["soft.example.test"] },
+    basePaths: ["soft", "office"],
+  });
+
+  async function requestRoot(
+    pathname: string,
+    { env, artifact }: { env?: string; artifact?: BaseBuildArtifact } = {},
+  ): Promise<{ response: Response; renderCount: number }> {
+    return await withEnv("AKAN_PUBLIC_ENV", env, () =>
+      withFullSsrCacheHarness(
+        async ({ fullSsr, fakeWorker }) => {
+          const response = await fullSsr(new Request(`https://akan.example.test${pathname}`));
+          return { response, renderCount: fakeWorker.renderCalls.length };
+        },
+        { artifact: artifact ?? artifactWithSubRoutes() },
+      ),
+    );
+  }
+
+  test("serves a basePath picker at the site root instead of a 404", async () => {
+    const { response, renderCount } = await requestRoot("/en/", { env: "local" });
+    const html = await response.text();
+
+    expect(response.status).toBe(200);
+    expect(renderCount).toBe(0);
+    expect(html).toContain('href="/en/soft"');
+    expect(html).toContain('href="/en/office"');
+    expect(html).toContain("soft.example.test");
+  });
+
+  test("keeps the picker on the bare root and on every configured locale", async () => {
+    await expect(requestRoot("/", { env: "local" }).then((r) => r.response.status)).resolves.toBe(200);
+    const { response } = await requestRoot("/ko", { env: "local" });
+    await expect(response.text()).resolves.toContain('href="/ko/soft"');
+  });
+
+  test("leaves non-root paths to the renderer", async () => {
+    const { renderCount } = await requestRoot("/en/soft", { env: "local" });
+    expect(renderCount).toBe(1);
+  });
+
+  test("stays local-only and sub-route-only", async () => {
+    await expect(requestRoot("/en/", { env: "debug" }).then((r) => r.renderCount)).resolves.toBe(1);
+    await expect(
+      requestRoot("/en/", { env: "local", artifact: createTestArtifact() }).then((r) => r.renderCount),
+    ).resolves.toBe(1);
+  });
+});
+
+describe("WebRouter dev mode selection", () => {
+  const devRoutes = async (commandType?: string) => {
+    // A dev router opens the builder IPC channel, which exists only in a process the CLI spawned.
+    const originalSend = process.send;
+    process.send = ((): boolean => true) as typeof process.send;
+    try {
+      return await withFullSsrCacheHarness(async ({ renderEnvRoutes }) => Object.keys(renderEnvRoutes), {
+        nodeEnv: "production",
+        commandType,
+      });
+    } finally {
+      process.send = originalSend;
+    }
+  };
+
+  test("keeps dev mode under `akan start` even when NODE_ENV claims production", async () => {
+    await expect(devRoutes("start")).resolves.toContain("/_akan/hmr");
+  });
+
+  test("stays in production mode when no command claims otherwise", async () => {
+    await expect(devRoutes()).resolves.not.toContain("/_akan/hmr");
+  });
+});
+
+describe("WebRouter dev route builds", () => {
+  test("builds the nearest layout route for a path only a route prefix matches", async () => {
+    const originalSend = process.send;
+    const requestedRouteIds: string[] = [];
+    process.send = ((message: { type?: string; id?: number; routeId?: string }): boolean => {
+      if (message.type !== "build-route" || !message.routeId) return true;
+      requestedRouteIds.push(message.routeId);
+      const data = { manifestDelta: {}, ssrManifestDelta: {}, newEntries: [], clientDeps: [] };
+      queueMicrotask(() => process.emit("message", { type: "build-route-res", id: message.id, ok: true, data }));
+      return true;
+    }) as typeof process.send;
+    try {
+      await withFullSsrCacheHarness(
+        async ({ fullSsr }) => await fullSsr(new Request("https://example.test/ko/blog/missing")),
+        {
+          nodeEnv: "development",
+          commandType: "start",
+          seedIndex: {
+            entries: [
+              { routeId: "/:lang/blog", pattern: "/:lang/blog", seeds: ["/repo/apps/demo/page/blog/_layout.tsx"] },
+            ],
+            globalLayoutFiles: [],
+          },
+        },
+      );
+      expect(requestedRouteIds).toEqual(["/:lang/blog"]);
+    } finally {
+      process.send = originalSend;
+    }
+  });
+
+  test("keeps a dev document out of the browser's HTTP cache, and leaves production's to the cache policy", async () => {
+    const cacheControlOf = async (options: { nodeEnv: string; commandType?: string }) =>
+      await withFullSsrCacheHarness(async ({ fullSsr }) => {
+        const response = await fullSsr(new Request("https://example.test/en/page"));
+        expect(response.status).toBe(200);
+        return response.headers.get("Cache-Control");
+      }, options);
+    const originalSend = process.send;
+    process.send = ((): boolean => true) as typeof process.send;
+    try {
+      expect(await cacheControlOf({ nodeEnv: "development", commandType: "start" })).toBe("no-store");
+      expect(await cacheControlOf({ nodeEnv: "production" })).toBeNull();
+    } finally {
+      process.send = originalSend;
+    }
+  });
+});
+
+describe("WebRouter csr surface", () => {
+  const routeKeys = async (web?: { ssr: boolean; csr: boolean }) =>
+    await withFullSsrCacheHarness(async ({ renderEnvRoutes }) => Object.keys(renderEnvRoutes), { web });
+
+  test("mounts /__csr only while the csr surface is on", async () => {
+    await expect(routeKeys()).resolves.toContain("/__csr");
+    await expect(routeKeys({ ssr: true, csr: false })).resolves.not.toContain("/__csr");
+  });
+
+  test("stops answering ?csr=true once the csr surface is off", async () => {
+    const withCsr = await withFullSsrCacheHarness(
+      async ({ fullSsr }) => await fullSsr(new Request("https://example.test/?csr=true")),
+      { web: { ssr: true, csr: true } },
+    );
+    // No artifact on disk, so this is the prod "no CSR html" 404 rather than a render — but it is the CSR path.
+    expect(withCsr.status).toBe(404);
+
+    const withoutCsr = await withFullSsrCacheHarness(
+      async ({ fullSsr }) => await fullSsr(new Request("https://example.test/?csr=true")),
+      { web: { ssr: true, csr: false } },
+    );
+    expect(withoutCsr.status).toBe(200);
+    expect(await withoutCsr.text()).toContain("render-1");
+  });
 });
 
 describe("WebRouter deep link associations", () => {
@@ -298,14 +523,16 @@ describe("WebRouter deep link associations", () => {
     deepLinkAssociations: [
       {
         targetName: "default",
-        appId: "com.minimal.app",
+        iosAppId: "com.minimal.app",
+        androidAppId: "com.minimal.app",
         domains: ["minimal.app"],
         iosTeamId: "TEAMID",
         androidSha256CertFingerprints: ["AA:BB"],
       },
       {
         targetName: "admin",
-        appId: "com.minimal.admin",
+        iosAppId: "com.puffinplanet.admin",
+        androidAppId: "com.minimal.admin",
         domains: ["minimal.app"],
         iosTeamId: "ADMINTEAM",
         androidSha256CertFingerprints: ["CC:DD"],
@@ -313,7 +540,7 @@ describe("WebRouter deep link associations", () => {
     ],
   });
 
-  test("serves apple app site association from deep link metadata", async () => {
+  test("serves apple app site association from deep link metadata, each target under its iOS id", async () => {
     await withFullSsrCacheHarness(
       async ({ renderEnvRoutes }) => {
         const response = await renderEnvRoutes["/.well-known/apple-app-site-association"](
@@ -325,7 +552,7 @@ describe("WebRouter deep link associations", () => {
             apps: [],
             details: [
               { appIDs: ["TEAMID.com.minimal.app"], components: [{ "/": "/*" }] },
-              { appIDs: ["ADMINTEAM.com.minimal.admin"], components: [{ "/": "/*" }] },
+              { appIDs: ["ADMINTEAM.com.puffinplanet.admin"], components: [{ "/": "/*" }] },
             ],
           },
         });
@@ -334,34 +561,63 @@ describe("WebRouter deep link associations", () => {
     );
   });
 
-  test("serves android asset links from deep link metadata", async () => {
-    await withFullSsrCacheHarness(
-      async ({ renderEnvRoutes }) => {
-        const response = await renderEnvRoutes["/.well-known/assetlinks.json"](
-          new Request("https://minimal.app/.well-known/assetlinks.json"),
-        );
-        expect(response.headers.get("Content-Type")).toContain("application/json");
-        await expect(response.json()).resolves.toEqual([
-          {
-            relation: ["delegate_permission/common.handle_all_urls"],
-            target: {
-              namespace: "android_app",
-              package_name: "com.minimal.app",
-              sha256_cert_fingerprints: ["AA:BB"],
-            },
-          },
-          {
-            relation: ["delegate_permission/common.handle_all_urls"],
-            target: {
-              namespace: "android_app",
-              package_name: "com.minimal.admin",
-              sha256_cert_fingerprints: ["CC:DD"],
-            },
-          },
-        ]);
-      },
-      { artifact: artifactWithDeepLinks() },
+  interface AssetLink {
+    relation: string[];
+    target: { namespace: string; package_name: string; sha256_cert_fingerprints: string[] };
+  }
+  const requestAssetLinks = async (env: string) =>
+    await withEnv("AKAN_PUBLIC_ENV", env, () =>
+      withFullSsrCacheHarness(
+        async ({ renderEnvRoutes }) => {
+          const response = await renderEnvRoutes["/.well-known/assetlinks.json"](
+            new Request("https://minimal.app/.well-known/assetlinks.json"),
+          );
+          expect(response.headers.get("Content-Type")).toContain("application/json");
+          return (await response.json()) as AssetLink[];
+        },
+        { artifact: artifactWithDeepLinks() },
+      ),
     );
+
+  test("serves android asset links from deep link metadata", async () => {
+    expect(await requestAssetLinks("main")).toEqual([
+      {
+        relation: ["delegate_permission/common.handle_all_urls"],
+        target: {
+          namespace: "android_app",
+          package_name: "com.minimal.app",
+          sha256_cert_fingerprints: ["AA:BB"],
+        },
+      },
+      {
+        relation: ["delegate_permission/common.handle_all_urls"],
+        target: {
+          namespace: "android_app",
+          package_name: "com.minimal.admin",
+          sha256_cert_fingerprints: ["CC:DD"],
+        },
+      },
+    ]);
+  });
+
+  test("vouches for the .debug package of a debug build only outside main", async () => {
+    const assetLinks = await requestAssetLinks("debug");
+    expect(assetLinks.map((assetLink) => assetLink.target.package_name)).toEqual([
+      "com.minimal.app",
+      "com.minimal.app.debug",
+      "com.minimal.admin",
+      "com.minimal.admin.debug",
+    ]);
+    expect(assetLinks[1]?.target.sha256_cert_fingerprints).toEqual(["AA:BB"]);
+  });
+});
+
+describe("WebRouter firebase messaging service worker", () => {
+  //* The push plugin writes `public/firebase-messaging-sw.js`; a framework route would silently shadow that asset.
+  test("is not a framework route, so the app's own public asset is what gets served", async () => {
+    const routeKeys = await withFullSsrCacheHarness(async ({ renderEnvRoutes }) => Object.keys(renderEnvRoutes));
+
+    expect(routeKeys).not.toContain("/firebase-messaging-sw.js");
   });
 });
 
@@ -404,12 +660,7 @@ describe("WebRouter RSC stream response", () => {
   test("leaves late redirects in the streamed Flight payload for client fallback", async () => {
     const response = await createRscNavigationStreamResponse({
       type: "stream",
-      stream: new ReadableStream<Uint8Array>({
-        start(controller) {
-          controller.enqueue(new TextEncoder().encode('0:E{"digest":"AKAN_REDIRECT"}\n'));
-          controller.close();
-        },
-      }),
+      stream: streamOf('0:E{"digest":"AKAN_REDIRECT"}\n'),
       lateControl: Promise.resolve({ type: "redirect", location: "/target", method: "replace", status: 307 }),
       cacheState: Promise.resolve({ cacheable: false, reason: "late-redirect" }),
       cancel: () => {},
@@ -424,12 +675,7 @@ describe("WebRouter RSC stream response", () => {
   test("exposes RSC navigation trace metadata on response headers", async () => {
     const response = await createRscNavigationStreamResponse({
       type: "stream",
-      stream: new ReadableStream<Uint8Array>({
-        start(controller) {
-          controller.enqueue(encoder.encode("0:null\n"));
-          controller.close();
-        },
-      }),
+      stream: streamOf("0:null\n"),
       trace: {
         navId: "7",
         pathname: "/en/docs",
@@ -476,16 +722,12 @@ describe("WebRouter RSC stream response", () => {
   test("exposes same-route searchParams patch trace metadata on response headers", async () => {
     const response = await createRscNavigationStreamResponse({
       type: "stream",
-      stream: new ReadableStream<Uint8Array>({
-        start(controller) {
-          controller.enqueue(encoder.encode("0:null\n"));
-          controller.close();
-        },
-      }),
+      stream: streamOf("0:null\n"),
       trace: {
         navId: "8",
         pathname: "/en/docs",
         routeId: "/:lang/docs",
+        cache: "miss" as const,
         partial: "patch",
         partialReason: "same-route-search-params",
         partialCommonPrefixLength: 3,
@@ -584,12 +826,7 @@ describe("WebRouter RSC stream response", () => {
   test("preserves RSC navigation status while streaming", async () => {
     const response = await createRscNavigationStreamResponse({
       type: "stream",
-      stream: new ReadableStream<Uint8Array>({
-        start(controller) {
-          controller.enqueue(new TextEncoder().encode("flight"));
-          controller.close();
-        },
-      }),
+      stream: streamOf("flight"),
       status: 404,
       lateControl: Promise.resolve(null),
       cacheState: Promise.resolve({ cacheable: false, reason: "not-found" }),
@@ -667,22 +904,6 @@ describe("WebRouter HTML cache streaming", () => {
     expect(resolveRouteCacheStoreTtl(120, { cacheable: true, revalidate: false })).toBeNull();
   });
 
-  test("uses shared allow and deny semantics for HTML cache paths", () => {
-    const env = {
-      AKAN_HTML_RESULT_CACHE_PATHS: " /docs, /blog ",
-      AKAN_HTML_RESULT_CACHE_EXCLUDE_PATHS: "/docs/private",
-    };
-
-    expect(isHtmlRouteCachePathAllowed("/docs", env)).toBe(true);
-    expect(isHtmlRouteCachePathAllowed("/docs/intro", env)).toBe(true);
-    expect(isHtmlRouteCachePathAllowed("/docs-private", env)).toBe(false);
-    expect(isHtmlRouteCachePathAllowed("/docs/private", env)).toBe(false);
-    expect(isHtmlRouteCachePathAllowed("/docs/private/child", env)).toBe(false);
-    expect(isHtmlRouteCachePathAllowed("/docs/private-ish", env)).toBe(true);
-    expect(isHtmlRouteCachePathAllowed("/other", env)).toBe(false);
-    expect(isHtmlRouteCachePathAllowed("/other", {}, { defaultAllow: true })).toBe(true);
-  });
-
   test("passes through the first chunk before caching the completed HTML", async () => {
     let cachedHtml = "";
     const stream = cacheHtmlWhileStreaming(
@@ -719,12 +940,7 @@ describe("WebRouter HTML cache streaming", () => {
   test("passes through completed HTML but skips caching when a late redirect is observed", async () => {
     let cachedHtml = "";
     const stream = cacheHtmlWhileStreaming(
-      new ReadableStream<Uint8Array>({
-        start(controller) {
-          controller.enqueue(encoder.encode("<html>redirect</html>"));
-          controller.close();
-        },
-      }),
+      streamOf("<html>redirect</html>"),
       (html) => {
         cachedHtml = html;
       },
@@ -742,12 +958,7 @@ describe("WebRouter HTML cache streaming", () => {
     let storeTtl = 30;
     let observedStoreTtl = 0;
     const stream = cacheHtmlWhileStreaming(
-      new ReadableStream<Uint8Array>({
-        start(controller) {
-          controller.enqueue(encoder.encode("<html>cache</html>"));
-          controller.close();
-        },
-      }),
+      streamOf("<html>cache</html>"),
       (html) => {
         cachedHtml = html;
         observedStoreTtl = storeTtl;
@@ -768,41 +979,23 @@ describe("WebRouter HTML cache streaming", () => {
 
   test("combines worker and host cache state before writing HTML", () => {
     const hostStore = createRequestStore(new Request("https://example.test/cache"));
-
-    expect(
+    const storeTtl = (lateControl?: { type: "redirect" }) =>
       resolveHtmlRouteCacheStoreTtl({
         baseTtl: 120,
         workerCacheState: { cacheable: true, revalidate: 60 },
         hostRequestStore: hostStore,
-      }),
-    ).toBe(60);
+        lateControl,
+      });
+
+    expect(storeTtl()).toBe(60);
 
     hostStore.policy.revalidate = 30;
-    expect(
-      resolveHtmlRouteCacheStoreTtl({
-        baseTtl: 120,
-        workerCacheState: { cacheable: true, revalidate: 60 },
-        hostRequestStore: hostStore,
-      }),
-    ).toBe(30);
+    expect(storeTtl()).toBe(30);
 
     hostStore.dynamicUsage.headers = true;
-    expect(
-      resolveHtmlRouteCacheStoreTtl({
-        baseTtl: 120,
-        workerCacheState: { cacheable: true, revalidate: 60 },
-        hostRequestStore: hostStore,
-      }),
-    ).toBeNull();
+    expect(storeTtl()).toBeNull();
     hostStore.dynamicUsage.headers = false;
-    expect(
-      resolveHtmlRouteCacheStoreTtl({
-        baseTtl: 120,
-        workerCacheState: { cacheable: true, revalidate: 60 },
-        hostRequestStore: hostStore,
-        lateControl: { type: "redirect" },
-      }),
-    ).toBeNull();
+    expect(storeTtl({ type: "redirect" })).toBeNull();
   });
 
   test("blocks HTML cache writes for worker controls and host dynamic usage", () => {
@@ -843,12 +1036,7 @@ describe("WebRouter HTML cache streaming", () => {
     let cachedHtml = "";
     let skipReason: string | undefined;
     const stream = cacheHtmlWhileStreaming(
-      new ReadableStream<Uint8Array>({
-        start(controller) {
-          controller.enqueue(encoder.encode("<html>too-large</html>"));
-          controller.close();
-        },
-      }),
+      streamOf("<html>too-large</html>"),
       (html) => {
         cachedHtml = html;
       },
@@ -879,6 +1067,40 @@ describe("WebRouter HTML cache streaming", () => {
     await sleep(0);
 
     expect(cancelledReason).toBe(reason);
+  });
+});
+
+describe("WebRouter production boot", () => {
+  test("serves the prebuilt route manifest without waiting on a worker that has not loaded yet", async () => {
+    const worker = createFakeRscWorker();
+    let reloads = 0;
+    worker.reload = () => {
+      reloads += 1;
+      return new Promise(() => {});
+    };
+    const manifests: (Record<string, unknown> | undefined)[] = [];
+    const render = worker.renderWithMeta.bind(worker);
+    worker.renderWithMeta = async (req, input) => {
+      manifests.push(input?.clientManifest);
+      return await render(req);
+    };
+    const entry = { id: "/_akan/client/card.js", chunks: [], name: "Card", async: true };
+    await withFullSsrCacheHarness(
+      async ({ fullSsr }) => {
+        await fullSsr(new Request("https://example.test/docs"));
+        expect(reloads).toBe(0);
+        expect(manifests[0]).toMatchObject({ "apps/a/ui/Card.tsx#Card": entry });
+      },
+      {
+        worker,
+        prebuilt: {
+          routeIds: [],
+          clientManifest: { "apps/a/ui/Card.tsx#Card": entry },
+          ssrManifest: { moduleLoading: null, moduleMap: {} },
+          knownEntries: [],
+        },
+      },
+    );
   });
 });
 

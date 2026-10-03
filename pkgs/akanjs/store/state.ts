@@ -1,5 +1,4 @@
 import { DataList } from "akanjs/base";
-import { capitalize } from "akanjs/common";
 import { ConstantRegistry, type DefaultOf } from "akanjs/constant";
 import type { ExtractSort, FilterInstance } from "akanjs/document";
 import type {
@@ -14,7 +13,22 @@ import type {
   SlceDbSort,
   SliceCls,
 } from "akanjs/signal";
+import { databaseStateNames } from "./databaseStateNames";
+import { sliceKeysOf } from "./sliceKeys";
 import type { StoreSliceArgs, StoreSliceMap, StoreSliceSuffixCap, Submit } from "./types";
+
+/** Armed by `new<Model>` / `edit<Model>`, cleared by a submit or a reset. */
+export interface DraftState {
+  key: string;
+  /** Hash of the form as opened; a write only becomes a draft once the form moves off it. */
+  baseHash: string;
+  /** The edited record's `updatedAt` at open time, or null for a new form. */
+  baseUpdatedAt: string | null;
+  /** Read from storage, awaiting the user's decision. Drives the restore bar. */
+  pending: { savedAt: Date; form: object } | null;
+  /** Set while a draft is the thing in the form. Drives the "continuing, saved n minutes ago" chip. */
+  appliedAt: Date | null;
+}
 
 export type SliceStateKey =
   | "defaultModel"
@@ -28,6 +42,8 @@ export type SliceStateKey =
   | "lastPageOfModel"
   | "pageOfModel"
   | "limitOfModel"
+  | "hasMoreOfModel"
+  | "isCumulativeOfModel"
   | "queryArgsOfModel"
   | "sortOfModel";
 type _SliceMap<S extends SliceCls> = StoreSliceMap<S>;
@@ -54,6 +70,8 @@ type BaseState<RefName extends string, Full, _Default = DefaultOf<Full>> = {
   [K in `${RefName}ViewAt`]: Date;
 } & {
   [K in `${RefName}Modal`]: string | null;
+} & {
+  [K in `${RefName}FormDraft`]: DraftState | null;
 } & {
   [K in `${RefName}Operation`]: "sleep" | "reset" | "idle" | "error" | "loading";
 };
@@ -92,6 +110,10 @@ export type SliceState<
 } & {
   [K in `limitOf${_CapitalizedRefName}${_CapitalizedSuffix}`]: number;
 } & {
+  [K in
+    | `hasMoreOf${_CapitalizedRefName}${_CapitalizedSuffix}`
+    | `isCumulativeOf${_CapitalizedRefName}${_CapitalizedSuffix}`]: boolean;
+} & {
   [K in `queryArgsOf${_CapitalizedRefName}${_CapitalizedSuffix}`]: Args;
 } & {
   [K in `sortOf${_CapitalizedRefName}${_CapitalizedSuffix}`]: _Sort;
@@ -128,6 +150,10 @@ type DefaultSliceStateFields<
     | `pageOf${_CapRefName}${StoreSliceSuffixCap<SlceCls, Suffix>}`
     | `limitOf${_CapRefName}${StoreSliceSuffixCap<SlceCls, Suffix>}`]: number;
 } & {
+  [Suffix in _Suffixes as
+    | `hasMoreOf${_CapRefName}${StoreSliceSuffixCap<SlceCls, Suffix>}`
+    | `isCumulativeOf${_CapRefName}${StoreSliceSuffixCap<SlceCls, Suffix>}`]: boolean;
+} & {
   [Suffix in _Suffixes as `queryArgsOf${_CapRefName}${StoreSliceSuffixCap<SlceCls, Suffix>}`]: StoreSliceArgs<
     SlceCls,
     Suffix
@@ -151,18 +177,7 @@ export type DefaultState<
 
 export const createDatabaseState = (refName: string) => {
   const cnst = ConstantRegistry.getDatabase(refName);
-  const [fieldName, className] = [refName, capitalize(refName)];
-  const names = {
-    model: fieldName,
-    Model: className,
-    modelLoading: `${fieldName}Loading`,
-    modelForm: `${fieldName}Form`,
-    modelFormLoading: `${fieldName}FormLoading`,
-    modelSubmit: `${fieldName}Submit`,
-    modelViewAt: `${fieldName}ViewAt`,
-    modelModal: `${fieldName}Modal`,
-    modelOperation: `${fieldName}Operation`,
-  };
+  const names = databaseStateNames(refName);
   const baseState = {
     [names.model]: null,
     [names.modelLoading]: true,
@@ -171,50 +186,16 @@ export const createDatabaseState = (refName: string) => {
     [names.modelSubmit]: { disabled: true, loading: false, times: 0 },
     [names.modelViewAt]: new Date(0),
     [names.modelModal]: null,
+    [names.modelDraft]: null,
     [names.modelOperation]: "sleep",
   };
   return baseState;
 };
 export const createSliceState = (refName: string, slice: { [key: string]: SerializedSlice }) => {
   const cnst = ConstantRegistry.getDatabase(refName);
-  const [fieldName, className] = [refName, capitalize(refName)];
-  const names = {
-    model: fieldName,
-    Model: className,
-    defaultModel: `default${className}`,
-    defaultModelInsight: `default${className}Insight`,
-    modelList: `${fieldName}List`,
-    modelListLoading: `${fieldName}ListLoading`,
-    modelInitList: `${fieldName}InitList`,
-    modelInitAt: `${fieldName}InitAt`,
-    modelStaleAt: `${fieldName}StaleAt`,
-    modelSelection: `${fieldName}Selection`,
-    modelInsight: `${fieldName}Insight`,
-    lastPageOfModel: `lastPageOf${className}`,
-    pageOfModel: `pageOf${className}`,
-    limitOfModel: `limitOf${className}`,
-    queryArgsOfModel: `queryArgsOf${className}`,
-    sortOfModel: `sortOf${className}`,
-  };
   const sliceState: Record<string, unknown> = {};
   Object.entries(slice).forEach(([suffix]) => {
-    const sliceName = `${refName}${capitalize(suffix)}`;
-    const SliceName = capitalize(sliceName);
-    const namesOfSlice: { [key in SliceStateKey]: string } = {
-      defaultModel: SliceName.replace(names.Model, names.defaultModel), //clusterInSelf Cluster
-      modelList: sliceName.replace(names.model, names.modelList),
-      modelListLoading: sliceName.replace(names.model, names.modelListLoading),
-      modelInitList: sliceName.replace(names.model, names.modelInitList),
-      modelInitAt: sliceName.replace(names.model, names.modelInitAt),
-      modelStaleAt: sliceName.replace(names.model, names.modelStaleAt),
-      modelSelection: sliceName.replace(names.model, names.modelSelection),
-      modelInsight: sliceName.replace(names.model, names.modelInsight),
-      lastPageOfModel: SliceName.replace(names.Model, names.lastPageOfModel),
-      pageOfModel: SliceName.replace(names.Model, names.pageOfModel),
-      limitOfModel: SliceName.replace(names.Model, names.limitOfModel),
-      queryArgsOfModel: SliceName.replace(names.Model, names.queryArgsOfModel),
-      sortOfModel: SliceName.replace(names.Model, names.sortOfModel),
-    };
+    const namesOfSlice = sliceKeysOf(refName, suffix).state;
     const singleSliceState = {
       [namesOfSlice.defaultModel]: new cnst.full(),
       [namesOfSlice.modelList]: new DataList(),
@@ -227,6 +208,8 @@ export const createSliceState = (refName: string, slice: { [key: string]: Serial
       [namesOfSlice.lastPageOfModel]: 1,
       [namesOfSlice.pageOfModel]: 1,
       [namesOfSlice.limitOfModel]: 20,
+      [namesOfSlice.hasMoreOfModel]: false,
+      [namesOfSlice.isCumulativeOfModel]: false,
       [namesOfSlice.queryArgsOfModel]: [],
       [namesOfSlice.sortOfModel]: "latest",
     };

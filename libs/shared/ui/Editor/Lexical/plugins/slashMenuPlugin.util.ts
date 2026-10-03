@@ -11,9 +11,12 @@ import {
   insertDivider,
   insertTable,
 } from "../blocks";
-import { insertEmbed, insertExcalidraw, insertFile, insertImage, insertVideo } from "../media";
+import type { EditorFeatureKey } from "../feature";
+import { insertEmbed, insertExcalidraw, insertFile, insertImage, insertMermaid, insertVideo } from "../media";
+import type { MentionSource } from "../mention.type";
 import type { EditorSlashOption } from "../plugin";
 import type { EditorUpload } from "../UploadContext";
+import { openMentionSource } from "./mentionPlugin.command";
 import { SlashOption } from "./slashMenuPlugin.option";
 
 /** Opens a transient file picker and forwards the chosen file. */
@@ -28,13 +31,21 @@ const openFilePicker = (accept: string, onPick: (file: File) => void) => {
   input.click();
 };
 
+interface BuildOptionsInput {
+  upload: EditorUpload;
+  /** The editor's enabled features. Every entry naming one the field does not have is dropped. */
+  features: ReadonlySet<EditorFeatureKey>;
+  extraOptions: readonly EditorSlashOption[];
+  mentionSources: readonly MentionSource[];
+}
+
 /**
- * Builds the option set. Text/list/structure options are always present; the
- * upload-backed media options (image/video/file) appear only when uploads are
- * configured, while embed (URL-based) and callout are always available.
- * `extraOptions` are the entries contributed by the editor's `plugins`.
+ * Builds the option set. The upload-backed media options (image/video/file) need uploads configured
+ * on top of their feature; every other built-in entry is present exactly when its feature is.
+ * `extraOptions` are the entries contributed by the editor's `plugins` and are never filtered —
+ * passing the plugin is the opt-in — and each `mentionSources` entry gets a `/<label>` entry of its own.
  */
-export const buildOptions = (upload: EditorUpload, extraOptions: readonly EditorSlashOption[]): SlashOption[] => {
+export const buildOptions = ({ upload, features, extraOptions, mentionSources }: BuildOptionsInput): SlashOption[] => {
   const options: SlashOption[] = [
     new SlashOption("paragraph", {
       label: "Paragraph",
@@ -44,6 +55,7 @@ export const buildOptions = (upload: EditorUpload, extraOptions: readonly Editor
       run: formatParagraph,
     }),
     new SlashOption("h1", {
+      feature: "heading",
       label: "Heading 1",
       description: "Big section heading",
       group: "text",
@@ -51,6 +63,7 @@ export const buildOptions = (upload: EditorUpload, extraOptions: readonly Editor
       run: (editor) => formatHeading(editor, "h1"),
     }),
     new SlashOption("h2", {
+      feature: "heading",
       label: "Heading 2",
       description: "Medium section heading",
       group: "text",
@@ -58,6 +71,7 @@ export const buildOptions = (upload: EditorUpload, extraOptions: readonly Editor
       run: (editor) => formatHeading(editor, "h2"),
     }),
     new SlashOption("h3", {
+      feature: "heading",
       label: "Heading 3",
       description: "Small section heading",
       group: "text",
@@ -65,6 +79,7 @@ export const buildOptions = (upload: EditorUpload, extraOptions: readonly Editor
       run: (editor) => formatHeading(editor, "h3"),
     }),
     new SlashOption("bulleted", {
+      feature: "list",
       label: "Bulleted list",
       description: "Create a simple bullet list",
       group: "list",
@@ -72,6 +87,7 @@ export const buildOptions = (upload: EditorUpload, extraOptions: readonly Editor
       run: formatBulletList,
     }),
     new SlashOption("numbered", {
+      feature: "list",
       label: "Numbered list",
       description: "Create an ordered list",
       group: "list",
@@ -79,6 +95,7 @@ export const buildOptions = (upload: EditorUpload, extraOptions: readonly Editor
       run: formatNumberedList,
     }),
     new SlashOption("todo", {
+      feature: "list",
       label: "Todo list",
       description: "Create a checklist",
       group: "list",
@@ -90,6 +107,7 @@ export const buildOptions = (upload: EditorUpload, extraOptions: readonly Editor
   if (upload.canUpload) {
     options.push(
       new SlashOption("image", {
+        feature: "image",
         label: "Image",
         description: "Upload an image",
         group: "media",
@@ -106,6 +124,7 @@ export const buildOptions = (upload: EditorUpload, extraOptions: readonly Editor
           }),
       }),
       new SlashOption("video", {
+        feature: "video",
         label: "Video",
         description: "Upload a video",
         group: "media",
@@ -122,6 +141,7 @@ export const buildOptions = (upload: EditorUpload, extraOptions: readonly Editor
           }),
       }),
       new SlashOption("file", {
+        feature: "file",
         label: "File",
         description: "Upload a file",
         group: "media",
@@ -147,6 +167,7 @@ export const buildOptions = (upload: EditorUpload, extraOptions: readonly Editor
 
   options.push(
     new SlashOption("embed", {
+      feature: "embed",
       label: "Embed",
       description: "Embed a YouTube / Vimeo URL",
       group: "media",
@@ -154,13 +175,23 @@ export const buildOptions = (upload: EditorUpload, extraOptions: readonly Editor
       run: (editor) => insertEmbed(editor, {}),
     }),
     new SlashOption("excalidraw", {
+      feature: "excalidraw",
       label: "Excalidraw",
       description: "Draw a diagram",
       group: "media",
       keywords: ["draw", "diagram", "sketch", "whiteboard"],
       run: (editor) => insertExcalidraw(editor, {}),
     }),
+    new SlashOption("mermaid", {
+      feature: "mermaid",
+      label: "Mermaid",
+      description: "Diagram from Mermaid syntax",
+      group: "media",
+      keywords: ["diagram", "flowchart", "sequence", "graph", "chart", "uml", "gantt"],
+      run: (editor) => insertMermaid(editor),
+    }),
     new SlashOption("table", {
+      feature: "table",
       label: "Table",
       description: "Insert a 3×3 table",
       group: "structure",
@@ -168,6 +199,7 @@ export const buildOptions = (upload: EditorUpload, extraOptions: readonly Editor
       run: (editor) => insertTable(editor),
     }),
     new SlashOption("accordion", {
+      feature: "collapsible",
       label: "Toggle",
       description: "Collapsible accordion section",
       group: "structure",
@@ -175,6 +207,7 @@ export const buildOptions = (upload: EditorUpload, extraOptions: readonly Editor
       run: (editor) => insertCollapsible(editor),
     }),
     new SlashOption("callout", {
+      feature: "callout",
       label: "Callout",
       description: "Add a highlighted note",
       group: "structure",
@@ -182,6 +215,7 @@ export const buildOptions = (upload: EditorUpload, extraOptions: readonly Editor
       run: (editor) => formatCallout(editor, "info"),
     }),
     new SlashOption("quote", {
+      feature: "quote",
       label: "Quote",
       description: "Add a quote",
       group: "structure",
@@ -189,6 +223,7 @@ export const buildOptions = (upload: EditorUpload, extraOptions: readonly Editor
       run: formatQuote,
     }),
     new SlashOption("code", {
+      feature: "code",
       label: "Code",
       description: "Add a code block",
       group: "structure",
@@ -196,6 +231,7 @@ export const buildOptions = (upload: EditorUpload, extraOptions: readonly Editor
       run: formatCode,
     }),
     new SlashOption("divider", {
+      feature: "divider",
       label: "Divider",
       description: "Separate content",
       group: "structure",
@@ -203,6 +239,19 @@ export const buildOptions = (upload: EditorUpload, extraOptions: readonly Editor
       run: insertDivider,
     }),
   );
+
+  for (const source of mentionSources) {
+    options.push(
+      new SlashOption(`mention:${source.refName}`, {
+        feature: "mention",
+        label: source.label,
+        description: `Mention a ${source.label.toLowerCase()}`,
+        group: "reference",
+        keywords: [source.refName, "mention", ...(source.keywords ?? [])],
+        run: (editor) => openMentionSource(editor, source),
+      }),
+    );
+  }
 
   for (const option of extraOptions) {
     options.push(
@@ -216,7 +265,7 @@ export const buildOptions = (upload: EditorUpload, extraOptions: readonly Editor
     );
   }
 
-  return options;
+  return options.filter((option) => !option.feature || features.has(option.feature));
 };
 
 /** Case-insensitive match against label + keywords. */

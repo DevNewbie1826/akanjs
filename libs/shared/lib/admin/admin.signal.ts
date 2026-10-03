@@ -4,9 +4,10 @@ import {
   Me,
   makeAdminAccessTokenResponse as makeAccessTokenResponse,
   makeAdminSignoutResponse as makeSignoutResponse,
+  readRefreshTokenCookie,
   SuperAdmin,
 } from "@libs/shared/srvkit";
-import { ID } from "akanjs/base";
+import { ID, Int } from "akanjs/base";
 import { endpoint, internal, Req, slice } from "akanjs/signal";
 import * as cnst from "../cnst";
 import { Err } from "../dict";
@@ -20,23 +21,33 @@ export class AdminInternal extends internal(srv.admin, ({ initialize, process, r
 
 export class AdminSlice extends slice(
   srv.admin,
-  { guards: { root: AdminGuard, get: AdminGuard, cru: SuperAdmin } },
-  () => ({}),
+  // `cru: false`: creating or re-roling an operator account is the escalation every other guard is measured
+  // against. It stays a deliberate act in the admin console.
+  { guards: { root: AdminGuard, get: AdminGuard, cru: SuperAdmin }, mcp: { cru: false } },
+  (init) => ({
+    inMention: init()
+      .search("text", String)
+      .exec(function (text) {
+        return this.adminService.queryBySearch(text);
+      }),
+  }),
 ) {}
 
 export class AdminEndpoint extends endpoint(srv.admin, ({ query, mutation, pubsub, message }) => ({
   isAdminSystemInitialized: query(Boolean).exec(async function () {
     return await this.adminService.isAdminSystemInitialized();
   }),
-  createAdminWithInitialize: mutation(cnst.Admin)
+  // The root admin is seeded at boot from env, so adding the next one is a superAdmin act; left open, this call
+  // mints a superAdmin for anyone while no other admin exists.
+  createAdminWithInitialize: mutation(cnst.Admin, { guards: [SuperAdmin], mcp: false })
     .body("data", cnst.AdminInput)
     .exec(async function (data) {
       return await this.adminService.createAdminWithInitialize(data);
     }),
-  me: query(cnst.Admin)
-    .with(Me)
+  me: query(cnst.Admin, { nullable: true })
+    .with(Me, { nullable: true })
     .exec(async function (me) {
-      return await this.adminService.getAdmin(me.id);
+      return me ? await this.adminService.getAdmin(me.id) : null;
     }),
   setAdminPassword: mutation(Boolean)
     .body("adminId", ID)
@@ -62,8 +73,8 @@ export class AdminEndpoint extends endpoint(srv.admin, ({ query, mutation, pubsu
     .body("refreshToken", String, { nullable: true })
     .with(Account)
     .with(Req)
-    .exec(async function (refreshToken, account, request) {
-      const token = refreshToken ?? (request as Bun.BunRequest).cookies.get("adminRefreshToken");
+    .exec(async function (refreshToken, account, req) {
+      const token = refreshToken ?? readRefreshTokenCookie(req.cookies, "admin");
       if (!token) throw new Err("admin.error.noRefreshToken");
       try {
         return makeAccessTokenResponse(await this.adminService.refreshAdminToken(token, account)) as never;
@@ -77,6 +88,15 @@ export class AdminEndpoint extends endpoint(srv.admin, ({ query, mutation, pubsu
         }
         throw error;
       }
+    }),
+  // `mcp: false`: the statement is read-only by construction, but it answers with raw rows rather than a model,
+  // so it is the one read that walks past `mask()` — `SELECT * FROM "user"` returns the columns every model
+  // response strips. One injected instruction in an operator's agent would be the whole database.
+  runAdminSql: mutation(cnst.InsightRows, { guards: [SuperAdmin], mcp: false })
+    .body("sql", String, { example: 'SELECT COUNT(*) AS total FROM "user"' })
+    .body("limit", Int, { nullable: true })
+    .exec(async function (sql, limit) {
+      return await this.adminService.runInsight(sql, limit);
     }),
   addAdminRole: mutation(cnst.Admin)
     .body("adminId", ID)

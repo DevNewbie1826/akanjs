@@ -25,7 +25,10 @@ export type FrameSlotBucket = "active" | "pending";
 export type FrameSlotMapByBucket = Record<FrameSlotBucket, FrameSlotMap>;
 export const PENDING_FRAME_READY_TIMEOUT_MS = 80;
 export const PENDING_FRAME_READY_MAX_TIMEOUT_MS = 120;
-export const KEYBOARD_FALLBACK_ANIMATION_DURATION_MS = 285;
+export const KEYBOARD_SHOW_ANIMATION_DURATION_MS = 420;
+export const KEYBOARD_HIDE_ANIMATION_DURATION_MS = 90;
+export const KEYBOARD_SHOW_ANIMATION_EASING = "cubic-bezier(0.16, 1, 0.3, 1)";
+export const KEYBOARD_HIDE_ANIMATION_EASING = "cubic-bezier(0.7, 0, 0.84, 0)";
 
 export const FRAME_Z_INDEX = {
   page: 10,
@@ -41,30 +44,7 @@ export const clonePageState = (pageState: PageState): PageState => ({ ...pageSta
 
 const resolveFrameSlotHeight = (slot: FrameSlotRegistration) => slot.height ?? slot.estimatedHeight ?? 0;
 
-const isInsetLockedByConfig = (_pathRoute: PathRoute, _key: "topInset" | "bottomInset") => {
-  // Inset reservation is an explicit route-level contract. Frame slots still
-  // carry measured runtime details (notably keyboard accessory height), but
-  // they no longer infer page chrome size when pageConfig omits the inset.
-  return true;
-};
-
 const getLeafLayout = (pathRoute: PathRoute) => pathRoute.renderLayouts.at(-1);
-
-function isSlotEligibleForTarget({
-  sourcePath,
-  targetPath,
-  slot,
-  visiblePaths,
-}: {
-  sourcePath: string;
-  targetPath: string;
-  slot: FrameSlotRegistration;
-  visiblePaths: Set<string>;
-}) {
-  if (visiblePaths.has(sourcePath)) return true;
-  if (sourcePath === targetPath && slot.scope === "layout" && slot.cache) return true;
-  return slot.scope === "layout" && Boolean(slot.cache);
-}
 
 export function getFrameSlotsForPath(
   pathRoute: PathRoute,
@@ -76,8 +56,8 @@ export function getFrameSlotsForPath(
   const targetLeafLayout = getLeafLayout(pathRoute);
   return Object.entries(frameSlots).flatMap(([sourcePath, slotsById]) => {
     const sourceRoute = routeByPath.get(sourcePath);
-    const slots = Object.values(slotsById).filter((slot) =>
-      isSlotEligibleForTarget({ sourcePath, targetPath: pathRoute.path, slot, visiblePaths }),
+    const slots = Object.values(slotsById).filter(
+      (slot) => visiblePaths.has(sourcePath) || (slot.scope === "layout" && Boolean(slot.cache)),
     );
     if (sourcePath === pathRoute.path) return slots;
     if (!sourceRoute || !targetLeafLayout || getLeafLayout(sourceRoute) !== targetLeafLayout) return [];
@@ -93,22 +73,8 @@ export function applyFrameSlots(
   visiblePaths: Set<string>,
 ) {
   const slots = getFrameSlotsForPath(pathRoute, frameSlots, pathRoutes, visiblePaths);
-  if (slots.length === 0) return clonePageState(basePageState);
   const pageState = clonePageState(basePageState);
-  if (!isInsetLockedByConfig(pathRoute, "topInset")) {
-    pageState.topInset = Math.max(
-      pageState.topInset,
-      ...slots.filter((slot) => slot.type === "topInset").map(resolveFrameSlotHeight),
-    );
-  }
-  if (!isInsetLockedByConfig(pathRoute, "bottomInset")) {
-    pageState.bottomInset = Math.max(
-      pageState.bottomInset,
-      ...slots.filter((slot) => slot.type === "bottomInset").map(resolveFrameSlotHeight),
-    );
-  }
-  const explicit = pathRoute.explicitPageConfigKeys ?? {};
-  if (!explicit.cache && slots.some((slot) => slot.cache)) pageState.cache = true;
+  if (!pathRoute.explicitPageConfigKeys?.cache && slots.some((slot) => slot.cache)) pageState.cache = true;
   return pageState;
 }
 
@@ -145,8 +111,7 @@ export function useFrameSlots() {
           const nextBucket = { ...prev[bucket] };
           if (Object.keys(nextPathSlots).length > 0) nextBucket[path] = nextPathSlots;
           else delete nextBucket[path];
-          const next = { ...prev, [bucket]: nextBucket };
-          return next;
+          return { ...prev, [bucket]: nextBucket };
         });
       };
     },
@@ -197,38 +162,53 @@ export function getFramePlatformProfile(): FramePlatformProfile {
   return isStandalone || hasCssSafeArea ? "mobileWeb" : "web";
 }
 
-export function useFrameViewport() {
-  const [viewport, setViewport] = useState(() => ({
-    width: window.innerWidth,
-    height: window.innerHeight,
-    visualWidth: window.visualViewport?.width ?? window.innerWidth,
-    visualHeight: window.visualViewport?.height ?? window.innerHeight,
-    visualOffsetTop: window.visualViewport?.offsetTop ?? 0,
-  }));
+/** Zeroes, for the render that has no window: a `useState` initializer runs during render, server included. */
+const emptyViewport = { width: 0, height: 0, visualWidth: 0, visualHeight: 0, visualOffsetTop: 0 };
 
-  const updateViewport = useCallback((reason = "viewport.change") => {
-    const visualViewport = window.visualViewport;
-    const platform = getCurrentPlatform();
-    const nextViewport = {
-      width: Math.round(visualViewport?.width ?? window.innerWidth),
-      height: Math.round(platform === "ios" ? window.innerHeight : (visualViewport?.height ?? window.innerHeight)),
-      visualWidth: Math.round(visualViewport?.width ?? window.innerWidth),
-      visualHeight: Math.round(visualViewport?.height ?? window.innerHeight),
-      visualOffsetTop: Math.round(visualViewport?.offsetTop ?? 0),
-    };
-    setViewport((prev) => {
-      if (
-        prev.width === nextViewport.width &&
-        prev.height === nextViewport.height &&
-        prev.visualWidth === nextViewport.visualWidth &&
-        prev.visualHeight === nextViewport.visualHeight &&
-        prev.visualOffsetTop === nextViewport.visualOffsetTop
-      )
-        return prev;
-      debugFrame(reason, { from: prev, to: nextViewport, platform });
-      return nextViewport;
-    });
-  }, []);
+export function useFrameViewport() {
+  const [viewport, setViewport] = useState(() =>
+    typeof window === "undefined"
+      ? emptyViewport
+      : {
+          width: window.innerWidth,
+          height: window.innerHeight,
+          visualWidth: window.visualViewport?.width ?? window.innerWidth,
+          visualHeight: window.visualViewport?.height ?? window.innerHeight,
+          visualOffsetTop: window.visualViewport?.offsetTop ?? 0,
+        },
+  );
+
+  const updateViewport = useCallback(
+    (reason = "viewport.change") => {
+      const visualViewport = window.visualViewport;
+      const platform = getCurrentPlatform();
+      const usesAkanKeyboardResize = platform === "ios" || platform === "android";
+      const width = Math.round(visualViewport?.width ?? window.innerWidth);
+      const currentHeight = Math.round(window.innerHeight);
+      const stableHeight =
+        usesAkanKeyboardResize && width === viewport.width ? Math.max(viewport.height, currentHeight) : currentHeight;
+      const nextViewport = {
+        width,
+        height: usesAkanKeyboardResize ? stableHeight : Math.round(visualViewport?.height ?? window.innerHeight),
+        visualWidth: Math.round(visualViewport?.width ?? window.innerWidth),
+        visualHeight: Math.round(visualViewport?.height ?? window.innerHeight),
+        visualOffsetTop: Math.round(visualViewport?.offsetTop ?? 0),
+      };
+      setViewport((prev) => {
+        if (
+          prev.width === nextViewport.width &&
+          prev.height === nextViewport.height &&
+          prev.visualWidth === nextViewport.visualWidth &&
+          prev.visualHeight === nextViewport.visualHeight &&
+          prev.visualOffsetTop === nextViewport.visualOffsetTop
+        )
+          return prev;
+        debugFrame(reason, { from: prev, to: nextViewport, platform });
+        return nextViewport;
+      });
+    },
+    [viewport.height],
+  );
 
   useEffect(() => {
     updateViewport("viewport.init");
@@ -261,9 +241,12 @@ export function hasKeyboardStickySlot(path: string, frameSlots: FrameSlotMap) {
   return getKeyboardAccessorySlots(path, frameSlots).length > 0;
 }
 
+export function hasBottomAnchoredKeyboardSlot(path: string, frameSlots: FrameSlotMap) {
+  return getKeyboardAccessorySlots(path, frameSlots).some((slot) => slot.contentAnchor === "bottom");
+}
+
 export function resolveKeyboardFrame({
   keyboardHeight,
-  bottomSafeArea,
   visualViewportKeyboardHeight,
   platformProfile,
   sticky,
@@ -276,22 +259,36 @@ export function resolveKeyboardFrame({
   sticky: boolean;
   freeze?: boolean;
 }): KeyboardFrameState {
+  const useVisualViewportHeight = platformProfile === "android" && visualViewportKeyboardHeight > 0;
   const visualFallbackHeight =
     keyboardHeight <= 0 && visualViewportKeyboardHeight > 0 ? visualViewportKeyboardHeight : 0;
-  const effectiveKeyboardHeight = keyboardHeight > 0 ? keyboardHeight : visualFallbackHeight;
-  const source = keyboardHeight > 0 ? "native" : visualFallbackHeight > 0 ? "visualViewport" : "fallback";
+  const effectiveKeyboardHeight = useVisualViewportHeight
+    ? visualViewportKeyboardHeight
+    : keyboardHeight > 0
+      ? keyboardHeight
+      : visualFallbackHeight;
+  const source = useVisualViewportHeight
+    ? "visualViewport"
+    : keyboardHeight > 0
+      ? "native"
+      : visualFallbackHeight > 0
+        ? "visualViewport"
+        : "fallback";
   const visualCompensation =
-    platformProfile === "ios" ? 0 : Math.min(visualViewportKeyboardHeight, effectiveKeyboardHeight);
+    platformProfile === "web" || platformProfile === "mobileWeb"
+      ? Math.min(visualViewportKeyboardHeight, effectiveKeyboardHeight)
+      : 0;
   const offset = sticky && !freeze ? Math.max(0, effectiveKeyboardHeight - visualCompensation) : 0;
+  const isShowing = effectiveKeyboardHeight > 0 && !freeze;
   return {
     height: effectiveKeyboardHeight,
     offset,
-    visible: effectiveKeyboardHeight > 0 && !freeze,
+    visible: isShowing,
     sticky,
     frozen: freeze,
     source,
-    animationDuration: KEYBOARD_FALLBACK_ANIMATION_DURATION_MS,
-    animationEasing: "ease-out",
+    animationDuration: isShowing ? KEYBOARD_SHOW_ANIMATION_DURATION_MS : KEYBOARD_HIDE_ANIMATION_DURATION_MS,
+    animationEasing: isShowing ? KEYBOARD_SHOW_ANIMATION_EASING : KEYBOARD_HIDE_ANIMATION_EASING,
   };
 }
 
@@ -346,14 +343,18 @@ export function useKeyboardFrame({
 }: {
   bottomSafeArea: number;
   sticky: boolean;
-  viewport: { visualHeight: number; visualOffsetTop: number };
+  viewport: { height: number; visualHeight: number; visualOffsetTop: number };
   platformProfile: FramePlatformProfile;
   freeze?: boolean;
 }) {
-  const keyboardHeight = st.use.keyboardHeight();
+  const keyboardHeight = st.use.keyboardHeight({ agent: false });
+  const androidViewportKeyboardHeight =
+    platformProfile === "android" ? Math.max(0, Math.round(viewport.height - window.innerHeight)) : 0;
   const visualViewportKeyboardHeight = Math.max(
     0,
-    Math.round(window.innerHeight - viewport.visualHeight - viewport.visualOffsetTop),
+    androidViewportKeyboardHeight > 0
+      ? androidViewportKeyboardHeight
+      : Math.round(viewport.height - viewport.visualHeight - viewport.visualOffsetTop),
   );
   return useMemo(
     () =>
@@ -504,8 +505,7 @@ export function createFrameSnapshot({
 
 const getTransitionDuration = (type: TransitionType) => {
   if (typeof window !== "undefined" && window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches) return 1;
-  if (type === "bottomUp") return 220;
-  if (type === "scaleOut") return 220;
+  if (type === "bottomUp" || type === "scaleOut") return 220;
   if (type === "fade" || type === "stack") return 150;
   return 0;
 };

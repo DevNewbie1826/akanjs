@@ -32,6 +32,30 @@ Model the business
 
 Business nouns such as user, order, product, and invoice usually become folders under lib/.
 
+Which folder does this file go in
+
+Who uses it?
+
+one product
+
+several products
+
+What does the file do?
+
+a URL a user visits
+
+data the business stores
+
+something the business does
+
+reusable markup
+
+browser API or React hook
+
+node, Bun, or a secret
+
+pure and isomorphic
+
 Workspace Rule
 
 At the workspace root, choose the folder by how widely the code is used. A single product goes to apps/. Shared product code goes to libs/. Framework code goes to pkgs/.
@@ -40,9 +64,9 @@ A business product that can run by itself. Examples: customer web, admin portal,
 
 Reusable product code shared by several apps. Examples: user account, billing, file upload, social features, security, admin features, etc.
 
-Code with special purpose, used or published as npm packages. Examples: payment gateway, robot control code, blockchain integration code, etc.
+Code with special purpose, used or published as npm packages. Examples: payment gateway, robot control code, etc.
 
-Generated folders such as .akan/ and dist/ are build outputs. They help Akan run fast, but you normally do not edit them by hand.
+Generated folders such as .akan/ and dist/ are build outputs, and you normally do not edit them by hand.
 
 Use pkgs/ only when the code should feel like a separate installable package. Ordinary one-app business logic belongs in apps/, and shared product logic usually belongs in libs/ first.
 
@@ -50,37 +74,33 @@ App/Library Folder Rule
 
 An app is where a product becomes visible to users. A library is where reusable business capabilities live. They look similar because both can have domain modules, UI, assets, and server helpers.
 
-Client
+Each folder has an admission test rather than a theme, and the first column says which side of the client boundary its code runs on. A client folder ships to the browser, so nothing secret may reach one; a shared folder is read from both sides, so it must stay pure and environment-safe. A file that fails every test does not belong in the app or library root at all.
 
-Runs in the browser or client app. Keep secrets out of this type.
+Folder
 
-Server
+- page/: A screen the user visits. When a feature has its own URL, put the page here. Example: page/orders.tsx serves /orders. — client
 
-Runs on the server. Good for private API calls, scripts, and protected logic.
+- lib/: Business data and the rules that go with it. When a feature owns something you save, make it a module folder. Example: lib/order/ holds the order data and its behavior. — shared
 
-Shared
+- ui/: Pieces of screen you reuse across pages and that are not tied to one model. Example: a card or a chart used in several places. — client
 
-Can be used from both server and client. Keep it pure and environment-safe.
+- webkit/: Code that needs the browser or a device feature, or a React hook. Example: a clipboard helper, a camera hook. — client
 
-Put pages here when a user can visit them by URL. Examples: home, sign in, product detail, admin dashboard. A library can hold one too, and apps that opt in with syncPageLibs serve its routes.
+- common/: Small pure helpers both sides use. Example: date formatting, string utilities. — shared
 
-Put business concepts here. Examples: user, product, order, invoice, payment, notification.
+- srvkit/: Connections to outside services. Example: a payment API client, a mail sender. — server
 
-Put reusable visual components here. Examples: Header, ProductCard, DatePicker, EmptyState.
+- env/: Settings that differ per environment. Example: local and production API hosts. — shared
 
-Put shared code that both server and client can access. Examples: formatters, validators, constants, and pure utilities.
+- plugin/: Code that changes how the app builds or runs. Example: a plugin that generates image sizes at build time. — shared
 
-Put browser/client helpers here. Examples: hooks for notifications, device APIs, local storage, or web-only behavior.
+- native/: Its own native plugins, one folder per plugin id. Example: native/label-printer/ with its page API, Kotlin and Swift. — client
 
-Environment adapters and environment-specific files generated or used by Akan.
+- public/: Files served as they are, with no processing. Example: images, fonts, robots.txt. — client
 
-Put static files here. Examples: logos, icons, fonts, downloadable PDFs, sample images.
+- private/: An asset folder the server reads at runtime and never serves to the browser. Example: an ONNX model file, a fixed JSON dataset. — server
 
-Put server-only helpers here. Examples: payment API clients, cloud SDK wrappers, private scripts.
-
-Put implementation-only code here when it should not become part of the public app or library API.
-
-Put development scripts here when you run them while the Akan server is running.
+- script/: Developer scripts you run by hand against a running app. Example: filling the database with test data. — server
 
 When you are unsure, ask what the file does: screen goes to page/, reusable visual piece goes to ui/, saved business data goes to lib/<model>/, and private server integration goes to srvkit/ or lib/_<service>/.
 
@@ -122,7 +142,7 @@ apps/commerce/
 │   ├── order/          # order data and behavior
 │   └── _payment/       # payment workflow
 ├── ui/
-│   └── ProductCard.tsx
+│   └── DisplayCard.tsx
 ├── srvkit/
 │   └── paymentGateway.ts
 └── public/
@@ -150,6 +170,8 @@ apps/myapp/
 ├── common/
 ├── webkit/
 ├── env/
+├── plugin/
+├── native/
 ├── public/
 ├── srvkit/
 ├── private/
@@ -172,6 +194,8 @@ libs/shared/
 ├── private/
 ├── common/
 ├── webkit/
+├── plugin/
+├── native/
 ├── client.ts
 ├── server.ts
 └── index.ts

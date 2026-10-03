@@ -1,13 +1,23 @@
+import { lowerlize } from "akanjs/common";
 import ts from "typescript";
 import type { Sys } from "../commandDecorators";
 import { generatedFilePathsForTarget } from "./artifacts";
-import { createPrimitiveWriteReport } from "./primitive";
+import {
+  callExpressionName,
+  expressionName,
+  firstObjectReturnedByArrow,
+  heritageCall,
+  nodeName,
+  propertyName,
+  sourceFileFor,
+} from "./sourceAst";
 import type {
   PrimitiveChangedFile,
   PrimitiveFileMap,
   PrimitiveGeneratedFile,
   PrimitiveNextAction,
   PrimitiveValidationCommand,
+  PrimitiveWriteReport,
   WorkflowDiagnostic,
 } from "./types";
 
@@ -57,6 +67,27 @@ export const nextActionsForTarget = (target: string) =>
     { command: `akan lint ${target}`, reason: "Validate the target after generated files are refreshed." },
   ] satisfies PrimitiveNextAction[];
 
+export const createPrimitiveWriteReport = ({
+  command,
+  status,
+  changedFiles = [],
+  generatedFiles = [],
+  validationCommands = [],
+  diagnostics = [],
+  nextActions = [],
+}: Omit<PrimitiveWriteReport, "schemaVersion" | "status"> & {
+  status?: PrimitiveWriteReport["status"];
+}): PrimitiveWriteReport => ({
+  schemaVersion: 1,
+  command,
+  status: status ?? (diagnostics.some((diagnostic) => diagnostic.severity === "error") ? "failed" : "passed"),
+  changedFiles,
+  generatedFiles,
+  validationCommands,
+  diagnostics,
+  nextActions,
+});
+
 export const createPassedPrimitiveReport = ({
   command,
   changedFiles,
@@ -89,8 +120,6 @@ export const titleize = (value: string) =>
     .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
     .replace(/[-_]+/g, " ")
     .replace(/\b\w/g, (char) => char.toUpperCase());
-
-export const lowerlize = (value: string) => `${value.slice(0, 1).toLowerCase()}${value.slice(1)}`;
 
 const koLabels: Record<string, string> = {
   amount: "금액",
@@ -160,21 +189,27 @@ export const normalizeFieldType = (typeName: string) => {
   return normalizedTypes[typeName.toLowerCase()] ?? typeName;
 };
 
-export const ensureBaseTypeImport = (content: string, typeName: string) => {
-  if (typeName !== "Int" && typeName !== "Float") return content;
-  const source = sourceFileFor("constant.ts", content);
-  const baseImport = findNamedImport(source, "akanjs/base");
-  if (baseImport) {
-    if (baseImport.names.includes(typeName)) return content;
-    const nextNames = [...baseImport.names, typeName].sort();
+export const ensureNamedImport = (content: string, moduleSpecifier: string, name: string) => {
+  const source = sourceFileFor("source.ts", content);
+  const namedImport = findNamedImport(source, moduleSpecifier);
+  if (namedImport) {
+    if (namedImport.names.includes(name)) return content;
+    const nextNames = [...namedImport.names, name].sort();
     return spliceText(
       content,
-      baseImport.namedBindingsStart,
-      baseImport.namedBindingsEnd,
+      namedImport.namedBindingsStart,
+      namedImport.namedBindingsEnd,
       `{ ${nextNames.join(", ")} }`,
     );
   }
-  return `import { ${typeName} } from "akanjs/base";\n${content}`;
+  return `import { ${name} } from "${moduleSpecifier}";\n${content}`;
+};
+
+export const ensureBaseImport = (content: string, name: string) => ensureNamedImport(content, "akanjs/base", name);
+
+export const ensureBaseTypeImport = (content: string, typeName: string) => {
+  if (typeName !== "Int" && typeName !== "Float") return content;
+  return ensureBaseImport(content, typeName);
 };
 
 export type FieldDefaultValue = string | number | boolean | null;
@@ -200,12 +235,12 @@ const booleanDefault = (rawDefault: FieldDefaultValue): string | null => {
 };
 
 const dateDefault = (rawDefault: FieldDefaultValue): string | null => {
-  if (typeof rawDefault === "number" && Number.isFinite(rawDefault)) return `new Date(${rawDefault})`;
+  if (typeof rawDefault === "number" && Number.isFinite(rawDefault)) return `() => dayjs(${rawDefault})`;
   if (typeof rawDefault !== "string") return null;
   const trimmed = rawDefault.trim();
   if (!trimmed) return null;
-  if (trimmed === "now") return "new Date()";
-  if (!Number.isNaN(Date.parse(trimmed))) return `new Date(${JSON.stringify(trimmed)})`;
+  if (trimmed === "now") return "() => dayjs()";
+  if (!Number.isNaN(Date.parse(trimmed))) return `() => dayjs(${JSON.stringify(trimmed)})`;
   return null;
 };
 
@@ -373,9 +408,6 @@ export interface AkanDictionaryStructure {
   fields: string[];
 }
 
-const sourceFileFor = (fileName: string, content: string, scriptKind = ts.ScriptKind.TS) =>
-  ts.createSourceFile(fileName, content, ts.ScriptTarget.Latest, true, scriptKind);
-
 const hasParseDiagnostics = (source: ts.SourceFile) =>
   ((source as ts.SourceFile & { parseDiagnostics?: readonly ts.Diagnostic[] }).parseDiagnostics ?? []).length > 0;
 
@@ -391,52 +423,6 @@ const lineEndAt = (content: string, position: number) => {
 
 const lineIndentAt = (content: string, position: number) =>
   /^[ \t]*/.exec(content.slice(lineStartAt(content, position)))?.[0] ?? "";
-
-const nodeName = (node: ts.PropertyName | ts.BindingName | undefined) => {
-  if (!node) return null;
-  if (ts.isIdentifier(node) || ts.isStringLiteral(node) || ts.isNumericLiteral(node)) return node.text;
-  return null;
-};
-
-const propertyName = (node: ts.ObjectLiteralElementLike) =>
-  ts.isPropertyAssignment(node) || ts.isShorthandPropertyAssignment(node) || ts.isMethodDeclaration(node)
-    ? nodeName(node.name)
-    : null;
-
-const expressionName = (expression: ts.Expression): string | null => {
-  if (ts.isIdentifier(expression)) return expression.text;
-  if (ts.isPropertyAccessExpression(expression)) return expression.name.text;
-  if (ts.isCallExpression(expression)) return expressionName(expression.expression);
-  if (ts.isAsExpression(expression)) return expressionName(expression.expression);
-  return null;
-};
-
-const firstObjectReturnedByArrow = (node: ts.Node): ts.ObjectLiteralExpression | null => {
-  if (!ts.isArrowFunction(node) && !ts.isFunctionExpression(node)) return null;
-  if (ts.isObjectLiteralExpression(node.body)) return node.body;
-  if (ts.isParenthesizedExpression(node.body) && ts.isObjectLiteralExpression(node.body.expression)) {
-    return node.body.expression;
-  }
-  if (!ts.isBlock(node.body)) return null;
-  for (const statement of node.body.statements) {
-    if (ts.isReturnStatement(statement) && statement.expression && ts.isObjectLiteralExpression(statement.expression)) {
-      return statement.expression;
-    }
-  }
-  return null;
-};
-
-const isViaCall = (expression: ts.Expression) =>
-  ts.isCallExpression(expression) && expressionName(expression.expression) === "via";
-
-const heritageCall = (node: ts.ClassDeclaration) => {
-  const heritage = node.heritageClauses?.flatMap((clause) => [...clause.types]) ?? [];
-  const expression = heritage.find((clause) => isViaCall(clause.expression))?.expression;
-  return expression && ts.isCallExpression(expression) ? expression : null;
-};
-
-const callExpressionName = (node: ts.CallExpression) =>
-  ts.isPropertyAccessExpression(node.expression) ? node.expression.name.text : expressionName(node.expression);
 
 const locatedObject = (source: ts.SourceFile, objectLiteral: ts.ObjectLiteralExpression): ObjectInsertionLocator => ({
   objectStart: objectLiteral.getStart(source),
@@ -863,8 +849,6 @@ export const parseValues = (value: string | null) =>
     .map((item) => item.trim())
     .filter(Boolean) ?? [];
 
-// ---- Service / signal insertion (add-mutation, add-slice) ----
-
 export const hasSourceParseErrors = (content: string, fileName = "source.ts") =>
   hasParseDiagnostics(sourceFileFor(fileName, content));
 
@@ -982,8 +966,7 @@ export const insertSignalFactoryEntry = (
   if (!located) return null;
   const locator = locatedObject(source, located.object);
   if (locator.fields.some((field) => field.name === entryName)) return content;
-  // Compute the param edit first (its offsets precede the object), but apply it last so the
-  // object splice (at a higher offset) does not invalidate the param region positions.
+  // Apply the param edit last: it sits before the object, so applying it first would shift the object's offsets.
   const paramEdit = factoryParamEdit(content, source, located.arrow, param);
   if (paramEdit === null) return null;
   const withEntry = insertOrderedFieldLine(content, locator, entryName, entryLine, {

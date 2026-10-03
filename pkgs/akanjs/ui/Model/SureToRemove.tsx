@@ -1,12 +1,16 @@
 "use client";
-import { clsx, msg, router, usePage } from "akanjs/client";
+import { ID } from "akanjs/base";
+import { cn, msg, router, usePage } from "akanjs/client";
 import { capitalize } from "akanjs/common";
 import type { SliceMeta } from "akanjs/fetch";
 import { st } from "akanjs/store";
-import { useMemo, useState } from "react";
+import { type ReactNode, useState } from "react";
 import { AiOutlineDelete } from "react-icons/ai";
 
+import { agentAttrs } from "../agentAttrs";
+import { buttonRecipe } from "../Button";
 import { Modal } from "../Modal";
+import { inputRecipe } from "../recipe";
 
 interface SureToRemoveProps {
   className?: string;
@@ -15,6 +19,11 @@ interface SureToRemoveProps {
   slice: SliceMeta;
   redirect?: string;
   typeNameToRemove?: boolean;
+  /** Element that opens the confirmation. Defaults to the framework's delete label. */
+  trigger?: ReactNode;
+  title?: ReactNode;
+  description?: ReactNode;
+  confirmLabel?: ReactNode;
 }
 export default function SureToRemove({
   className,
@@ -23,35 +32,47 @@ export default function SureToRemove({
   slice,
   redirect,
   typeNameToRemove,
+  trigger,
+  title,
+  description,
+  confirmLabel,
 }: SureToRemoveProps) {
   const { l } = usePage();
   const [repeatName, setRepeatName] = useState("");
   const [modalOpen, setModalOpen] = useState(false);
   const storeDo = st.do as unknown as { [key: string]: (...args: any[]) => Promise<void> };
-  const { refName, sliceName } = slice;
-  const modelName = refName;
-  const names = useMemo(
-    () => ({
-      removeModel: `remove${capitalize(modelName)}`,
-    }),
-    [],
-  );
+  const { refName: modelName } = slice;
+  const names = { removeModel: `remove${capitalize(modelName)}` };
 
+  const removeModel = async (id: string) => {
+    await storeDo[names.removeModel](id);
+    msg.success("base.removeSuccess", { data: { model: l(`${modelName}.modelName` as "base.new") } });
+    setModalOpen(false);
+    if (!redirect) return;
+    if (redirect === "back") router.back();
+    else router.push(redirect);
+  };
+  // `typeNameToRemove` gates a person behind retyping the name; a one-click approval card is no such gate, so no tool.
+  const removeTool = st
+    .tool(typeNameToRemove ? null : names.removeModel)
+    .desc(`Remove one ${modelName}.`)
+    .arg("modelId", ID)
+    .exec((id) => removeModel(id));
   return (
-    <div
-      className="inline size-full"
-      onClick={(e) => {
-        e.stopPropagation();
-        setModalOpen(true);
-      }}
-    >
+    <>
       <div
-        className={clsx(
-          "flex size-full cursor-pointer flex-nowrap items-center justify-center gap-2 whitespace-nowrap text-error",
-          className,
-        )}
+        className={cn(trigger ? "contents" : "inline size-full", className)}
+        {...agentAttrs(removeTool)}
+        onClick={(e) => {
+          e.stopPropagation();
+          setModalOpen(true);
+        }}
       >
-        <AiOutlineDelete /> {l("base.remove")}
+        {trigger ?? (
+          <div className="flex size-full cursor-pointer flex-nowrap items-center justify-center gap-2 whitespace-nowrap text-destructive">
+            <AiOutlineDelete /> {l("base.remove")}
+          </div>
+        )}
       </div>
       <Modal
         open={modalOpen}
@@ -59,42 +80,41 @@ export default function SureToRemove({
           setModalOpen(false);
         }}
         title={
-          <div className="font-bold text-error text-lg">
-            {l("base.removeModel", { model: l(`${modelName}.modelName` as "base.new") })}
-          </div>
+          title ?? (
+            <div className="font-bold text-destructive text-lg">
+              {l("base.removeModel", { model: l(`${modelName}.modelName` as "base.new") })}
+            </div>
+          )
         }
-        bodyClassName="border-error"
+        bodyClassName="border-destructive"
         action={
           <button
-            className="btn btn-error w-full"
+            className={buttonRecipe({ variant: "destructive" }, "w-full")}
             disabled={typeNameToRemove && repeatName !== name}
             onClick={async () => {
-              await storeDo[names.removeModel](modelId);
-              msg.success("base.removeSuccess", { data: { model: l(`${modelName}.modelName` as "base.new") } });
-              setModalOpen(false);
-              if (!redirect) return;
-              if (redirect === "back") router.back();
-              else router.push(redirect);
+              await removeModel(modelId);
             }}
           >
-            {l("base.removeModel", { model: l(`${modelName}.modelName` as "base.new") })}
+            {confirmLabel ?? l("base.removeModel", { model: l(`${modelName}.modelName` as "base.new") })}
           </button>
         }
       >
-        <div className="py-4">
-          {l("base.sureToRemove", { model: l(`${modelName}.modelName` as "base.new"), name })}
-          <br />
-          {l("base.irreversibleOps")}
-          {typeNameToRemove ? (
-            <>
-              <br />
-              {l("base.typeNameToRemove", { model: l(`${modelName}.modelName` as "base.new"), name })}
-            </>
-          ) : null}
-        </div>
+        {description ?? (
+          <div className="py-4">
+            {l("base.sureToRemove", { model: l(`${modelName}.modelName` as "base.new"), name })}
+            <br />
+            {l("base.irreversibleOps")}
+            {typeNameToRemove ? (
+              <>
+                <br />
+                {l("base.typeNameToRemove", { model: l(`${modelName}.modelName` as "base.new"), name })}
+              </>
+            ) : null}
+          </div>
+        )}
         {typeNameToRemove ? (
           <input
-            className="input w-full text-center"
+            className={inputRecipe({}, "text-center")}
             placeholder={`${l(`${modelName}.modelName` as "base.new")} name`}
             value={repeatName}
             onChange={(e) => {
@@ -103,6 +123,6 @@ export default function SureToRemove({
           />
         ) : null}
       </Modal>
-    </div>
+    </>
   );
 }

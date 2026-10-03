@@ -9,6 +9,33 @@ const DIRECTORY_SCOPED_LEAVES = new Set(["_layout", "_index", "_overrides"]);
 
 export type RouteModuleKind = "page" | "layout" | "overrides";
 
+export const PAGE_ROUTE_EXPORTS: ReadonlySet<string> = new Set([
+  "default",
+  "pageConfig",
+  "head",
+  "generateHead",
+  "Loading",
+]);
+export const LAYOUT_ROUTE_EXPORTS: ReadonlySet<string> = new Set([...PAGE_ROUTE_EXPORTS, "NotFound", "Error"]);
+export const ROOT_LAYOUT_ROUTE_EXPORTS: ReadonlySet<string> = new Set([
+  ...LAYOUT_ROUTE_EXPORTS,
+  "fonts",
+  "manifest",
+  "theme",
+  "reconnect",
+  "wsConnect",
+  "layoutStyle",
+]);
+/** Root-layout exports that are plain config rather than components, so a PascalCase check cannot allow them. */
+export const RESERVED_ROUTE_CONFIG_EXPORTS: ReadonlySet<string> = new Set(
+  [...ROOT_LAYOUT_ROUTE_EXPORTS].filter((name) => name !== "default" && !/^[A-Z]/.test(name)),
+);
+
+export function getRouteExports(kind: "page" | "layout", { rootLayout = false } = {}): ReadonlySet<string> {
+  if (kind === "page") return PAGE_ROUTE_EXPORTS;
+  return rootLayout ? ROOT_LAYOUT_ROUTE_EXPORTS : LAYOUT_ROUTE_EXPORTS;
+}
+
 export interface ParsedRouteModuleKey {
   key: string;
   kind: RouteModuleKind;
@@ -31,33 +58,39 @@ export interface ValidatePageSourceFileOptions {
   filePath?: string;
 }
 
+const toRouteKey = (filePath: string) =>
+  filePath.startsWith("./") ? filePath : `./${filePath.split(/[\\/]/).join("/")}`;
+
 export function isRouteSourceFile(filePath: string): boolean {
   if (!SOURCE_EXT_RE.test(filePath)) return false;
-  const key = filePath.startsWith("./") ? filePath : `./${filePath.split(/[\\/]/).join("/")}`;
-  return tryParseRouteModuleKey(key) !== null;
+  return tryParseRouteModuleKey(toRouteKey(filePath)) !== null;
+}
+
+/** `null` when the file is fine, including a non-source asset, which `page/` tolerates. */
+export function getPageSourceFileViolation(filePath: string): string | null {
+  if (!SOURCE_EXT_RE.test(filePath)) return null;
+
+  const match = ROUTE_SOURCE_RE.exec(toRouteKey(filePath));
+  if (!match) return "invalid page source file";
+
+  const file = match[1] as string;
+  const ext = match[2] as string;
+  const leaf = file.split("/").filter(Boolean).at(-1);
+  if (!leaf) return "invalid page source file";
+
+  if (ext !== "tsx") return "route source files under page/ must use .tsx";
+  if (leaf.startsWith("_") && !RESERVED_ROUTE_FILES.has(leaf) && leaf !== INTERNAL_ROOT_LAYOUT_LEAF)
+    return "only _index.tsx, _layout.tsx and _overrides.tsx are allowed as reserved route files under page/";
+  if (/^[A-Z]/.test(leaf)) return "route page filenames must not start with an uppercase letter";
+  return null;
 }
 
 export function validatePageSourceFile(filePath: string, options: ValidatePageSourceFileOptions = {}): boolean {
   if (!SOURCE_EXT_RE.test(filePath)) return false;
 
-  const key = filePath.startsWith("./") ? filePath : `./${filePath.split(/[\\/]/).join("/")}`;
-  const match = ROUTE_SOURCE_RE.exec(key);
-  const displayPath = options.filePath ?? key;
-  if (!match) throw new Error(`[route-convention] invalid page source file: ${displayPath}`);
-
-  const file = match[1] as string;
-  const ext = match[2] as string;
-  const leaf = file.split("/").filter(Boolean).at(-1);
-  if (!leaf) throw new Error(`[route-convention] invalid page source file: ${displayPath}`);
-
-  if (ext !== "tsx") throw new Error(`[route-convention] route source files under page/ must use .tsx: ${displayPath}`);
-  if (leaf.startsWith("_") && !RESERVED_ROUTE_FILES.has(leaf) && leaf !== INTERNAL_ROOT_LAYOUT_LEAF)
-    throw new Error(
-      `[route-convention] only _index.tsx, _layout.tsx and _overrides.tsx are allowed as reserved route files under page/: ${displayPath}`,
-    );
-  if (/^[A-Z]/.test(leaf))
-    throw new Error(`[route-convention] route page filenames must not start with an uppercase letter: ${displayPath}`);
-  return true;
+  const violation = getPageSourceFileViolation(filePath);
+  if (!violation) return true;
+  throw new Error(`[route-convention] ${violation}: ${options.filePath ?? toRouteKey(filePath)}`);
 }
 
 export function validateSubRoutePageKey(
@@ -176,6 +209,20 @@ export function matchRoutePattern(pattern: string, pathname: string): Record<str
   for (let i = 0; i < patternParts.length; i++) {
     const pat = patternParts[i] ?? "";
     const val = pathParts[i] ?? "";
+    if (pat.startsWith(":")) params[pat.slice(1)] = decodeURIComponent(val);
+    else if (pat !== val) return null;
+  }
+  return params;
+}
+
+export function matchRoutePrefix(pattern: string, pathname: string): Record<string, string> | null {
+  const patternParts = pattern.split("/").filter(Boolean);
+  const pathParts = pathname.split("/").filter(Boolean);
+  if (patternParts.length > pathParts.length) return null;
+  const params: Record<string, string> = {};
+  for (let i = 0; i < patternParts.length; i++) {
+    const pat = patternParts[i];
+    const val = pathParts[i];
     if (pat.startsWith(":")) params[pat.slice(1)] = decodeURIComponent(val);
     else if (pat !== val) return null;
   }

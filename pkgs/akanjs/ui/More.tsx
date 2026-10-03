@@ -1,5 +1,5 @@
 "use client";
-import { clsx, isMobileDevice } from "akanjs/client";
+import { cn, isMobileDevice } from "akanjs/client";
 import { useEffect, useState } from "react";
 import { InfiniteScroll } from "./InfiniteScroll";
 import { Pagination } from "./Pagination";
@@ -8,7 +8,8 @@ interface MoreProps {
   total: number;
   itemsPerPage: number;
   currentPage: number;
-  onAddPage: (page: number) => Promise<void>;
+  hasMore: boolean;
+  onLoadMore: () => Promise<void>;
   onPageSelect: (page: number, option?: { scrollToTop?: boolean }) => void;
   children?: React.ReactNode;
   className?: string;
@@ -19,7 +20,8 @@ export const More = ({
   total,
   itemsPerPage,
   currentPage,
-  onAddPage,
+  hasMore,
+  onLoadMore,
   onPageSelect,
   children,
   className,
@@ -31,28 +33,19 @@ export const More = ({
     setIsMobile(isMobileDevice());
   }, []);
 
-  if (total <= itemsPerPage) {
-    return <>{children}</>;
-  }
-
-  if (isMobile) {
+  if (isMobile)
     return (
-      <InfiniteScroll
-        total={total}
-        currentPage={currentPage}
-        itemsPerPage={itemsPerPage}
-        onAddPage={onAddPage}
-        onPageSelect={onPageSelect}
-        reverse={reverse}
-      >
+      <InfiniteScroll hasMore={hasMore} onLoadMore={onLoadMore} reverse={reverse}>
         {children}
       </InfiniteScroll>
     );
-  }
+
+  if (total <= itemsPerPage) return <>{children}</>;
+
   return (
     <>
       {children}
-      <div className={clsx("mt-4 flex w-full flex-wrap justify-center", className)}>
+      <div className={cn("mt-4 flex w-full flex-wrap justify-center", className)}>
         <Pagination currentPage={currentPage} total={total} itemsPerPage={itemsPerPage} onPageSelect={onPageSelect} />
       </div>
     </>

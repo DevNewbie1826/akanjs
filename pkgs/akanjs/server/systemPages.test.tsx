@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { DEFAULT_AKAN_I18N } from "akanjs/common";
 import {
+  createSubRouteIndexResponse,
   createSystemPageFallbackText,
   createSystemPageHeaders,
   createSystemPageResponse,
@@ -83,6 +84,22 @@ describe("system pages", () => {
     ).toBe("/en/soft");
   });
 
+  test("lists every basePath as a locale-aware link on the sub route index", async () => {
+    const response = await createSubRouteIndexResponse({
+      locale: "ko",
+      basePaths: ["akanjs", "soft"],
+      subRoutes: { soft: ["soft.example.test"] },
+    });
+    const html = await response.text();
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("Content-Type")).toBe("text/html; charset=utf-8");
+    expect(html).toContain('href="/ko/akanjs"');
+    expect(html).toContain('href="/ko/soft"');
+    expect(html).toContain("soft.example.test");
+    expect(html).toContain("noindex");
+  });
+
   test("provides final fallback text and no-store headers", () => {
     const headers = createSystemPageHeaders();
 
@@ -93,10 +110,9 @@ describe("system pages", () => {
 
   test("keeps RSC worker system-page helpers free of react-dom/server", async () => {
     const result = await Bun.build({
-      entrypoints: [new URL("./rscWorker.tsx", import.meta.url).pathname],
+      entrypoints: [`${import.meta.dir}/rscWorker.tsx`],
       target: "bun",
       conditions: ["react-server"],
-      write: false,
     });
 
     expect(result.success).toBe(true);

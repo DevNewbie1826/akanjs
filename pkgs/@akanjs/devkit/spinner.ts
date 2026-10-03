@@ -2,6 +2,14 @@ import ora, { type Ora } from "ora";
 
 export class Spinner {
   static padding = 12;
+  // XXX: `discardStdin` must stay off: ora raw-modes the terminal while spinning, a Bun child spawned then writes that
+  // raw termios back when it exits, and Ctrl+C stops producing SIGINT.
+  static oraOptions = { discardStdin: false } as const;
+  // ora's clear loop is `ceil(lineWidth / columns)`, so an unsized pty (`isTTY` with 0 columns: CI, `script`) never
+  // returns from `clear()`; such a terminal gets plain lines.
+  static canAnimate(stream: NodeJS.WriteStream = process.stderr): boolean {
+    return !stream.isTTY || stream.columns > 0;
+  }
   spinner: Ora;
   stopWatch: NodeJS.Timeout | null = null;
   startAt: Date = new Date();
@@ -12,10 +20,10 @@ export class Spinner {
     Spinner.padding = Math.max(Spinner.padding, prefix.length);
     this.prefix = prefix;
     this.message = message;
-    this.spinner = ora(message);
+    this.spinner = ora({ ...Spinner.oraOptions, text: message });
     this.spinner.prefixText = prefix.padStart(Spinner.padding, " ");
     this.spinner.indent = indent;
-    this.enableSpin = enableSpin;
+    this.enableSpin = enableSpin && Spinner.canAnimate();
   }
   start() {
     this.startAt = new Date();

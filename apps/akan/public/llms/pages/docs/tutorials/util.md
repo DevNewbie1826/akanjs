@@ -16,7 +16,6 @@
 - Create Utility Components (#util-components)
 - Apply To Unit & View Components (#apply-to-components)
 - Test Status Management (#test-implementation)
-- Status Management Best Practices (#best-practices)
 - What's Next? (#next-steps)
 
 ## Content
@@ -79,9 +78,11 @@ This pattern ensures that business rules are enforced at the document level whil
 
 Create Signal Endpoints
 
-Think of signal endpoints as the communication system between the frontend (like the shop's order display screen) and the backend (the kitchen and management system). When staff clicks a "Process" button on the screen, it needs to communicate with the backend to actually update the order. Akan.js automatically creates both REST and GraphQL versions of these endpoints, so different parts of your system can communicate however they prefer.
+Think of signal endpoints as the communication system between the frontend (like the shop's order display screen) and the backend (the kitchen and management system). When staff clicks a "Process" button on the screen, it needs to communicate with the backend to actually update the order. Akan.js serves every endpoint over HTTP and over the websocket, and publishes it to AI agents over MCP when its guards allow, so every caller reaches the same kitchen through the same hatch.
 
 Each signal endpoint is defined using the mutation() builder, specifying the return type and accepting the order ID as a parameter via .param(). The .exec() callback delegates to the corresponding service method to perform the actual business logic.
+
+The second argument to slice() is the guard map, not boilerplate: root is the generated admin query API and is always Admin, get covers reads, and cru covers create, update and remove — create is opened on its own here because the kiosk takes anonymous orders. Leaving root: Public hands that admin query API to every anonymous caller, and to every AI agent through /mcp.
 
 We also need to add dictionary entries for these API endpoints so they display properly in the UI:
 
@@ -103,7 +104,7 @@ This ensures that when status changes happen, the UI automatically reflects the 
 
 Create Utility Components
 
-Just like a real ice cream shop might have labeled buttons or stamps for different order stages, we'll create reusable button components for each action. These "digital buttons" can be placed anywhere in our interface - on order cards, in detailed views, or on staff dashboards. By creating them once as utility components, we ensure consistent behavior and styling throughout the entire application.
+Just like a real ice cream shop might have labeled buttons or stamps for different order stages, we'll create reusable button components for each action. These "digital buttons" can be placed anywhere in our interface - on order Unit cards, in detailed views, or on staff dashboards. By creating them once as utility components, we ensure consistent behavior and styling throughout the entire application.
 
 Each button component includes:
 
@@ -121,7 +122,7 @@ Button labels come from dictionary entries for proper multilingual support
 
 Apply To Unit & View Components
 
-Now comes the exciting part - putting all the pieces together! Just like adding action buttons to the order tickets in a real shop, we'll integrate our status management buttons directly into the order cards and detailed views. This means staff won't need to navigate to separate pages or menus - they can process orders right from wherever they're viewing them, making the workflow fast and intuitive.
+Now we'll put all the pieces together. Just like adding action buttons to the order tickets in a real shop, we'll integrate our status management buttons directly into the order Unit cards and detailed views. Staff won't need to navigate to separate pages or menus - they can process orders right from wherever they're viewing them.
 
 Let's update the Unit component to include status management buttons:
 
@@ -171,43 +172,7 @@ Invalid actions should be prevented
 
 Error messages should appear if business rules are violated
 
-Status Management Best Practices
-
-Here are important best practices for implementing status management in Akan.js:
-
-Enforce Business Rules
-
-Always validate state transitions at the document level using business methods. This ensures data integrity regardless of how the API is called.
-
-Smart UI Controls
-
-Disable buttons and hide actions that aren't valid for the current state. This provides immediate feedback to users about what actions are possible.
-
-Consistent Patterns
-
-Follow the same pattern across all status operations: Document → Service → Signal → Store → Component. This makes your code predictable and maintainable.
-
-Proper Error Handling
-
-Use dictionary-based error messages with Err exceptions. This ensures error messages are properly translated and user-friendly.
-
 What's Next?
-
-Excellent work! You've successfully implemented a complete status management system for your ice cream orders. Shop staff can now efficiently manage the order lifecycle with proper business rule enforcement.
-
-🎉 What You've Accomplished:
-
-Implemented business logic with validation
-
-Created service layer for status operations
-
-Built signal endpoints for status changes
-
-Added frontend store actions
-
-Created reusable utility components
-
-Integrated smart UI controls
 
 In the next tutorial, we'll learn how to edit existing data by implementing order modification functionality. This will allow customers to update their ice cream orders before they're processed, completing the full CRUD operations for our ice cream shop.
 
@@ -337,6 +302,7 @@ export class IcecreamOrderService extends serve(db.icecreamOrder, ({ use, servic
 ### apps/koyo/lib/icecreamOrder/icecreamOrder.signal.ts
 
 ```ts
+import { Admin } from "@libs/shared/srvkit";
 import { ID } from "akanjs/base"; // [!code ++]
 import { endpoint, internal, Public, slice } from "akanjs/signal"; // [!code collapse:18]
 
@@ -347,7 +313,7 @@ export class IcecreamOrderInternal extends internal(srv.icecreamOrder, ({ interv
 
 export class IcecreamOrderSlice extends slice(
   srv.icecreamOrder,
-  { guards: { root: Public, get: Public, cru: Public } },
+  { guards: { root: Admin, get: Public, cru: Admin, create: Public } },
   (init) => ({
     inPublic: init().exec(function () {
       return this.icecreamOrderService.queryAny();
@@ -488,9 +454,9 @@ export class IcecreamOrderStore extends store(sig.icecreamOrder, () => ({
 ### apps/koyo/lib/icecreamOrder/IcecreamOrder.Util.tsx
 
 ```ts
-"use client"; // [!code collapse:4]
-import { clsx } from "akanjs/client";
+"use client"; // [!code collapse:3]
 import { st, usePage } from "@apps/koyo/client";
+import { buttonRecipe } from "akanjs/ui";
 
 interface ProcessProps {
   className?: string;
@@ -501,7 +467,7 @@ export const Process = ({ className, icecreamOrderId, disabled }: ProcessProps) 
   const { l } = usePage();
   return (
     <button
-      className={clsx("btn btn-secondary", className)}
+      className={buttonRecipe({ variant: "secondary" }, className)}
       disabled={disabled}
       onClick={() => {
         void st.do.processIcecreamOrder(icecreamOrderId);
@@ -521,7 +487,7 @@ export const Serve = ({ className, icecreamOrderId, disabled }: ServeProps) => {
   const { l } = usePage();
   return (
     <button
-      className={clsx("btn btn-accent", className)}
+      className={buttonRecipe({ variant: "accent" }, className)}
       disabled={disabled}
       onClick={() => {
         void st.do.serveIcecreamOrder(icecreamOrderId);
@@ -541,7 +507,7 @@ export const Finish = ({ className, icecreamOrderId, disabled }: FinishProps) =>
   const { l } = usePage();
   return (
     <button
-      className={clsx("btn btn-success", className)}
+      className={buttonRecipe({ variant: "success" }, className)}
       disabled={disabled}
       onClick={() => {
         void st.do.finishIcecreamOrder(icecreamOrderId);
@@ -561,7 +527,7 @@ export const Cancel = ({ className, icecreamOrderId, disabled }: CancelProps) =>
   const { l } = usePage();
   return (
     <button
-      className={clsx("btn btn-warning", className)}
+      className={buttonRecipe({ variant: "warning" }, className)}
       disabled={disabled}
       onClick={() => {
         void st.do.cancelIcecreamOrder(icecreamOrderId);
@@ -576,42 +542,43 @@ export const Cancel = ({ className, icecreamOrderId, disabled }: CancelProps) =>
 ### apps/koyo/lib/icecreamOrder/IcecreamOrder.Unit.tsx
 
 ```ts
-import { clsx, type ModelProps } from "akanjs/client"; // [!code collapse:3]
-import { Model } from "akanjs/ui";
+import { cn, type ModelProps } from "akanjs/client"; // [!code collapse:3]
+import { Model, buttonRecipe } from "akanjs/ui";
 import { cnst, fetch, usePage } from "@apps/koyo/client";
 import { IcecreamOrder } from "@apps/koyo/client"; // [!code ++]
 
 export const Card = ({ icecreamOrder }: ModelProps<"icecreamOrder", cnst.LightIcecreamOrder>) => {
   const { l } = usePage();
   return (
-    <div className="group flex w-full flex-wrap justify-between gap-2 overflow-hidden rounded-xl bg-linear-to-br from-base-100 via-base-200 to-base-300 px-8 py-6 shadow-md transition-all duration-300 hover:shadow-xl">
-      <div className="flex flex-col justify-center"> // [!code collapse:24]
+    <div className="group flex w-full flex-wrap justify-between gap-2 overflow-hidden rounded-xl bg-linear-to-br from-background via-muted to-border px-8 py-6 shadow-md transition-all duration-300 hover:shadow-xl">
+      <div className="flex flex-col justify-center"> // [!code collapse:25]
         <div className="flex items-center gap-2 text-lg font-semibold text-primary">
-          <span className="inline-block rounded bg-base-200 px-2 py-1 text-xs font-bold tracking-wider uppercase">
+          <span className="inline-block rounded bg-muted px-2 py-1 text-xs font-bold tracking-wider uppercase">
             {l("icecreamOrder.id")}
           </span>
           <span className="ml-2 font-mono text-primary">#{icecreamOrder.id.slice(-4)}</span>
         </div>
         <div className="mt-4 flex items-center gap-2">
-          <span className="inline-block rounded border border-base-300 bg-base-100 px-2 py-1 text-xs font-bold tracking-wider text-primary uppercase">
+          <span className="inline-block rounded border border-border bg-background px-2 py-1 text-xs font-bold tracking-wider text-primary uppercase">
             {l("icecreamOrder.status")}
           </span>
           <span
-            className={clsx("ml-2 rounded-full px-3 py-1 text-sm font-semibold", {
-              "border border-primary/40 bg-base-100 text-primary": icecreamOrder.status === "active",
-              "border border-warning/40 bg-base-100 text-warning": icecreamOrder.status === "processing",
-              "border border-info/40 bg-info text-info-content": icecreamOrder.status === "served",
-              "border border-accent/40 bg-base-100 text-accent": icecreamOrder.status === "finished",
-              "border border-base-300 bg-base-100 text-base-content/70": icecreamOrder.status === "canceled",
-            })}
+            className={cn(
+              "ml-2 rounded-full px-3 py-1 text-sm font-semibold",
+              icecreamOrder.status === "active" && "border border-primary/40 bg-background text-primary",
+              icecreamOrder.status === "processing" && "border border-warning/40 bg-background text-warning",
+              icecreamOrder.status === "served" && "border border-info/40 bg-info text-info-foreground",
+              icecreamOrder.status === "finished" && "border border-accent/40 bg-background text-accent",
+              icecreamOrder.status === "canceled" && "border border-border bg-background text-foreground/70",
+            )}
           >
             {l(`icecreamOrderStatus.${icecreamOrder.status}`)}
           </span>
         </div>
       </div>
-      <div className="bg-base-100 flex items-center justify-center gap-2 rounded-xl p-4">
+      <div className="bg-background flex items-center justify-center gap-2 rounded-xl p-4">
         <Model.ViewWrapper slice={fetch.slice.icecreamOrder} modelId={icecreamOrder.id}>
-          <button className="btn btn-primary">
+          <button className={buttonRecipe({ variant: "primary" })}>
             <span>{l.trans({ en: "View", ko: "보기" })}</span>
           </button>
         </Model.ViewWrapper>
@@ -628,7 +595,7 @@ export const Card = ({ icecreamOrder }: ModelProps<"icecreamOrder", cnst.LightIc
 ### apps/koyo/lib/icecreamOrder/IcecreamOrder.View.tsx
 
 ```ts
-import { clsx } from "akanjs/client"; // [!code collapse:2]
+import { cn } from "akanjs/client"; // [!code collapse:2]
 import { cnst, usePage } from "@apps/koyo/client";
 import { IcecreamOrder } from "@apps/koyo/client"; // [!code ++]
 // [!code collapse:5]
@@ -640,48 +607,49 @@ interface GeneralProps {
 export const General = ({ className, icecreamOrder }: GeneralProps) => {
   const { l } = usePage();
   return (
-    <div className={clsx(className, "mx-auto w-full space-y-6 rounded-xl p-8 shadow-lg")}>
-      <div className="flex items-center gap-3 border-b pb-4"> // [!code collapse:42]
+    <div className={cn(className, "mx-auto w-full space-y-6 rounded-xl p-8 shadow-lg")}>
+      <div className="flex items-center gap-3 border-b pb-4"> // [!code collapse:43]
         <span className="text-3xl font-extrabold text-primary">🍦</span>
         <span className="text-2xl font-bold">{l("icecreamOrder.modelName")}</span>
-        <span className="text-base-content/50 ml-auto text-xs">#{icecreamOrder.id}</span>
+        <span className="text-foreground/50 ml-auto text-xs">#{icecreamOrder.id}</span>
       </div>
       <div className="grid grid-cols-2 gap-x-6 gap-y-4">
-        <div className="text-base-content/50 font-semibold">{l("icecreamOrder.size")}</div>
+        <div className="text-foreground/50 font-semibold">{l("icecreamOrder.size")}</div>
         <div>{icecreamOrder.size} cc</div>
-        <div className="text-base-content/50 font-semibold">{l("icecreamOrder.toppings")}</div>
+        <div className="text-foreground/50 font-semibold">{l("icecreamOrder.toppings")}</div>
         <div className="flex flex-wrap gap-2">
           {icecreamOrder.toppings.length === 0 ? (
-            <span className="text-base-content/70 italic">{l.trans({ en: "No toppings", ko: "토핑 없음" })}</span>
+            <span className="text-foreground/70 italic">{l.trans({ en: "No toppings", ko: "토핑 없음" })}</span>
           ) : (
             icecreamOrder.toppings.map((topping) => (
               <span
                 key={topping}
-                className="inline-block rounded-full bg-base-100 px-2 py-1 text-xs font-medium text-primary"
+                className="inline-block rounded-full bg-background px-2 py-1 text-xs font-medium text-primary"
               >
                 {l(`topping.${topping}`)}
               </span>
             ))
           )}
         </div>
-        <div className="text-base-content/50 font-semibold">{l("icecreamOrder.status")}</div>
+        <div className="text-foreground/50 font-semibold">{l("icecreamOrder.status")}</div>
         <div>
           <span
-            className={clsx("inline-block rounded-full px-2 py-1 text-xs font-semibold", {
-              "border border-primary/40 bg-base-100 text-primary": icecreamOrder.status === "active",
-              "border border-warning/40 bg-base-100 text-warning": icecreamOrder.status === "processing",
-              "border border-info/40 bg-info text-info-content": icecreamOrder.status === "served",
-              "border border-accent/40 bg-base-100 text-accent": icecreamOrder.status === "finished",
-              "border border-base-300 bg-base-100 text-base-content/70": icecreamOrder.status === "canceled",
-            })}
+            className={cn(
+              "inline-block rounded-full px-2 py-1 text-xs font-semibold",
+              icecreamOrder.status === "active" && "border border-primary/40 bg-background text-primary",
+              icecreamOrder.status === "processing" && "border border-warning/40 bg-background text-warning",
+              icecreamOrder.status === "served" && "border border-info/40 bg-info text-info-foreground",
+              icecreamOrder.status === "finished" && "border border-accent/40 bg-background text-accent",
+              icecreamOrder.status === "canceled" && "border border-border bg-background text-foreground/70",
+            )}
           >
             {l(`icecreamOrderStatus.${icecreamOrder.status}`)}
           </span>
         </div>
-        <div className="text-base-content/50 font-semibold">{l("icecreamOrder.createdAt")}</div>
-        <div className="text-base-content/70">{icecreamOrder.createdAt.format("YYYY-MM-DD HH:mm:ss")}</div>
-        <div className="text-base-content/50 font-semibold">{l("icecreamOrder.updatedAt")}</div>
-        <div className="text-base-content/70">{icecreamOrder.updatedAt.format("YYYY-MM-DD HH:mm:ss")}</div>
+        <div className="text-foreground/50 font-semibold">{l("icecreamOrder.createdAt")}</div>
+        <div className="text-foreground/70">{icecreamOrder.createdAt.format("YYYY-MM-DD HH:mm:ss")}</div>
+        <div className="text-foreground/50 font-semibold">{l("icecreamOrder.updatedAt")}</div>
+        <div className="text-foreground/70">{icecreamOrder.updatedAt.format("YYYY-MM-DD HH:mm:ss")}</div>
       </div>
       <div className="flex items-center justify-end gap-2"> // [!code ++:6]
         <IcecreamOrder.Util.Process icecreamOrderId={icecreamOrder.id} disabled={icecreamOrder.status !== "active"} />

@@ -23,6 +23,27 @@ import {
 import type { InternalArgCls } from "./internalArg";
 import type { CnstFull, CnstInput, CnstInsight, CnstLight, DbFilter, SignalOption, SrvMap, SrvRefName } from "./types";
 
+export interface LiveSliceOption<ArgName extends string = string> {
+  /**
+   * Keys a client may place a new row under itself (default `["latest"]`); any other sort refetches. A key on a
+   * `_doc` field is warned about at boot: SQLite orders it by SQL value and Postgres by jsonb type.
+   */
+  sort?: string[];
+  /** Invalidation only: subscribers refetch. Required for `q.raw()`, `q.search()` or `exists`/`missing` on `_doc`. */
+  fallback?: "invalidate";
+  /** `light` sends the row and costs nothing to apply; `id` sends the id alone for a room where the row is bulky. */
+  payload?: "light" | "id";
+  /** Nullable arguments that close the room while they carry a value (the list refetches); a `param` is refused. */
+  pauseOn?: ArgName[];
+}
+
+export interface ResolvedLiveSliceOption {
+  sort: string[];
+  fallback: "invalidate" | null;
+  payload: "light" | "id";
+  pauseOn: string[];
+}
+
 export class SliceInfo<
   RefName extends string = string,
   Input = any,
@@ -46,6 +67,7 @@ export class SliceInfo<
   readonly args: ArgInfo<EndpointArgProps<boolean>>[] = [];
   readonly internalArgs: InternalArgInfo<boolean>[] = [];
   readonly signalOption: SignalOption;
+  liveOption: ResolvedLiveSliceOption | null = null;
   execFn: ((...args: [...ServerArgs, ...InternalArgs]) => QueryOf<DocumentModel<Full>>) | null = null;
 
   constructor(
@@ -89,6 +111,7 @@ export class SliceInfo<
       [...ServerArgs, arg: _ServerArg]
     >;
   }
+  /** @deprecated Slices are GET queries, which carry no body: `fetch` never sends this argument. Use `.search`. */
   body<
     ArgName extends string,
     ExplicitType = unknown,
@@ -161,6 +184,17 @@ export class SliceInfo<
       ServerArgs
     >;
   }
+  live(option: LiveSliceOption<ArgNames[number]> = {}) {
+    if (this.execFn) throw new Error("Query function is already set");
+    if (this.liveOption) throw new Error("Live option is already set");
+    this.liveOption = {
+      sort: option.sort ?? ["latest"],
+      fallback: option.fallback ?? null,
+      payload: option.payload ?? "light",
+      pauseOn: (option.pauseOn as string[] | undefined) ?? [],
+    };
+    return this;
+  }
   exec(
     query: (
       this: {
@@ -203,9 +237,6 @@ export const buildSlice =
       signalOption,
     );
 
-// --- Accessors ---
-// Named projections for SliceInfo's 11 generics. Use these to avoid repeating
-// 11-slot `extends SliceInfo<any, any, ..., infer X, any, any>` patterns.
 type SliceInfoEmptyParts = {
   refName: never;
   input: never;

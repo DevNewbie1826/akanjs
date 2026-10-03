@@ -4,19 +4,14 @@ import type { Cls } from "./types";
 
 export type { Dayjs };
 
-/** Shared dayjs factory re-export used by Akan documents, services, stores, and UI. */
 export const dayjs = dayjsLib;
 
-/** Registry that maps Akan primitive scalar names to their runtime scalar classes. */
 export class PrimitiveRegistry {
   static readonly #namePrimitiveMap = new Map<string, typeof PrimitiveScalar>();
   static readonly #primitiveNameMap = new Map<typeof PrimitiveScalar, string>();
-  static register(scalar: typeof PrimitiveScalar, { overwrite = false } = {}) {
-    if (
-      !overwrite &&
-      (PrimitiveRegistry.#namePrimitiveMap.has(scalar.refName) || PrimitiveRegistry.#primitiveNameMap.has(scalar))
-    )
-      throw new Error(`Scalar ${scalar.refName} already registered`);
+  //? A second registration of a refName replaces the first rather than throwing: HMR re-evaluates the module that
+  //? declared the scalar, and the registry cannot tell that apart from a clash. The old class keeps its name.
+  static register(scalar: typeof PrimitiveScalar) {
     PrimitiveRegistry.#namePrimitiveMap.set(scalar.refName, scalar);
     PrimitiveRegistry.#primitiveNameMap.set(scalar, scalar.refName);
   }
@@ -42,9 +37,27 @@ export class PrimitiveRegistry {
   static getAll(): (typeof PrimitiveScalar)[] {
     return [...PrimitiveRegistry.#namePrimitiveMap.values()];
   }
+  /** The agent face `modelRef` declares, or null for anything that is not a registered primitive declaring one. */
+  static agentOf(modelRef: unknown): PrimitiveAgentFace | null {
+    if (!PrimitiveRegistry.#primitiveNameMap.has(modelRef as typeof PrimitiveScalar)) return null;
+    return (modelRef as typeof PrimitiveScalar).agent ?? null;
+  }
 }
 
-export type PrimitiveValue = string | number | boolean | Dayjs | Date | null | undefined;
+export interface PrimitiveJsonSchema {
+  [key: string]: unknown;
+}
+
+/**
+ * How an agent sees a primitive whose stored shape is not the one a model should read: `schema` is its published shape
+ * and `read` maps a stored or wire value into it. No `write`: every input already runs through `parseValue`.
+ */
+export interface PrimitiveAgentFace<Value = unknown> {
+  schema: PrimitiveJsonSchema;
+  read(value: Value): unknown;
+}
+
+export type PrimitiveValue = string | number | boolean | Dayjs | Date | Uint8Array | object | null | undefined;
 export class PrimitiveScalar {
   static refName: string;
   static [SERVER_VALUE]: unknown;
@@ -52,6 +65,10 @@ export class PrimitiveScalar {
   static [DEFAULT_VALUE]: unknown = null;
   static [PURIFIED_VALUE]: unknown = null;
   static [EXAMPLE_VALUE]: unknown = null;
+  /** The wire shape, for a primitive the built-in schema table cannot know. Absent, it is published as a string. */
+  static jsonSchema?: PrimitiveJsonSchema;
+  /** Absent, an agent sees the wire shape. */
+  static agent?: PrimitiveAgentFace;
 
   static validate(value: PrimitiveValue): boolean {
     return true;
@@ -100,7 +117,7 @@ export class PrimitiveScalar {
   }
 }
 
-/** Integer primitive scalar. Accepts safe integer numbers after parsing. */
+/** Safe integers only. */
 export class Int extends PrimitiveScalar {
   static override refName: "Int" = "Int";
   static override [SERVER_VALUE]: number;
@@ -121,7 +138,7 @@ export class Int extends PrimitiveScalar {
 }
 PrimitiveRegistry.register(Int);
 
-/** Floating point primitive scalar. Accepts finite numbers after parsing. */
+/** Finite numbers only. */
 export class Float extends PrimitiveScalar {
   static override refName: "Float" = "Float";
   static override [SERVER_VALUE]: number;
@@ -142,7 +159,7 @@ export class Float extends PrimitiveScalar {
 }
 PrimitiveRegistry.register(Float);
 
-/** 24-character hexadecimal id primitive used by Akan document and signal models. */
+/** 24 hexadecimal characters. */
 export class ID extends PrimitiveScalar {
   static override refName: "ID" = "ID";
   static override [SERVER_VALUE]: string;
@@ -169,13 +186,56 @@ export class ID extends PrimitiveScalar {
 }
 PrimitiveRegistry.register(ID);
 
-/** Open object primitive for intentionally flexible payloads or metadata blobs. */
+/** An intentionally open payload. */
 export class Any extends PrimitiveScalar {
   static override refName: "Any" = "Any";
   static override [DEFAULT_VALUE]: object | null = null;
   static override [EXAMPLE_VALUE]: object = {};
 }
 PrimitiveRegistry.register(Any);
+
+type NodeBuffer = Uint8Array & { toString(encoding: string): string };
+interface BufferCtor {
+  from(buffer: ArrayBufferLike, byteOffset: number, length: number): NodeBuffer;
+  from(text: string, encoding: string): NodeBuffer;
+}
+
+export class Binary extends PrimitiveScalar {
+  static override refName: "Binary" = "Binary";
+  static override [SERVER_VALUE]: Uint8Array;
+  static override [CLIENT_VALUE]: Uint8Array;
+  static override [DEFAULT_VALUE]: Uint8Array | null = null;
+  static override [PURIFIED_VALUE]: Uint8Array | null = null;
+  static override [EXAMPLE_VALUE]: string = "AAEC";
+
+  static override validate(value: Uint8Array | string): boolean {
+    return value instanceof Uint8Array || typeof value === "string";
+  }
+  static override parseValue(input: Uint8Array | string): Uint8Array {
+    return typeof input === "string" ? Binary.#fromBase64(input) : input;
+  }
+  static override serializeValue(value: Uint8Array | string): string {
+    return typeof value === "string" ? value : Binary.#toBase64(value);
+  }
+
+  static #toBase64(bytes: Uint8Array): string {
+    const buffer = (globalThis as { Buffer?: BufferCtor }).Buffer;
+    if (buffer) return buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString("base64");
+    let binary = "";
+    for (let idx = 0; idx < bytes.length; idx += 0x8000)
+      binary += String.fromCharCode(...bytes.subarray(idx, idx + 0x8000));
+    return btoa(binary);
+  }
+  static #fromBase64(text: string): Uint8Array {
+    const buffer = (globalThis as { Buffer?: BufferCtor }).Buffer;
+    if (buffer) return buffer.from(text, "base64");
+    const binary = atob(text);
+    const bytes = new Uint8Array(binary.length);
+    for (let idx = 0; idx < binary.length; idx += 1) bytes[idx] = binary.charCodeAt(idx);
+    return bytes;
+  }
+}
+PrimitiveRegistry.register(Binary);
 
 export class Upload extends PrimitiveScalar {
   static override refName: "Upload" = "Upload";
@@ -210,12 +270,12 @@ declare global {
     [DEFAULT_VALUE]: boolean;
     [PURIFIED_VALUE]: boolean;
     [EXAMPLE_VALUE]: boolean;
-    validate(value: boolean | number): boolean;
-    parseValue(input: boolean | number): boolean | number;
-    serializeValue(value: boolean | number): boolean | number;
-    _parse(input: boolean | number): boolean;
-    _serialize(value: boolean | number): boolean;
-    _checkValue(value: boolean | number): void;
+    validate(value: boolean | number | string): boolean;
+    parseValue(input: boolean | number | string): boolean | number | string;
+    serializeValue(value: boolean | number | string): boolean | number | string;
+    _parse(input: boolean | number | string): boolean;
+    _serialize(value: boolean | number | string): boolean;
+    _checkValue(value: boolean | number | string): void;
   }
   interface DateConstructor {
     refName: "Date";
@@ -233,34 +293,20 @@ declare global {
   }
 }
 
+const isBlankOrInvalid = (refName: string, value: PrimitiveValue) =>
+  value === "" ||
+  (refName === "Date" && typeof value === "string" && Number.isNaN(new Date(value).getTime())) ||
+  (refName === "Date" && value instanceof Date && Number.isNaN(value.getTime())) ||
+  (!!value && typeof value === "object" && "isValid" in value && !(value as { isValid: () => boolean }).isValid());
+
 const scalarPrimitiveStatics = {
-  _parse(
-    this: typeof PrimitiveScalar,
-    input: PrimitiveValue,
-    { optional = false }: { optional?: boolean } = {},
-  ): PrimitiveValue {
-    if (optional && (input === null || input === undefined)) return undefined;
-    const value = this.parseValue(input);
-    this._checkValue(value, { optional });
-    return value;
-  },
+  _parse: PrimitiveScalar._parse,
   _serialize(
     this: typeof PrimitiveScalar,
     value: PrimitiveValue,
     { optional = false }: { optional?: boolean } = {},
   ): PrimitiveValue {
-    if (optional && value === "") return undefined;
-    if (this.refName === "Date" && optional && typeof value === "string" && Number.isNaN(new Date(value).getTime()))
-      return undefined;
-    if (this.refName === "Date" && optional && value instanceof Date && Number.isNaN(value.getTime())) return undefined;
-    if (
-      optional &&
-      value &&
-      typeof value === "object" &&
-      "isValid" in value &&
-      !(value as { isValid: () => boolean }).isValid()
-    )
-      return undefined;
+    if (optional && isBlankOrInvalid(this.refName, value)) return undefined;
     this._checkValue(value, { optional });
     if (value === null || value === undefined) return undefined;
     return this.serializeValue(value);
@@ -274,23 +320,11 @@ const scalarPrimitiveStatics = {
       if (optional) return;
       else throw new Error(`Required ${this.refName} value: ${value}`);
     }
-    if (optional && value === "") return;
-    if (this.refName === "Date" && optional && typeof value === "string" && Number.isNaN(new Date(value).getTime()))
-      return;
-    if (this.refName === "Date" && optional && value instanceof Date && Number.isNaN(value.getTime())) return;
-    if (
-      optional &&
-      value &&
-      typeof value === "object" &&
-      "isValid" in value &&
-      !(value as { isValid: () => boolean }).isValid()
-    )
-      return;
+    if (optional && isBlankOrInvalid(this.refName, value)) return;
     if (!this.validate(value)) throw new Error(`Invalid ${this.refName} value: ${value}`);
   },
 };
 
-// String
 Object.assign(String, scalarPrimitiveStatics, {
   refName: "String",
   [DEFAULT_VALUE]: "",
@@ -307,11 +341,15 @@ Object.assign(String, scalarPrimitiveStatics, {
 });
 PrimitiveRegistry.register(String);
 
-// Boolean
-const normalizeBooleanPrimitiveValue = (value: boolean | number): boolean | null => {
+// Query strings, path params, and FormData fields arrive as text, so the wire spellings normalize here.
+const normalizeBooleanPrimitiveValue = (value: boolean | number | string): boolean | null => {
   if (typeof value === "boolean") return value;
   if (value === 1) return true;
   if (value === 0) return false;
+  if (typeof value !== "string") return null;
+  const text = value.trim().toLowerCase();
+  if (text === "true" || text === "1") return true;
+  if (text === "false" || text === "0") return false;
   return null;
 };
 
@@ -320,19 +358,18 @@ Object.assign(Boolean, {
   refName: "Boolean",
   [DEFAULT_VALUE]: false,
   [EXAMPLE_VALUE]: true,
-  validate(value: boolean | number) {
+  validate(value: boolean | number | string) {
     return normalizeBooleanPrimitiveValue(value) !== null;
   },
-  parseValue(input: boolean | number) {
+  parseValue(input: boolean | number | string) {
     return normalizeBooleanPrimitiveValue(input) ?? input;
   },
-  serializeValue(value: boolean | number) {
+  serializeValue(value: boolean | number | string) {
     return normalizeBooleanPrimitiveValue(value) ?? value;
   },
 });
 PrimitiveRegistry.register(Boolean);
 
-// Date
 Object.assign(Date, {
   ...scalarPrimitiveStatics,
   refName: "Date",
@@ -354,4 +391,4 @@ Object.assign(Date, {
 });
 PrimitiveRegistry.register(Date);
 
-export type DefaultPrimitiveName = "String" | "Boolean" | "Date" | "Int" | "Float" | "ID" | "Any" | "Upload";
+export type DefaultPrimitiveName = "String" | "Boolean" | "Date" | "Int" | "Float" | "ID" | "Any" | "Binary" | "Upload";

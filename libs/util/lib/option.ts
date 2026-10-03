@@ -8,18 +8,20 @@ import type {
   PushNotificationServerOptions,
 } from "@libs/util/srvkit";
 import {
+  assertJwtSecretConfigured,
   BlobStorageApi,
   CloudflareApi,
   DiscordApi,
   EmailApi,
   generateAeskey,
   generateHost,
-  generateJwtSecret,
   ObjectStorageApi,
   PurpleApi,
+  resolveJwtSecret,
 } from "@libs/util/srvkit";
-import type { SshOptions } from "akanjs/base";
+import { getEnv, type SshOptions } from "akanjs/base";
 import { AkanOption } from "akanjs/server";
+import { BlobStorage } from "akanjs/service";
 import type { LibOptions } from "./srv";
 
 export interface RedisOptions {
@@ -49,6 +51,8 @@ export type SSOOptions = {
 };
 
 export interface SecurityOptions {
+  jwtSecret: string;
+  aeskey?: string;
   verifies: ("wallet" | "password" | "phone" | "kakao" | "naver" | "email")[][];
   sso: SSOOptions;
 }
@@ -74,7 +78,7 @@ export interface GoogleAccount {
 
 export type ModulesOptions = LibOptions & {
   hostname?: string | null;
-  security?: SecurityOptions;
+  security: SecurityOptions;
   objectStorage?: ObjectStorageOptions;
   privateStorage?: ObjectStorageOptions;
   ipfs?: IpfsApiOptions;
@@ -90,22 +94,26 @@ export type ModulesOptions = LibOptions & {
 };
 
 export const option = new AkanOption<ModulesOptions>().use((options) => {
-  const blobStorageApi = new BlobStorageApi(options.appName, {
+  const env = getEnv();
+  const blobStorageApi = new BlobStorageApi(env.appName, {
     baseDir: "local",
     urlPrefix:
-      options.operationMode === "local"
+      env.operationMode === "local"
         ? `http://localhost:${process.env.PORT ?? options.port ?? 8282}/api/localFile/getBlob`
         : "/api/localFile/getBlob",
   });
-  const storageApi = options.objectStorage
-    ? new ObjectStorageApi(options.appName, options.objectStorage)
-    : blobStorageApi;
+  // A closed-network kit has no route to the object store, and CI replaces an app's env file with its own, so the
+  // deployment's STORAGE_MODE=local is what keeps its files on the local blob storage whatever the env configures.
+  const isLocalStorageOnly = process.env.STORAGE_MODE === "local";
+  const objectStorage = isLocalStorageOnly ? undefined : options.objectStorage;
+  const privateStorage = isLocalStorageOnly ? undefined : options.privateStorage;
+  if (!objectStorage) BlobStorage.assertShared("Without `objectStorage`, libs/util storage");
+  const storageApi = objectStorage ? new ObjectStorageApi(env.appName, objectStorage) : blobStorageApi;
   // Private-only storage. On R2/S3 access control is bucket-level (R2 ignores per-object ACL),
   // so private files must live in a separate bucket that has NO public access configured.
   // Falls back to the public storageApi when `privateStorage` is not configured (e.g. local blob backend).
-  const privStorageApi = options.privateStorage
-    ? new ObjectStorageApi(options.appName, options.privateStorage)
-    : storageApi;
+  const privStorageApi = privateStorage ? new ObjectStorageApi(env.appName, privateStorage) : storageApi;
+  assertJwtSecretConfigured({ operationMode: env.operationMode, configuredSecret: options.security?.jwtSecret });
   return {
     cloudflareApi: options.cloudflare ? new CloudflareApi(options.cloudflare) : null,
     emailApi: options.mailer ? new EmailApi(options.mailer) : null,
@@ -113,8 +121,9 @@ export const option = new AkanOption<ModulesOptions>().use((options) => {
     storageApi,
     privStorageApi,
     blobStorageApi,
-    jwtSecret: generateJwtSecret(options.appName, options.environment),
-    aeskey: generateAeskey(options.appName, options.environment),
+    jwtSecret: resolveJwtSecret(env.appName, env.environment, options.security?.jwtSecret),
+    aeskey:
+      process.env.AES_KEY ?? options.security?.aeskey ?? generateAeskey(env.appName, env.environment, env.repoName),
     host: generateHost(options),
     discordApi: options.discord ? new DiscordApi(options.discord).initBots() : null,
   };

@@ -1,9 +1,11 @@
 "use client";
 import type { ReactDOMAttributes } from "@use-gesture/react/dist/declarations/src/types";
 import type { PromiseOrObject } from "akanjs/base";
-import { createContext, type ForwardRefExoticComponent, type ReactNode, type RefObject, useContext } from "react";
+import { type ForwardRefExoticComponent, type ReactNode, type RefObject, useContext } from "react";
 import type { AnimatedComponent, AnimatedProps, Interpolation, SpringValue } from "react-spring";
+import type { RouteDefinition } from "./route/RouteDefinition";
 import type { RouterInstance } from "./router";
+import { sharedContext } from "./sharedContext";
 import type { ReactFont } from "./types";
 
 export type TransitionType = "none" | "fade" | "bottomUp" | "stack" | "scaleOut";
@@ -16,21 +18,10 @@ export type PageSafeAreaConfig =
       bottom?: boolean;
       android?: "auto" | "edge-to-edge" | "none";
     };
-/**
- * Server-render strategy for the initial full-document SSR pass.
- * - `"stream"` (default): flush the shell — including any `Loading` Suspense
- *   fallback — as soon as it is ready, then stream the resolved page. Redirects
- *   decided in the shell still become real HTTP redirects; redirects thrown
- *   inside suspended content degrade to soft (client) redirects.
- * - `"block"`: buffer the whole document until every Suspense boundary resolves
- *   before sending a byte. The `Loading` fallback never reaches the browser, but
- *   a non-redirect error thrown in slow content can still yield a clean error
- *   page. Use only for routes that need that guarantee and do not care about SEO
- *   or first-paint of the fallback.
- */
+/** `"stream"` flushes the shell (`Loading` included) then streams; a redirect in suspended content becomes a client one.
+ * `"block"` buffers the whole document, so an error in slow content can still render a clean error page. */
 export type SsrRenderMode = "stream" | "block";
 
-/** Per-page CSR configuration for transition, safe-area, and gesture behavior. */
 export interface PageConfig {
   transition?: TransitionType;
   safeArea?: PageSafeAreaConfig;
@@ -42,20 +33,12 @@ export interface PageConfig {
   cache?: boolean;
   /** Initial full-document SSR strategy. Defaults to `"stream"`. */
   ssr?: SsrRenderMode;
-  /**
-   * Opt in to guarded RSC page suffix commits when the page does not require
-   * head/metadata updates and the retained route chain head is invariant for
-   * sibling navigations under the same layout.
-   */
+  /** Opt-in suffix-only RSC commits, for a page needing no head update under a layout head its siblings share. */
   rscPatchHeadSafe?: boolean;
   topSafeAreaColor?: string;
   bottomSafeAreaColor?: string;
-  /**
-   * Keeps the route out of `akan build`. The route still serves under `akan start`, but nothing about it
-   * reaches production: no bundle, no manifest entry, no URL. On a `_layout`, every route under that
-   * directory is excluded with it. Must be written as a literal `true`/`false` — the build reads it from
-   * the source without evaluating the module.
-   */
+  /** Keeps the route (on a `_layout`, its whole directory) out of `akan build` while `akan start` serves it. Write a
+   * literal `true`/`false`: the build reads it off the source without evaluating the module. */
   devOnly?: boolean;
 }
 
@@ -77,7 +60,6 @@ export interface PageProps {
   params: { [key: string]: string };
   searchParams: { [key: string]: string | string[] };
 }
-/** Props passed to Akan layout route modules. */
 export interface LayoutProps extends PageProps {
   children: ReactNode;
 }
@@ -107,7 +89,6 @@ export interface AkanHeadSnapshotV1 {
 }
 export interface ResolvedHead {
   node: Head | null | undefined;
-  hasExplicitLanguageAlternates: boolean;
   headSnapshot?: AkanHeadSnapshotV1;
 }
 export type ResolveHeadResult = Head | ResolvedHead | null | undefined;
@@ -122,9 +103,11 @@ export type LayoutErrorRender = (props: LayoutErrorProps) => PromiseOrObject<Rea
 export interface RouteRender {
   render: LayoutRender | PageRender;
   isAsync?: boolean;
+  /** CSR: a page's render reads the query; a layout's reads only the params of its own path (`paramNames`). */
+  kind?: "page" | "layout";
+  paramNames?: string[];
   Loading?: LayoutLoadingRender | PageLoadingRender;
-  /** Loads the module and populates `Loading` without running `render`/`resolveHead`.
-   * Used by the patch (suffix) compose path, which never calls `resolveHead`. */
+  /** Loads the module and fills `Loading` without running `render`/`resolveHead` (the suffix compose path). */
   resolveLoading?: () => void | Promise<void>;
   NotFound?: LayoutNotFoundRender;
   Error?: LayoutErrorRender;
@@ -133,6 +116,8 @@ export interface RouteRender {
   resolveHead?: ResolveHead;
   getPageConfig?: () => PromiseOrObject<PageConfig | undefined>;
   getLayoutPageConfig?: () => PromiseOrObject<PageConfig | undefined>;
+  /** The `page()` chain behind a page render, when it was declared as one — what a page prompt is read off. */
+  getRouteDefinition?: () => PromiseOrObject<RouteDefinition | undefined>;
 }
 export interface WebAppManifestIcon {
   src: string;
@@ -159,53 +144,24 @@ export interface WebAppManifest {
   screenshots?: WebAppManifestIcon[];
   [key: string]: unknown;
 }
-export interface AkanMetadata {
-  title?: string;
-  description?: string;
-  robots?: string;
-  openGraph?: {
-    title?: string;
-    description?: string;
-    type?: string;
-    url?: string;
-    siteName?: string;
-    images?: string | string[];
-  };
-  twitter?: {
-    card?: "summary" | "summary_large_image" | "app" | "player" | (string & {});
-    title?: string;
-    description?: string;
-    images?: string | string[];
-  };
-  alternates?: {
-    canonical?: string;
-    languages?: Record<string, string>;
-  };
-}
-export type GenerateMetadata = (props: PageProps) => PromiseOrObject<AkanMetadata | null | undefined>;
 export interface PageModule {
   default?: PageRender;
   pageConfig?: PageConfig;
   head?: Head;
-  metadata?: AkanMetadata;
   generateHead?: GenerateHead;
-  generateMetadata?: GenerateMetadata;
   Loading?: PageLoadingRender;
 }
 export interface LayoutModule {
   default?: LayoutRender;
   pageConfig?: PageConfig;
   head?: Head;
-  metadata?: AkanMetadata;
   generateHead?: GenerateHead;
-  generateMetadata?: GenerateMetadata;
   fonts?: ReactFont[];
   manifest?: WebAppManifest;
   theme?: string;
   reconnect?: boolean;
   wsConnect?: boolean;
   layoutStyle?: "mobile" | "web";
-  gaTrackingId?: string;
   Loading?: LayoutLoadingRender;
   NotFound?: LayoutNotFoundRender;
   Error?: LayoutErrorRender;
@@ -218,22 +174,16 @@ export interface Route {
   path: string;
   renderPage?: RouteRender;
   renderLayout?: RouteRender;
+  /** `renderLayout` is a generated `__root_layout`: a root boundary the page generator found. */
+  isRootLayout?: boolean;
   /** Synthetic layout render from a `_overrides.tsx` at this node; wraps the subtree in a UI-override provider. */
   renderOverrides?: RouteRender;
   pageIncludesOwnLayout?: boolean;
   isSpecialRoute?: boolean;
-  // Page?:
-  //   | (({ params, searchParams }: PageProps) => ReactNode)
-  //   | (({ params, searchParams }: PageProps) => Promise<ReactNode>);
-  // Layout?:
-  //   | (({ children, params, searchParams }: LayoutProps) => ReactNode)
-  //   | (({ children, params, searchParams }: LayoutProps) => Promise<ReactNode>);
   loader?: () => unknown;
   pageState?: PageState;
   pageConfigChain?: PageConfig[];
   explicitPageConfigKeys?: Partial<Record<keyof PageConfig, boolean>>;
-  // action?: any;
-  // ErrorBoundary?: any;
   children: Map<string, Route>;
 }
 
@@ -267,18 +217,6 @@ export type PageState = CsrState & {
   topInset: number;
   bottomInset: number;
 };
-export const defaultPageState: PageState = {
-  transition: "none",
-  topSafeArea: 0,
-  bottomSafeArea: 0,
-  topInset: 0,
-  bottomInset: 0,
-  gesture: true,
-  cache: false,
-  ssr: "stream",
-  topSafeAreaColor: "var(--color-base-100, Canvas)",
-  bottomSafeAreaColor: "var(--color-base-100, Canvas)",
-};
 
 export interface Location {
   href: string;
@@ -288,6 +226,7 @@ export interface Location {
   searchParams: { [key: string]: string | string[] };
   pathRoute: PathRoute;
   hash: string;
+  entryId?: string; // the history entry this location is; a replace within one route keeps it
 }
 export type CsrNavigationPhase = "idle" | "preparing" | "transitioning";
 export type CsrNavigationKind = "push" | "replace" | "back" | "popForward" | "popBack";
@@ -314,6 +253,7 @@ export interface History {
   idxMap: Map<string, number>;
   cachedLocationMap: Map<string, Location>;
   idx: number;
+  dormant?: Set<string>; // entry ids a restored stack holds without a page until one is visited
 }
 
 export interface RouterProps {
@@ -323,14 +263,24 @@ export interface RouterProps {
   back: () => void | Promise<void>;
 }
 
+export type CsrPageType = "current" | "prev" | "pending" | "cached";
+export interface CsrStackEntry {
+  key: string; // the page container's identity: the entry, or the route itself for a `cache` page
+  location: Location;
+  pageType: CsrPageType;
+  zIndex: number;
+}
+
 export interface RouteState {
   clientWidth: number;
   clientHeight: number;
   location: Location;
   prevLocation: Location | null;
   pendingLocation: Location | null;
+  stackEntries: CsrStackEntry[];
   navigationIntent: NavigationIntent | null;
   phase: CsrNavigationPhase;
+  isBackgrounded: boolean;
   history: RefObject<History>;
   topSafeAreaRef: RefObject<HTMLDivElement | null>;
   bottomSafeAreaRef: RefObject<HTMLDivElement | null>;
@@ -355,25 +305,46 @@ export type UseCsrTransition = CsrTransitionStyles & {
 };
 
 export type CsrContextType = RouteState & UseCsrTransition;
-export const csrContext = createContext<CsrContextType>({} as unknown as CsrContextType);
+// The web's SSR tree has no CSR shell, so no provider: its refs still exist, empty, as a mounted page's are before commit.
+export const csrContext = sharedContext<CsrContextType>("csr", {
+  history: { current: null },
+  topSafeAreaRef: { current: null },
+  bottomSafeAreaRef: { current: null },
+  prevPageContentRef: { current: null },
+  pageContentRef: { current: null },
+  frameRootRef: { current: null },
+  onBack: { current: {} },
+} as unknown as CsrContextType);
 export const useCsr = () => {
   const contextValues = useContext(csrContext);
   return contextValues;
 };
 
 export interface PathContextType {
-  pageType: "current" | "prev" | "cached" | "pending";
+  pageType: CsrPageType;
+  pageKey?: string;
   location: Location;
   prefix?: string;
   gestureEnabled: boolean;
   setGestureEnabled: (enabled: boolean) => void;
   registerFrameSlot: (slot: FrameSlotRegistration) => () => void;
 }
-export const pathContext = createContext<PathContextType>({} as unknown as PathContextType);
+export const pathContext = sharedContext<PathContextType>("path", {} as unknown as PathContextType);
 export const usePathCtx = () => {
   const contextValues = useContext(pathContext);
   return contextValues;
 };
+
+//? `prev` is shown under the current page for a swipe back; `hidden` is parked, its effects stopped.
+export type PageActivity = "current" | "prev" | "pending" | "hidden";
+export interface PageActivityState {
+  activity: PageActivity;
+  focused: boolean;
+}
+export const pageActivityContext = sharedContext<PageActivityState>("pageActivity", {
+  activity: "current",
+  focused: true,
+});
 
 export interface PathRoute {
   path: string;
@@ -461,6 +432,7 @@ export interface FrameLayoutState {
   keyboard: KeyboardFrameState;
   contentViewport: FrameContentViewportState;
   keyboardAccessory: KeyboardAccessoryFrameState;
+  contentAnchor?: "bottom";
   platformProfile: FramePlatformProfile;
   zIndex: FrameLayerZIndex;
   pageStateByPath: Map<string, PageState>;
@@ -469,6 +441,7 @@ export interface FrameSlotRegistration {
   scope?: FrameSlotScope;
   type: FrameSlotType;
   role?: FrameSlotRole;
+  contentAnchor?: "bottom";
   height?: number;
   estimatedHeight?: number;
   source?: "navbar" | "topInset" | "bottomInset" | "bottomTab" | (string & {});

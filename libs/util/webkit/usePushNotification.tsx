@@ -1,13 +1,13 @@
 "use client";
 
-import { router } from "akanjs/client";
-import { loadCapacitorDevice, loadCapacitorFcm, loadCapacitorPushNotifications } from "akanjs/client/capacitor";
-import { getApps, initializeApp } from "firebase/app";
-import { getToken as getFirebaseToken, getMessaging } from "firebase/messaging";
+import { router, storage } from "akanjs/client";
+import { isNativeApp, type NativePushToken, push } from "akanjs/client/native";
+import type { Messaging } from "firebase/messaging";
 import { useEffect } from "react";
+import { pushNavigateMessage } from "../common/pushNavigateMessage";
 
 export type PushNotificationPlatform = "web" | "ios" | "android";
-export type PushNotificationProvider = "fcm";
+export type PushNotificationProvider = "apns" | "fcm";
 
 // Client env shape for firebase web push; mirrors the fields of firebase's `FirebaseOptions`.
 export interface FirebaseOptions {
@@ -25,10 +25,11 @@ export interface PushToken {
   token: string;
   platform: PushNotificationPlatform;
   provider: PushNotificationProvider;
-  deviceId?: string;
+  // This installation, so the server replaces the token a device had instead of keeping both.
+  deviceId: string;
 }
 
-export type PushNotificationPermission = "prompt" | "granted" | "denied" | string;
+export type PushNotificationPermission = "prompt" | "prompt-with-rationale" | "granted" | "denied" | "default";
 
 export interface PushNotificationClientEnv {
   firebase?: FirebaseOptions & {
@@ -36,11 +37,11 @@ export interface PushNotificationClientEnv {
   };
 }
 
-/** The two runtime globals this integration touches: the injected client env, and the click-bridge promise
- *  cached on `globalThis` so repeated `initPushNotificationClickBridge` calls register the native listener
- *  once per page. */
+/** The runtime globals this integration touches: the injected client env, plus the two install guards cached
+ *  on `globalThis` so repeated calls register the click and foreground listeners once per page. */
 export interface PushNotificationGlobals {
-  __AKAN_PUSH_CLICK_BRIDGE__?: Promise<boolean>;
+  __AKAN_PUSH_WEB_CLICK__?: boolean;
+  __AKAN_PUSH_FOREGROUND__?: boolean;
   __AKAN_CLIENT_ENV__?: PushNotificationClientEnv;
 }
 
@@ -52,12 +53,32 @@ const getClientEnv = () => pushNotificationGlobals().__AKAN_CLIENT_ENV__;
 
 const getFirebaseConfig = () => getClientEnv()?.firebase;
 
-const normalizePlatform = (platform: string): PushNotificationPlatform | null => {
-  if (platform === "web" || platform === "ios" || platform === "android") return platform;
-  return null;
-};
-
 const isWebRuntime = () => typeof window !== "undefined" && typeof navigator !== "undefined";
+
+//? firebase is web push only; loaded on first use so a native shell's bundle never evaluates it.
+let firebaseLoad: Promise<[typeof import("firebase/app"), typeof import("firebase/messaging")]> | null = null;
+const loadFirebase = () => (firebaseLoad ??= Promise.all([import("firebase/app"), import("firebase/messaging")]));
+
+const pushDeviceIdKey = "akan:pushDeviceId";
+let deviceIdLoad: Promise<string> | null = null;
+
+//? Kept in the app's own storage, so a reinstall or cleared site data starts a new installation along with its token.
+export const getPushDeviceId = () =>
+  (deviceIdLoad ??= (async () => {
+    const stored = await storage.getItem(pushDeviceIdKey);
+    if (stored) return stored;
+    const created = Array.from(crypto.getRandomValues(new Uint8Array(16)), (byte) =>
+      byte.toString(16).padStart(2, "0"),
+    ).join("");
+    await storage.setItem(pushDeviceIdKey, created);
+    return created;
+  })().catch((error: unknown) => {
+    deviceIdLoad = null;
+    throw error;
+  }));
+
+/** The installation id if this device ever registered for push, without making one. */
+export const loadPushDeviceId = async () => (await storage.getItem(pushDeviceIdKey)) ?? null;
 
 const isInternalDeepLink = (url: string) => {
   if (url.startsWith("/") && !url.startsWith("//")) return true;
@@ -76,26 +97,50 @@ const enterDeepLink = (url: string) => {
   return router.enterDeepLink(`${parsed.pathname}${parsed.search}${parsed.hash}`);
 };
 
-const getNativePlatform = async () => {
-  const { Device } = await loadCapacitorDevice();
-  const device = await Device.getInfo();
-  return normalizePlatform(device.platform);
+export const applyPushBadge = (count: string | number | undefined) => {
+  // Firefox and desktop Safari ship no setAppBadge; calling it unguarded is a synchronous TypeError.
+  if (count === undefined || !isWebRuntime() || !("setAppBadge" in navigator)) return;
+  const parsed = typeof count === "number" ? count : Number.parseInt(count, 10);
+  if (Number.isNaN(parsed)) return;
+  void navigator.setAppBadge(parsed);
 };
 
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+const withDeviceId = async ({ token, provider, platform }: NativePushToken): Promise<PushToken> => ({
+  token,
+  provider,
+  platform,
+  deviceId: await getPushDeviceId(),
+});
 
-const getNativeToken = async (options?: { retries?: number }): Promise<PushToken | undefined> => {
-  const [{ FCM }, platform] = await Promise.all([loadCapacitorFcm(), getNativePlatform()]);
-  if (!platform || platform === "web") return undefined;
+//* FCM SDK 는 보이는 window client 가 하나라도 있으면 워커에서 그리지 않고 페이지로 payload 를 넘긴다.
+//* 이 경로가 없으면 앱 창을 보고 있는 동안 푸시가 통째로 사라진다 — FCM 응답은 성공이라 서버 쪽은 정상으로 보인다.
+const initForegroundDisplay = async (messaging: Messaging, registration: ServiceWorkerRegistration) => {
+  const globals = pushNotificationGlobals();
+  if (globals.__AKAN_PUSH_FOREGROUND__) return;
+  globals.__AKAN_PUSH_FOREGROUND__ = true;
+  const [, { onMessage }] = await loadFirebase();
+  onMessage(messaging, (payload) => {
+    const data: Record<string, string | undefined> = payload.data ?? {};
+    applyPushBadge(data.badgeCount);
+    const title = payload.notification?.title ?? data.title;
+    const body = payload.notification?.body ?? data.body;
+    if (!title && !body) return;
+    // Drawing through the worker's own registration keeps the click on `notificationclick`, so a foreground
+    // and a background notification take the one deep-link path instead of two that can drift apart.
+    void registration.showNotification(title ?? "", {
+      body,
+      icon: payload.notification?.icon ?? data.icon,
+      tag: data.tag,
+      data: { url: data.url ?? payload.fcmOptions?.link, FCM_MSG: payload },
+    });
+  });
+};
 
-  const retries = options?.retries ?? 0;
-  for (let attempt = 0; attempt <= retries; attempt += 1) {
-    const { token } = await FCM.getToken();
-    if (token) return { token, platform, provider: "fcm" };
-    if (attempt < retries) await sleep(500 * (attempt + 1));
-  }
-
-  return undefined;
+const getWebMessaging = async () => {
+  const firebaseConfig = getFirebaseConfig();
+  if (!firebaseConfig?.apiKey) return null;
+  const [{ getApps, initializeApp }, { getMessaging }] = await loadFirebase();
+  return getMessaging(getApps()[0] ?? initializeApp(firebaseConfig));
 };
 
 const getWebToken = async (): Promise<PushToken | undefined> => {
@@ -109,85 +154,50 @@ const getWebToken = async (): Promise<PushToken | undefined> => {
   ) {
     return undefined;
   }
-  const firebase = getApps()[0] ?? initializeApp(firebaseConfig);
-  const messaging = getMessaging(firebase);
+  const messaging = await getWebMessaging();
+  if (!messaging) return undefined;
+  const [, { getToken }] = await loadFirebase();
   const serviceWorkerRegistration = await navigator.serviceWorker.register("/firebase-messaging-sw.js");
-  const token = await getFirebaseToken(messaging, {
-    vapidKey: firebaseConfig.vapidKey,
-    serviceWorkerRegistration,
-  });
+  const token = await getToken(messaging, { vapidKey: firebaseConfig.vapidKey, serviceWorkerRegistration });
+  await initForegroundDisplay(messaging, serviceWorkerRegistration);
   if (!token) return undefined;
-  return { token, platform: "web", provider: "fcm" };
+  return { token, platform: "web", provider: "fcm", deviceId: await getPushDeviceId() };
 };
 
-const getPushUrlFromNativeEvent = (event: { notification?: { data?: Record<string, unknown> } }) => {
-  const data = event.notification?.data;
-  const fcmMessage = data?.FCM_MSG as { data?: { url?: unknown }; fcmOptions?: { link?: unknown } } | undefined;
-  const directUrl = data?.url;
-  const nestedUrl = fcmMessage?.data?.url ?? fcmMessage?.fcmOptions?.link;
-  return typeof directUrl === "string" ? directUrl : typeof nestedUrl === "string" ? nestedUrl : undefined;
-};
-
-const waitForNativeRegistration = async (
-  PushNotifications: Awaited<ReturnType<typeof loadCapacitorPushNotifications>>["PushNotifications"],
-): Promise<string | undefined> => {
-  let registrationHandle: { remove?: () => Promise<void> | void } | void;
-  let errorHandle: { remove?: () => Promise<void> | void } | void;
-
-  const cleanup = async () => {
-    await registrationHandle?.remove?.();
-    await errorHandle?.remove?.();
-  };
-
-  return await new Promise<string | undefined>((resolve) => {
-    let settled = false;
-    const finish = (token?: string) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timeout);
-      void cleanup();
-      resolve(token);
-    };
-
-    const timeout = setTimeout(() => finish(), 8000);
-
-    Promise.resolve(
-      PushNotifications.addListener("registration", (event) => {
-        finish(typeof event.value === "string" ? event.value : undefined);
-      }),
-    ).then((handle) => {
-      registrationHandle = handle;
-    });
-    Promise.resolve(PushNotifications.addListener("registrationError", () => finish())).then((handle) => {
-      errorHandle = handle;
-    });
-    Promise.resolve(PushNotifications.register()).catch(() => finish());
+//* 워커가 이미 열린 탭을 찾아 넘긴 알림 클릭을 받아 클라이언트 라우팅으로 잇는다(풀 리로드 방지).
+const initWebClickBridge = () => {
+  const globals = pushNotificationGlobals();
+  if (globals.__AKAN_PUSH_WEB_CLICK__) return;
+  if (!isWebRuntime() || typeof navigator.serviceWorker?.addEventListener !== "function") return;
+  globals.__AKAN_PUSH_WEB_CLICK__ = true;
+  navigator.serviceWorker.addEventListener("message", (event) => {
+    const message = event.data as { type?: unknown; url?: unknown } | null;
+    if (message?.type !== pushNavigateMessage || typeof message.url !== "string") return;
+    try {
+      enterDeepLink(message.url);
+    } catch {
+      // Router may not be initialized yet when the click wakes a backgrounded tab.
+    }
   });
 };
 
+//* 이미 워커가 설치된 재방문에서는 register() 가 다시 불리지 않으므로, 여기서 포그라운드 경로를 복구한다.
+const restoreForegroundDisplay = async () => {
+  if (!isWebRuntime() || typeof navigator.serviceWorker?.getRegistration !== "function") return;
+  if (!("Notification" in window) || Notification.permission !== "granted") return;
+  const registration = await navigator.serviceWorker.getRegistration("/firebase-messaging-sw.js");
+  if (!registration) return;
+  const messaging = await getWebMessaging();
+  if (messaging) await initForegroundDisplay(messaging, registration);
+};
+
+/** The web's notification clicks. A native shell's taps are deep links the framework routes from boot. */
 export const initPushNotificationClickBridge = async () => {
-  const globals = pushNotificationGlobals();
-  if (globals.__AKAN_PUSH_CLICK_BRIDGE__) return await globals.__AKAN_PUSH_CLICK_BRIDGE__;
-
+  if (isNativeApp()) return true;
   try {
-    const platform = await getNativePlatform();
-    if (!platform || platform === "web") return true;
-
-    globals.__AKAN_PUSH_CLICK_BRIDGE__ = (async () => {
-      const { PushNotifications } = await loadCapacitorPushNotifications();
-      await PushNotifications.addListener("pushNotificationActionPerformed", (event) => {
-        const url = getPushUrlFromNativeEvent(event);
-        if (!url) return;
-        try {
-          enterDeepLink(url);
-        } catch {
-          // Router may not be initialized yet during very early native resumes.
-        }
-      });
-      return true;
-    })();
-
-    return await globals.__AKAN_PUSH_CLICK_BRIDGE__;
+    initWebClickBridge();
+    await restoreForegroundDisplay();
+    return true;
   } catch {
     return false;
   }
@@ -200,56 +210,32 @@ export const usePushNotification = () => {
 
   const isSupported = async () => {
     if (!isWebRuntime()) return false;
-    try {
-      const platform = await getNativePlatform();
-      if (platform && platform !== "web") {
-        await Promise.all([loadCapacitorFcm(), loadCapacitorPushNotifications()]);
-        return true;
-      }
-    } catch {
-      // Fall through to web support checks.
-    }
+    if (isNativeApp()) return push.isSupported("register");
     return Boolean(getFirebaseConfig()?.apiKey && "Notification" in window && "serviceWorker" in navigator);
   };
 
   const getPermission = async (): Promise<PushNotificationPermission> => {
-    try {
-      const platform = await getNativePlatform();
-      if (platform && platform !== "web") {
-        const { PushNotifications } = await loadCapacitorPushNotifications();
-        const { receive } = await PushNotifications.checkPermissions();
-        return receive;
-      }
-    } catch {
-      // Fall through to web permission checks.
+    if (isNativeApp()) {
+      if (!push.isSupported("checkPermission")) return "denied";
+      return (await push.checkPermission()).display;
     }
     if (!isWebRuntime() || !("Notification" in window)) return "denied";
     return Notification.permission;
   };
 
   const requestPermission = async (): Promise<PushNotificationPermission> => {
-    try {
-      const platform = await getNativePlatform();
-      if (platform && platform !== "web") {
-        const { PushNotifications } = await loadCapacitorPushNotifications();
-        const { receive } = await PushNotifications.requestPermissions();
-        return receive;
-      }
-    } catch {
-      // Fall through to web permission checks.
+    if (isNativeApp()) {
+      if (!push.isSupported("requestPermission")) return "denied";
+      return (await push.requestPermission()).display;
     }
     if (!isWebRuntime() || !("Notification" in window)) return "denied";
     return await Notification.requestPermission();
   };
 
+  //? Asks for nothing: registering with APNs or FCM shows no prompt, so callers check the permission first.
   const getToken = async () => {
     try {
-      const platform = await getNativePlatform();
-      if (platform && platform !== "web") return await getNativeToken();
-    } catch {
-      // Fall through to web token lookup.
-    }
-    try {
+      if (isNativeApp()) return await withDeviceId(await push.register());
       return await getWebToken();
     } catch {
       return undefined;
@@ -258,30 +244,19 @@ export const usePushNotification = () => {
 
   const register = async () => {
     try {
-      const permission = await requestPermission();
-
-      const platform = await getNativePlatform().catch(() => null);
-      if (platform && platform !== "web") {
-        const [{ FCM }, { PushNotifications }] = await Promise.all([
-          loadCapacitorFcm(),
-          loadCapacitorPushNotifications(),
-        ]);
-        await FCM.setAutoInit({ enabled: true });
-
-        if (platform === "android") {
-          return await getNativeToken({ retries: 5 });
-        }
-
-        if (permission !== "granted") return undefined;
-        await waitForNativeRegistration(PushNotifications);
-        return await getNativeToken({ retries: 5 });
-      }
-
-      if (permission !== "granted") return undefined;
-      return await getWebToken();
+      if ((await requestPermission()) !== "granted") return undefined;
+      return await getToken();
     } catch {
       return undefined;
     }
+  };
+
+  /** A native shell's token rotates on its own (FCM refreshes, APNs after a restore); hand each new one to the server. */
+  const onTokenChange = (listener: (pushToken: PushToken) => void) => {
+    if (!isNativeApp()) return () => undefined;
+    return push.listen("token", (nativeToken) => {
+      void withDeviceId(nativeToken).then(listener);
+    });
   };
 
   return {
@@ -290,6 +265,7 @@ export const usePushNotification = () => {
     requestPermission,
     register,
     getToken,
+    onTokenChange,
     initClickBridge: initPushNotificationClickBridge,
   };
 };

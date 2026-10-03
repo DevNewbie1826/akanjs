@@ -1,8 +1,12 @@
 "use client";
-import { clsx, usePage } from "akanjs/client";
-import { type ComponentType, createElement } from "react";
+import { cn, usePage } from "akanjs/client";
+import { type ComponentType, createElement, Fragment, type ReactNode } from "react";
 
-import { createOverridable, useUiOverride } from "./UiOverride";
+import { buttonRecipe } from "./Button";
+import { InvalidMessage, invalidMessageOf } from "./Input";
+import { createOverridable, useUiOverride, useUiRecipe } from "./UiOverride";
+
+const selectedCls = "border-transparent bg-primary text-primary-foreground hover:bg-primary/90";
 
 export interface ToggleSelectProps<I extends string | number | boolean | null> {
   className?: string;
@@ -12,7 +16,13 @@ export interface ToggleSelectProps<I extends string | number | boolean | null> {
   nullable: boolean;
   validate: (value: I) => boolean | string;
   onChange: (value: I, idx: number) => void;
+  onClear?: () => void;
   disabled?: boolean;
+  /** Draws one cell. `onToggle` is the cell's own action — put it on whatever the cell renders. */
+  renderItem?: (
+    item: { label: string; value: I; disabled?: boolean },
+    state: { selected: boolean; disabled: boolean; onToggle: () => void },
+  ) => ReactNode;
 }
 const DefaultToggleSelect = <I extends string | number | boolean | null>({
   className,
@@ -22,18 +32,18 @@ const DefaultToggleSelect = <I extends string | number | boolean | null>({
   validate,
   value,
   onChange,
+  onClear,
   disabled,
+  renderItem,
 }: ToggleSelectProps<I>) => {
   const { l } = usePage();
+  const toggleBtn = (useUiRecipe("button") ?? buttonRecipe)({ variant: "outline", size: "sm" });
   const validateResult = value !== null ? validate(value) : false;
-  // const status: "error" | "warning" | "success" =
-  //   !nullable && !value?.length ? "warning" : validateResult === true ? "success" : "error";
-  const invalidMessage =
-    value === null || (typeof value === "string" && !value.length) || validateResult === true
-      ? null
-      : validateResult === false
-        ? l("base.invalidValueError")
-        : validateResult;
+  const invalidMessage = invalidMessageOf(
+    value === null || (typeof value === "string" && !value.length),
+    validateResult,
+    l,
+  );
   const options = items.map(
     (item) =>
       (typeof item === "string" || typeof item === "number" ? { label: item.toString(), value: item } : item) as {
@@ -44,38 +54,32 @@ const DefaultToggleSelect = <I extends string | number | boolean | null>({
   );
   return (
     <div
-      className={clsx(
-        "relative flex w-full flex-wrap items-center gap-1 rounded-md border border-base-content/20 p-2",
+      className={cn(
+        "relative flex w-full flex-wrap items-center gap-1 rounded-box border border-border p-2",
         className,
       )}
     >
       {options.map((option, idx: number) => {
         const isSelected = value === option.value;
         const isDisabled = (disabled ?? false) || (option.disabled ?? false);
-        return (
+        const onToggle = () => {
+          if (nullable && isSelected) onClear?.();
+          else onChange(option.value, idx);
+        };
+        return renderItem ? (
+          <Fragment key={idx}>{renderItem(option, { selected: isSelected, disabled: isDisabled, onToggle })}</Fragment>
+        ) : (
           <button
             key={idx}
             disabled={isDisabled}
-            className={clsx(
-              "btn btn-sm",
-              { "bg-success/70 text-success-content": isSelected, "btn-disabled cursor-not-allowed": isDisabled },
-              // {
-              //   "btn-error": status === "error",
-              //   "btn-warning": status === "warning",
-              // },
-              btnClassName,
-            )}
-            onClick={() => {
-              onChange(option.value, idx);
-            }}
+            className={cn(toggleBtn, isSelected && selectedCls, isDisabled && "cursor-not-allowed", btnClassName)}
+            onClick={onToggle}
           >
             {option.label}
           </button>
         );
       })}
-      {invalidMessage ? (
-        <div className="absolute -bottom-4 animate-fadeIn text-error text-xs">{invalidMessage}</div>
-      ) : null}
+      <InvalidMessage message={invalidMessage} />
     </div>
   );
 };
@@ -101,15 +105,9 @@ const DefaultMulti = ({
   disabled,
 }: MultiProps) => {
   const { l } = usePage();
+  const toggleBtn = (useUiRecipe("button") ?? buttonRecipe)({ variant: "outline", size: "sm" });
   const validateResult = validate(value);
-  // const status: "error" | "warning" | "success" =
-  //   !nullable && !value.length ? "warning" : validateResult === true ? "success" : "error";
-  const invalidMessage =
-    !value.length || validateResult === true
-      ? null
-      : validateResult === false
-        ? l("base.invalidValueError")
-        : validateResult;
+  const invalidMessage = invalidMessageOf(!value.length, validateResult, l);
   const options = items.map(
     (item) =>
       (typeof item === "string" || typeof item === "number" ? { label: item.toString(), value: item } : item) as {
@@ -120,8 +118,8 @@ const DefaultMulti = ({
   );
   return (
     <div
-      className={clsx(
-        "relative flex w-full flex-wrap items-center gap-1 rounded-md border border-base-content/20 p-2",
+      className={cn(
+        "relative flex w-full flex-wrap items-center gap-1 rounded-box border border-border p-2",
         className,
       )}
     >
@@ -132,11 +130,7 @@ const DefaultMulti = ({
           <button
             key={idx}
             disabled={isDisabled}
-            className={clsx(
-              "btn btn-sm",
-              { "bg-success/70 text-success-content": isSelected, "cursor-not-allowed": isDisabled },
-              btnClassName,
-            )}
+            className={cn(toggleBtn, isSelected && selectedCls, isDisabled && "cursor-not-allowed", btnClassName)}
             onClick={() => {
               onChange(
                 isSelected
@@ -153,23 +147,17 @@ const DefaultMulti = ({
           </button>
         );
       })}
-      {invalidMessage ? (
-        <div className="absolute -bottom-4 animate-fadeIn text-error text-xs">{invalidMessage}</div>
-      ) : null}
+      <InvalidMessage message={invalidMessage} />
     </div>
   );
 };
+// Written out rather than `createOverridable`, so `<ToggleSelect<Status> …/>` still infers.
 const ToggleSelectBase = <I extends string | number | boolean | null>(props: ToggleSelectProps<I>) => {
   const Override = useUiOverride("ToggleSelect");
   const Impl = (Override ?? DefaultToggleSelect) as unknown as ComponentType<ToggleSelectProps<I>>;
   return createElement(Impl, props);
 };
 
-/**
- * Toggle-select. `ToggleSelect` keeps its generic signature (so `<ToggleSelect<Status> …/>` still
- * infers), and both it and `ToggleSelect.Multi` resolve to a route-scoped override when a
- * `page/**\/_overrides.tsx` in the route's ancestry declares one (slots `ToggleSelect`, `ToggleSelectMulti`).
- */
 export const ToggleSelect = Object.assign(ToggleSelectBase, {
   Multi: createOverridable("ToggleSelectMulti", DefaultMulti),
 });

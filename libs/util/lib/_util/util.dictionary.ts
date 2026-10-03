@@ -22,6 +22,10 @@ export const dictionary = serviceDictionary(["en", "ko"])
   })
   .error({
     arrayWeightLengthMismatch: ["Array and weight length should be equal", "배열과 가중치의 길이가 같아야 합니다"],
+    jwtSecretRequired: [
+      "JWT_SECRET is not configured. Outside local a derived secret can be forged by anyone who knows the app, environment and repo names; set JWT_SECRET or security.jwtSecret, or AKAN_ALLOW_DERIVED_JWT_SECRET=1 to accept the risk",
+      "JWT_SECRET 이 설정되지 않았다. local 밖에서 파생 시크릿은 앱·환경·레포 이름을 아는 누구나 위조할 수 있다. JWT_SECRET 또는 security.jwtSecret 을 설정하거나, AKAN_ALLOW_DERIVED_JWT_SECRET=1 로 위험을 감수한다.",
+    ],
     cloudflareDnsRecordsLoadFailed: [
       "Failed to load Cloudflare DNS records: {errors}",
       "Cloudflare DNS 레코드를 불러오지 못했습니다: {errors}",
@@ -39,6 +43,11 @@ export const dictionary = serviceDictionary(["en", "ko"])
     discordBotNotFound: ["No bot found for botId: {botId}", "botId {botId}에 해당하는 봇을 찾을 수 없습니다"],
     discordRoleOrUserNotFound: ["No role or user", "역할 또는 사용자를 찾을 수 없습니다"],
     noResponseBody: ["No response body", "응답 본문이 없습니다"],
+    streamAborted: ["Stream aborted: {localPath}", "전송이 취소되었습니다: {localPath}"],
+    streamStalled: [
+      "Stream stalled for {seconds}s: {localPath}",
+      "{seconds}초 동안 응답이 없어 전송을 중단했습니다: {localPath}",
+    ],
     filenameRequired: [
       "Filename is required for local path: {localPath}",
       "로컬 경로 {localPath}에 파일 이름이 필요합니다",
@@ -64,13 +73,21 @@ export const dictionary = serviceDictionary(["en", "ko"])
       "Failed to list repository apps: {reason}",
       "저장소 앱 목록을 불러오지 못했습니다: {reason}",
     ],
+    githubWebhookListFailed: [
+      "Failed to list repository webhooks: {reason}",
+      "저장소 웹훅 목록을 불러오지 못했습니다: {reason}",
+    ],
+    githubWebhookRegisterFailed: [
+      "Failed to register the repository webhook: {reason}",
+      "저장소 웹훅을 등록하지 못했습니다: {reason}",
+    ],
+    githubWebhookUpdateFailed: [
+      "Failed to update the repository webhook: {reason}",
+      "저장소 웹훅을 갱신하지 못했습니다: {reason}",
+    ],
     githubPrivateKeyNotConfigured: [
       "GitHub App private key is not configured",
       "GitHub 앱 개인 키가 설정되지 않았습니다",
-    ],
-    pushNotificationTargetRequired: [
-      "Push notification target token or topic is required.",
-      "푸시 알림 대상 토큰 또는 토픽이 필요합니다.",
     ],
     invalidBaseUrlForDelete: [
       "Invalid base URL, unable to delete data",

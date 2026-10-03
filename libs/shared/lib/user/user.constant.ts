@@ -28,9 +28,9 @@ export class UserStatus extends enumOf("userStatus", ["prepare", "active", "dorm
 
 export class UserInput extends via((field) => ({
   nickname: field(String, { default: "", maxlength: 12, text: "title" }),
-  image: field(File, { text: "thumb", cascade: "remove" }).optional(),
-  images: field([File], { cascade: "remove" }),
-  appliedImages: field([File], { cascade: "remove" }),
+  image: field(File, { text: "thumb" }).optional(),
+  images: field([File]),
+  appliedImages: field([File]),
 })) {}
 
 export class UserObject extends via(UserInput, (field) => ({
@@ -40,18 +40,18 @@ export class UserObject extends via(UserInput, (field) => ({
   accountId: field.secret(String).optional(),
   password: field.secret(String).optional(),
   phone: field.secret(String).optional(),
-  notiInfo: field.secret(NotiInfo),
+  notiInfo: field.secret(NotiInfo, { default: () => new NotiInfo() }),
   imageNum: field.secret(Int, { default: 0 }),
   encourageInfo: field.secret(EncourageInfo, { default: () => new EncourageInfo() }),
   restrictInfo: field.secret(RestrictInfo).optional(),
   leaveInfo: field.secret(LeaveInfo).optional(),
   verifies: field([Verify]),
   roles: field([UserRole], { default: ["user"], text: "filter" }),
-  playing: field([String], { text: "tag" }),
+  playing: field([String]),
   isOnline: field(Boolean, { default: true }),
   lastLoginAt: field(Date, { default: () => dayjs() }),
   joinAt: field(Date).optional(),
-  profileStatus: field(ProfileStatus, { default: "prepare" }),
+  profileStatus: field(ProfileStatus, { default: "prepare", text: "filter" }),
   badgeCount: field(Int, { default: 0 }),
   status: field(UserStatus, { default: "prepare", text: "filter" }),
 })) {}

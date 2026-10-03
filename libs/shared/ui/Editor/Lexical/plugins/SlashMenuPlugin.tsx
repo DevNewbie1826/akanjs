@@ -5,7 +5,10 @@ import type { TextNode } from "lexical";
 import { useCallback, useMemo, useState } from "react";
 import { createPortal } from "react-dom";
 
+import type { EditorFeatureKey } from "../feature";
+import type { MentionSource } from "../mention.type";
 import type { EditorSlashOption } from "../plugin";
+import { useLocalOnlyTrigger } from "../typeaheadTrigger";
 import { useEditorUpload } from "../UploadContext";
 import type { SlashOption } from "./slashMenuPlugin.option";
 import type { SlashGroup } from "./slashMenuPlugin.type";
@@ -16,9 +19,10 @@ const GROUP_LABELS: Record<SlashGroup, string> = {
   list: "Lists",
   media: "Media",
   structure: "Structure",
+  reference: "References",
 };
 // Group render order.
-const GROUP_ORDER: SlashGroup[] = ["text", "list", "media", "structure"];
+const GROUP_ORDER: SlashGroup[] = ["text", "list", "media", "structure", "reference"];
 
 /**
  * Slash-command block picker. Typing `/` opens a grouped, searchable menu;
@@ -26,15 +30,24 @@ const GROUP_ORDER: SlashGroup[] = ["text", "list", "media", "structure"];
  * Selecting an option removes the `/query` text and runs the block conversion
  * or media insertion.
  */
-export const SlashMenuPlugin = ({ extraOptions = [] }: { extraOptions?: readonly EditorSlashOption[] }) => {
+interface SlashMenuPluginProps {
+  features: ReadonlySet<EditorFeatureKey>;
+  extraOptions?: readonly EditorSlashOption[];
+  mentionSources?: readonly MentionSource[];
+}
+
+export const SlashMenuPlugin = ({ features, extraOptions = [], mentionSources = [] }: SlashMenuPluginProps) => {
   const [editor] = useLexicalComposerContext();
   const upload = useEditorUpload();
   const [query, setQuery] = useState<string | null>(null);
-  const allOptions = useMemo(() => buildOptions(upload, extraOptions), [upload, extraOptions]);
+  const allOptions = useMemo(
+    () => buildOptions({ upload, features, extraOptions, mentionSources }),
+    [upload, features, extraOptions, mentionSources],
+  );
 
   // `/` opens the menu at a word boundary; query is a single token (no spaces),
   // matching the Lexical playground convention so the menu closes on space.
-  const triggerFn = useBasicTypeaheadTriggerMatch("/", { minLength: 0 });
+  const triggerFn = useLocalOnlyTrigger(useBasicTypeaheadTriggerMatch("/", { minLength: 0 }));
 
   const options = useMemo(() => {
     if (!query) return allOptions;
@@ -58,6 +71,9 @@ export const SlashMenuPlugin = ({ extraOptions = [] }: { extraOptions?: readonly
       onQueryChange={setQuery}
       onSelectOption={onSelectOption}
       triggerFn={triggerFn}
+      // Lexical appends this anchor to <body> with no z-index; without one the menu
+      // renders under any positioned overlay hosting the editor (Modal, BottomSheet).
+      anchorClassName="z-[9999]"
       menuRenderFn={(anchorRef, { selectedIndex, selectOptionAndCleanUp, setHighlightedIndex }) => {
         if (anchorRef.current === null || options.length === 0) return null;
         return createPortal(
@@ -90,10 +106,10 @@ export const SlashMenuList = ({ options, selectedIndex, onSelect, onHighlight }:
   })).filter((section) => section.items.length > 0);
 
   return (
-    <div className="z-50 max-h-80 w-64 overflow-y-auto rounded-md border border-base-content/10 bg-base-100 p-1 shadow-lg">
+    <div className="max-h-80 w-64 overflow-y-auto rounded-md border border-foreground/10 bg-background p-1 shadow-lg">
       {grouped.map((section) => (
         <div key={section.group}>
-          <div className="px-2 py-1 font-medium text-base-content/40 text-xs uppercase tracking-wide">
+          <div className="px-2 py-1 font-medium text-foreground/40 text-xs uppercase tracking-wide">
             {GROUP_LABELS[section.group]}
           </div>
           {section.items.map(({ option, index }) => (
@@ -102,7 +118,7 @@ export const SlashMenuList = ({ options, selectedIndex, onSelect, onHighlight }:
               type="button"
               ref={(el) => option.setRefElement(el)}
               className={`flex w-full flex-col items-start rounded px-2 py-1.5 text-left transition-colors ${
-                index === selectedIndex ? "bg-base-200" : "hover:bg-base-200/60"
+                index === selectedIndex ? "bg-muted" : "hover:bg-muted/60"
               }`}
               // Keep editor selection intact while clicking the menu.
               onMouseDown={(event) => event.preventDefault()}
@@ -110,7 +126,7 @@ export const SlashMenuList = ({ options, selectedIndex, onSelect, onHighlight }:
               onClick={() => onSelect(option)}
             >
               <span className="font-medium text-sm">{option.label}</span>
-              <span className="text-base-content/50 text-xs">{option.description}</span>
+              <span className="text-foreground/50 text-xs">{option.description}</span>
             </button>
           ))}
         </div>

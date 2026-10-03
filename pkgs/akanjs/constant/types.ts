@@ -14,21 +14,27 @@ type ObjectToId<O> = O extends BaseObject
         ? DocumentModel<O>
         : O;
 
-type Docify<T, _StateKeys extends keyof GetStateObject<T> = keyof GetStateObject<T>> = {
-  [K in _StateKeys as null extends T[K] ? never : K]-?: ObjectToId<NonNullable<T[K]>>;
-} & {
-  [K in _StateKeys as null extends T[K] ? K : never]?: ObjectToId<NonNullable<T[K]>> | undefined;
-};
-export type DocumentModel<T> = T extends (infer S)[]
-  ? DocumentModel<S>[]
-  : T extends string | number | boolean | Dayjs | File
-    ? T
-    : T extends Map<infer K, infer V>
-      ? Map<K, DocumentModel<V>>
-      : Docify<T>;
+type Docify<T, _StateKeys extends keyof GetStateObject<T> = keyof GetStateObject<T>> = unknown extends T
+  ? T
+  : { [K in _StateKeys as null extends T[K] ? never : K]-?: ObjectToId<NonNullable<T[K]>> } & {
+      [K in _StateKeys as null extends T[K] ? K : never]?: ObjectToId<NonNullable<T[K]>> | undefined;
+    };
+export type DocumentModel<T> = unknown extends T
+  ? T
+  : T extends (infer S)[]
+    ? DocumentModel<S>[]
+    : T extends string | number | boolean | Dayjs | File
+      ? T
+      : T extends Map<infer K, infer V>
+        ? Map<K, DocumentModel<V>>
+        : Docify<T>;
 
 export type FieldState<T> = T extends { id: string } ? T | null : T;
-export type DefaultOf<S> = GetStateObject<{ [K in keyof S]: FieldState<S[K]> }>;
+export type DefaultOf<S> = {
+  [K in keyof S as S[K] extends (...args: never[]) => unknown ? never : K extends "prototype" ? never : K]: FieldState<
+    S[K]
+  >;
+};
 
 export type DefaultOfSchema<Schema, RelationKey = never> = [RelationKey] extends [never]
   ? Schema
@@ -57,26 +63,29 @@ export class BaseInsight {
   declare count: number;
 }
 
-// TODO: migrate this to shared
-export interface ProtoFile {
+// The projection a `LightFile` carries, so a field declared `field(LightFile)` feeds the upload UI too.
+export interface ProtoLightFile {
   id: string;
   filename: string;
   abstractData: string | null;
   imageSize: [number, number];
-  progress: number | null;
+  progress?: number | null;
   url: string;
   size: number;
   status: string;
   createdAt: Dayjs;
   updatedAt: Dayjs;
   removedAt: Dayjs | null;
+}
+
+export interface ProtoFile extends ProtoLightFile {
+  progress: number | null;
   mimetype: string;
   encoding: string;
   origin: string | null;
   lastModifiedAt: Dayjs;
 }
 
-// TODO: migrate this to shared
 export interface ProtoAppInfo {
   appId: string | null;
   appName: string;
@@ -91,7 +100,6 @@ export interface ProtoAppInfo {
   isEmulator: boolean | null;
 }
 
-// TODO: migrate this to shared
 export interface ProtoPatch {
   source: ProtoFile;
   build: ProtoFile;
@@ -101,6 +109,24 @@ export interface ProtoPatch {
 }
 
 export const DEFAULT_PAGE_SIZE = 20;
+/**
+ * The most rows one list request may take: the page size is client input, so without a ceiling one request could
+ * read the whole table, and `LIMIT 0`/`-1` reaches SQLite as no limit at all.
+ */
+export const MAX_PAGE_SIZE = 500;
+
+/** Clamps a caller-supplied page size into `[1, MAX_PAGE_SIZE]`, falling back to `DEFAULT_PAGE_SIZE`. */
+export const resolvePageLimit = (limit: unknown, fallback: number = DEFAULT_PAGE_SIZE): number => {
+  const asked = Math.trunc(Number(limit));
+  if (!Number.isFinite(asked) || asked <= 0) return Math.min(fallback, MAX_PAGE_SIZE);
+  return Math.min(asked, MAX_PAGE_SIZE);
+};
+
+/** Clamps an offset to a non-negative integer; a negative `OFFSET` is silently read as zero by the database. */
+export const resolvePageSkip = (skip: unknown): number => {
+  const asked = Math.trunc(Number(skip));
+  return Number.isFinite(asked) && asked > 0 ? asked : 0;
+};
 export type NonFunctionalKeys<T> = {
   [K in keyof T]: T[K] extends (...args: never[]) => unknown ? never : K;
 }[keyof T];
@@ -108,6 +134,5 @@ export type NonFunctionalKeys<T> = {
 export const unsetDate = dayjs(new Date("0000"));
 export const MAX_INT = 2147483647;
 
-// TODO: migrate this to akanjs/client
 export class Responsive extends enumOf("responsive", ["xl", "lg", "md", "sm", "xs"] as const) {}
 export const responsiveWidths = [1200, 992, 768, 576, 0] as const;

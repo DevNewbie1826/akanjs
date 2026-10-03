@@ -160,7 +160,7 @@ This code creates two input fields: one for selecting ice cream size (small/medi
 
 The "st.use.icecreamOrderForm()" gets the current form data, while "st.do.setSizeOnIcecreamOrder" and "st.do.setToppingsOnIcecreamOrder" update the form when customers make selections.
 
-🎉 Now customers can create orders using your form. But how do we show those orders in a nice, visual way? Let's create a card design to display each order beautifully.
+Now customers can create orders using your form. But how do we show those orders in a nice, visual way? Let's create a card design to display each order beautifully.
 
 Update unit file
 
@@ -168,9 +168,9 @@ The Unit file shows how each order looks in a list or card view. Think of it as 
 
 This creates a card design for each ice cream order. The card shows the order ID and status with different colors - green for "active", blue for "processing", and red for "served".
 
-The clsx function changes the card's appearance based on the order status, and l() displays the status text in the user's language.
+The cn function changes the card's appearance based on the order status, and l() displays the status text in the user's language.
 
-🚀 We have the form (Template) and the display card (Unit). Now let's put it all together on a webpage so customers can actually visit and use your ice cream ordering system!
+We have the form (Template) and the display card (Unit). Now let's put it all together on a webpage so customers can actually visit and use your ice cream ordering system!
 
 Expose to page
 
@@ -210,22 +210,22 @@ akan create-module icecreamOrder
 ### Code
 
 ```bash
-└── apps/          # ${l.trans({ en: "Application code", ko: "애플리케이션 코드" })}
-    └── koyo/      # ${l.trans({ en: "Individual application", ko: "개별 애플리케이션" })}
-        └── lib/          # ${l.trans({ en: "Domain modules", ko: "도메인 모듈" })}
-            └── icecreamOrder/  # ${l.trans({ en: "Icecream order domain module", ko: "아이스크림 주문 도메인 모듈" })}
-                ├── icecreamOrder.abstract.md   # ${l.trans({ en: "Business intent", ko: "비즈니스 의도" })}
-                ├── icecreamOrder.constant.ts   # ${l.trans({ en: "Types and schemas", ko: "타입과 스키마" })}
-                ├── icecreamOrder.dictionary.ts # ${l.trans({ en: "Translations", ko: "번역" })}
-                ├── icecreamOrder.document.ts   # ${l.trans({ en: "Document", ko: "문서" })}
-                ├── icecreamOrder.service.ts    # ${l.trans({ en: "Business logic", ko: "비즈니스 로직" })}
-                ├── icecreamOrder.signal.ts     # ${l.trans({ en: "API endpoints", ko: "API 엔드포인트" })}
-                ├── icecreamOrder.store.ts      # ${l.trans({ en: "State management", ko: "상태 관리" })}
-                ├── icecreamOrder.Template.tsx  # ${l.trans({ en: "Form UI", ko: "수정/생성 UI" })}
-                ├── icecreamOrder.Unit.tsx      # ${l.trans({ en: "Overview UI", ko: "개요 UI" })}
-                ├── icecreamOrder.Util.tsx      # ${l.trans({ en: "Utility UI", ko: "유틸리티 UI" })}
-                ├── icecreamOrder.View.tsx      # ${l.trans({ en: "Detail view UI", ko: "상세 뷰 UI" })}
-                └── icecreamOrder.Zone.tsx      # ${l.trans({ en: "Integration UI", ko: "통합 UI" })}
+└── apps/          # Application code
+    └── koyo/      # Individual application
+        └── lib/          # Domain modules
+            └── icecreamOrder/  # Icecream order domain module
+                ├── icecreamOrder.abstract.md   # Business intent
+                ├── icecreamOrder.constant.ts   # Types and schemas
+                ├── icecreamOrder.dictionary.ts # Translations
+                ├── icecreamOrder.document.ts   # Document
+                ├── icecreamOrder.service.ts    # Business logic
+                ├── icecreamOrder.signal.ts     # API endpoints
+                ├── icecreamOrder.store.ts      # State management
+                ├── icecreamOrder.Template.tsx  # Form UI
+                ├── icecreamOrder.Unit.tsx      # Overview UI
+                ├── icecreamOrder.Util.tsx      # Utility UI
+                ├── icecreamOrder.View.tsx      # Detail view UI
+                └── icecreamOrder.Zone.tsx      # Integration UI
 ```
 
 ### apps/koyo/lib/icecreamOrder/icecreamOrder.constant.ts
@@ -360,31 +360,32 @@ export const General = ({ className }: GeneralProps) => {
 ### apps/koyo/lib/icecreamOrder/IcecreamOrder.Unit.tsx
 
 ```ts
-import { clsx, ModelProps } from "akanjs/client"; // [!code collapse:3]
+import { cn, ModelProps } from "akanjs/client"; // [!code collapse:3]
 import { cnst, usePage } from "@apps/koyo/client";
 
 export const Card = ({ icecreamOrder }: ModelProps<"icecreamOrder", cnst.LightIcecreamOrder>) => {
   const { l } = usePage();
   return (
-    <div className="group flex w-full flex-wrap justify-between gap-2 overflow-hidden rounded-xl border border-base-300 bg-base-100 px-8 py-6 shadow-md transition-all duration-300 hover:shadow-xl">
+    <div className="group flex w-full flex-wrap justify-between gap-2 overflow-hidden rounded-xl border border-border bg-background px-8 py-6 shadow-md transition-all duration-300 hover:shadow-xl">
       <div className="flex flex-col justify-center">
         <div className="flex items-center gap-2 text-lg font-semibold text-primary">
-          <span className="inline-block rounded border border-base-300 bg-base-200 px-2 py-1 text-xs font-bold tracking-wider text-primary uppercase">
+          <span className="inline-block rounded border border-border bg-muted px-2 py-1 text-xs font-bold tracking-wider text-primary uppercase">
             {l("icecreamOrder.id")}
           </span>
         </div>
         <div className="mt-4 flex items-center gap-2">
-          <span className="inline-block rounded bg-base-200 px-2 py-1 text-xs font-bold tracking-wider text-primary uppercase">
+          <span className="inline-block rounded bg-muted px-2 py-1 text-xs font-bold tracking-wider text-primary uppercase">
             {l("icecreamOrder.status")}
           </span>
           <span
-            className={clsx("ml-2 rounded-full border border-base-300 bg-base-100 px-3 py-1 text-sm font-semibold text-base-content/80", {
-              "bg-primary text-primary-content": icecreamOrder.status === "active",
-              "bg-warning text-warning-content": icecreamOrder.status === "processing",
-              "bg-secondary text-secondary-content": icecreamOrder.status === "served",
-              "bg-accent text-accent-content": icecreamOrder.status === "finished",
-              "bg-neutral text-neutral-content": icecreamOrder.status === "canceled",
-            })}
+            className={cn(
+              "ml-2 rounded-full border border-border bg-background px-3 py-1 text-sm font-semibold text-foreground/80",
+              icecreamOrder.status === "active" && "bg-primary text-primary-foreground",
+              icecreamOrder.status === "processing" && "bg-warning text-warning-foreground",
+              icecreamOrder.status === "served" && "bg-secondary text-secondary-foreground",
+              icecreamOrder.status === "finished" && "bg-accent text-accent-foreground",
+              icecreamOrder.status === "canceled" && "bg-neutral text-neutral-foreground",
+            )}
           >
             {l(`icecreamOrderStatus.${icecreamOrder.status}`)}
           </span>
@@ -398,19 +399,20 @@ export const Card = ({ icecreamOrder }: ModelProps<"icecreamOrder", cnst.LightIc
 ### apps/koyo/page/_index.tsx
 
 ```ts
-import { Model } from "akanjs/ui";
+import { Model, buttonRecipe } from "akanjs/ui";
 import { cnst, fetch, IcecreamOrder, usePage } from "@apps/koyo/client";
+import { page } from "akanjs/client";
 
-export default async function Page() {
+export default page().render(() => {
   const { l } = usePage();
-  const { icecreamOrderInitInPublic } = await fetch.initIcecreamOrderInPublic();
+  const { icecreamOrderInitInPublic } = fetch.initIcecreamOrderInPublic();
   const icecreamOrderForm: Partial<cnst.IcecreamOrderInput> = {};
   return (
     <div className="space-y-4">
       <div className="flex items-center gap-4 text-5xl font-black">
         <div className="text-5xl font-bold">{l("icecreamOrder.modelName")}</div>
         <Model.New
-          className="btn btn-primary"
+          trigger={<button className={buttonRecipe({ variant: "primary" })}>{l("base.new")}</button>}
           slice={fetch.slice.icecreamOrderInPublic}
           renderTitle="name"
           partial={icecreamOrderForm}
@@ -425,7 +427,7 @@ export default async function Page() {
       />
     </div>
   );
-}
+});
 ```
 
 ## Agent Notes

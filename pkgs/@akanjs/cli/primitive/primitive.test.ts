@@ -1,20 +1,15 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { CommandContainer } from "@akanjs/devkit/commandDecorators";
+import { createTempModule, tempRoots } from "@akanjs/devkit/testHelpers";
 import { ModuleRunner } from "../module/module.runner";
-import { cleanupCliTempWorkspace, createTempModule } from "../testHelpers";
 import { PrimitiveScript } from "./primitive.script";
 
-const tempRoots: string[] = [];
-
-afterEach(async () => {
-  CommandContainer.clear();
-  await Promise.all(tempRoots.splice(0).map((root) => cleanupCliTempWorkspace(root)));
-});
+afterEach(() => CommandContainer.clear());
+const track = tempRoots();
 
 describe("PrimitiveScript", () => {
   test("adds a source-limited field to module constant and dictionary files", async () => {
-    const { root, workspace, module } = await createTempModule("post");
-    tempRoots.push(root);
+    const { workspace, module } = track(await createTempModule("post"));
     await new ModuleRunner().createModuleTemplate(module);
     const script = CommandContainer.get(PrimitiveScript);
 
@@ -39,8 +34,7 @@ describe("PrimitiveScript", () => {
   });
 
   test("orders priority fields and preserves existing comments", async () => {
-    const { root, workspace, module } = await createTempModule("article");
-    tempRoots.push(root);
+    const { workspace, module } = track(await createTempModule("article"));
     await new ModuleRunner().createModuleTemplate(module);
     await module.writeFile(
       "article.constant.ts",
@@ -109,8 +103,7 @@ export const dictionary = modelDictionary(["en", "ko"])
   });
 
   test("adds selected template surface and light projection for safe field patterns", async () => {
-    const { root, workspace, module } = await createTempModule("project");
-    tempRoots.push(root);
+    const { workspace, module } = track(await createTempModule("project"));
     await new ModuleRunner().createModuleTemplate(module);
     const script = CommandContainer.get(PrimitiveScript);
 
@@ -144,8 +137,7 @@ export const dictionary = modelDictionary(["en", "ko"])
   });
 
   test("normalizes integer and float field type aliases", async () => {
-    const { root, workspace, module } = await createTempModule("post");
-    tempRoots.push(root);
+    const { workspace, module } = track(await createTempModule("post"));
     await new ModuleRunner().createModuleTemplate(module);
     const script = CommandContainer.get(PrimitiveScript);
 
@@ -173,8 +165,7 @@ export const dictionary = modelDictionary(["en", "ko"])
   });
 
   test("coerces boolean, string, and date defaults and rejects invalid numeric defaults", async () => {
-    const { root, workspace, module } = await createTempModule("post");
-    tempRoots.push(root);
+    const { workspace, module } = track(await createTempModule("post"));
     await new ModuleRunner().createModuleTemplate(module);
     const script = CommandContainer.get(PrimitiveScript);
 
@@ -199,6 +190,13 @@ export const dictionary = modelDictionary(["en", "ko"])
       type: "Date",
       defaultValue: "2026-01-01",
     });
+    const nowReport = await script.addField(workspace, {
+      app: "demo",
+      module: "post",
+      field: "startAt",
+      type: "Date",
+      defaultValue: "now",
+    });
     const invalidReport = await script.addField(workspace, {
       app: "demo",
       module: "post",
@@ -210,6 +208,7 @@ export const dictionary = modelDictionary(["en", "ko"])
     expect(booleanReport.status).toBe("passed");
     expect(stringReport.status).toBe("passed");
     expect(dateReport.status).toBe("passed");
+    expect(nowReport.status).toBe("passed");
     expect(invalidReport.status).toBe("failed");
     expect(invalidReport.diagnostics).toContainEqual(
       expect.objectContaining({ code: "primitive-default-value-invalid", input: "default" }),
@@ -217,13 +216,14 @@ export const dictionary = modelDictionary(["en", "ko"])
     const constant = await module.readFile("post.constant.ts");
     expect(constant).toContain("published: field(Boolean, { default: false }),");
     expect(constant).toContain('title: field(String, { default: "Untitled" }),');
-    expect(constant).toContain('dueAt: field(Date, { default: new Date("2026-01-01") }),');
+    expect(constant).toContain('dueAt: field(Date, { default: () => dayjs("2026-01-01") }),');
+    expect(constant).toContain("startAt: field(Date, { default: () => dayjs() }),");
+    expect(constant).toMatch(/import \{[^}]*\bdayjs\b[^}]*\} from "akanjs\/base";/);
     expect(constant).not.toContain("budget:");
   });
 
   test("rejects ambiguous number field types without writing source files", async () => {
-    const { root, workspace, module } = await createTempModule("post");
-    tempRoots.push(root);
+    const { workspace, module } = track(await createTempModule("post"));
     await new ModuleRunner().createModuleTemplate(module);
     const script = CommandContainer.get(PrimitiveScript);
 
@@ -252,8 +252,7 @@ export const dictionary = modelDictionary(["en", "ko"])
   });
 
   test("fails before writing when post-edit parse verification fails", async () => {
-    const { root, workspace, module } = await createTempModule("post");
-    tempRoots.push(root);
+    const { workspace, module } = track(await createTempModule("post"));
     await new ModuleRunner().createModuleTemplate(module);
     const originalConstant = await module.readFile("post.constant.ts");
     const script = CommandContainer.get(PrimitiveScript);
@@ -274,8 +273,7 @@ export const dictionary = modelDictionary(["en", "ko"])
   });
 
   test("adds an enum field and enum dictionary without syncing generated files", async () => {
-    const { root, workspace, module } = await createTempModule("task");
-    tempRoots.push(root);
+    const { workspace, module } = track(await createTempModule("task"));
     await new ModuleRunner().createModuleTemplate(module);
     const script = CommandContainer.get(PrimitiveScript);
 
@@ -311,8 +309,7 @@ export const dictionary = modelDictionary(["en", "ko"])
   });
 
   test("returns diagnostics for missing required inputs", async () => {
-    const { root, workspace } = await createTempModule("unused");
-    tempRoots.push(root);
+    const { workspace } = track(await createTempModule("unused"));
     const report = await CommandContainer.get(PrimitiveScript).addField(workspace, {
       app: "demo",
       module: null,

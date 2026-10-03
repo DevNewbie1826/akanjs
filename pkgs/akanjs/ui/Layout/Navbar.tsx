@@ -1,6 +1,6 @@
 "use client";
 import { getEnv } from "akanjs/base";
-import { clsx, DEFAULT_TOP_INSET, debugFrame, type TransitionType, usePathCtx } from "akanjs/client";
+import { cn, DEFAULT_TOP_INSET, debugFrame, type TransitionType, usePathCtx } from "akanjs/client";
 import { type ReactNode, useLayoutEffect } from "react";
 import { BiChevronLeft, BiX } from "react-icons/bi";
 
@@ -25,7 +25,7 @@ export const Navbar = ({ back = false, className, height, children, title, left,
   const path = pathRoute?.path;
   const BackIcon = closeIconTransitions.has(pathRoute?.pageState.transition ?? "none") ? BiX : BiChevronLeft;
   const registerFrameSlot = pathCtx.registerFrameSlot ?? (() => () => undefined);
-  const suffix = getEnv().renderMode === "csr" && path ? `-${path}` : "";
+  const suffix = getEnv().renderMode === "csr" && path ? `-${pathCtx.pageKey ?? path}` : "";
   useLayoutEffect(() => {
     if (!path) return;
     debugFrame("navbar.mount", { path, height });
@@ -44,17 +44,7 @@ export const Navbar = ({ back = false, className, height, children, title, left,
   return (
     <>
       <Portal id={`topInsetContent${suffix}`}>
-        <div
-          className={clsx(
-            "flex size-full items-center px-5",
-            {
-              "pl-14": back,
-            },
-            className,
-          )}
-        >
-          {children}
-        </div>
+        <div className={cn("flex size-full items-center px-5", back && "pl-14", className)}>{children}</div>
       </Portal>
       {back ? (
         <Portal id={`topLeftActionContent${suffix}`}>

@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, mock, test } from "bun:test";
 import type { Location, PathRoute, RouteGuide } from "akanjs/client";
-import { createRobotPage } from "./createRobotPage";
-import { createSitemapPage } from "./createSitemapPage";
+import { fakeElement, fakeReact, hooks, sameDeps } from "./hookHarness.fixture";
+import { createRobotPage, createSitemapPage } from "./seoPages";
 
 type RenderHookResult<T> = {
   get current(): T;
@@ -15,70 +15,26 @@ const originalSetTimeout = globalThis.setTimeout;
 const originalClearTimeout = globalThis.clearTimeout;
 const originalSetInterval = globalThis.setInterval;
 const originalClearInterval = globalThis.clearInterval;
-const effectCleanups: Array<() => void> = [];
 const reactLazyLoaders: Array<() => Promise<unknown>> = [];
-let hookIndex = 0;
-const hookStates: unknown[] = [];
-let hookMemoStates: Array<{ deps: unknown[]; value: unknown }> = [];
 let hookEffectStates: Array<{ deps: unknown[] | undefined; cleanup?: () => undefined }> = [];
 
-const sameDeps = (a: unknown[] | undefined, b: unknown[] | undefined) =>
-  !!a && !!b && a.length === b.length && a.every((value, index) => Object.is(value, b[index]));
-
-mock.module("react", () => ({
-  Fragment: ({ children }: { children: unknown }) => children,
-  useCallback: <T,>(fn: T, deps?: unknown[]) => {
-    const index = hookIndex++;
-    const memo = hookMemoStates[index];
-    if (memo && sameDeps(memo.deps, deps)) return memo.value as T;
-    hookMemoStates[index] = { deps: deps ?? [], value: fn };
-    return fn;
-  },
-  useMemo: <T,>(factory: () => T, deps?: unknown[]) => {
-    const index = hookIndex++;
-    const memo = hookMemoStates[index];
-    if (memo && sameDeps(memo.deps, deps)) return memo.value as T;
-    const value = factory();
-    hookMemoStates[index] = { deps: deps ?? [], value };
-    return value;
-  },
-  useRef: <T,>(initial: T) => {
-    const index = hookIndex++;
-    if (!hookStates[index]) hookStates[index] = { current: initial };
-    return hookStates[index] as { current: T };
-  },
-  useState: <T,>(initial: T) => {
-    const index = hookIndex++;
-    if (hookStates[index] === undefined)
-      hookStates[index] = typeof initial === "function" ? (initial as () => T)() : initial;
-    const setState = (next: T | ((prev: T) => T)) => {
-      const state = hookStates[index] as T;
-      const nextState = typeof next === "function" ? (next as (prev: T) => T)(state) : next;
-      if (typeof state === "object" && state && typeof nextState === "object" && nextState) {
-        Object.assign(state, nextState);
-      } else {
-        hookStates[index] = nextState;
-      }
-    };
-    return [hookStates[index] as T, setState] as const;
-  },
-  useEffect: (fn: () => (() => undefined) | undefined, deps?: unknown[]) => {
-    const index = hookIndex++;
-    const prev = hookEffectStates[index];
-    if (prev && sameDeps(prev.deps, deps)) return;
-    prev?.cleanup?.();
-    const cleanup = fn();
-    hookEffectStates[index] = { deps, cleanup: cleanup || undefined };
-    if (cleanup) effectCleanups.push(cleanup);
-  },
-  forwardRef: (fn: unknown) => fn,
-  lazy: (loader: () => Promise<unknown>) => {
-    reactLazyLoaders.push(loader);
-    return { loader };
-  },
-  memo: <T,>(component: T) => component,
-  act: async (fn: () => void | Promise<void>) => await fn(),
-}));
+mock.module("react", () =>
+  fakeReact({
+    useEffect: (fn: () => (() => undefined) | undefined, deps?: unknown[]) => {
+      const index = hooks.index++;
+      const prev = hookEffectStates[index];
+      if (prev && sameDeps(prev.deps, deps)) return;
+      prev?.cleanup?.();
+      const cleanup = fn();
+      hookEffectStates[index] = { deps, cleanup: cleanup || undefined };
+      if (cleanup) hooks.cleanups.push(cleanup);
+    },
+    lazy: (loader: () => Promise<unknown>) => {
+      reactLazyLoaders.push(loader);
+      return { loader };
+    },
+  }),
+);
 mock.module("react/jsx-dev-runtime", () => ({
   Fragment: ({ children }: { children: unknown }) => children,
   jsxDEV: (_type: unknown, props: { children?: unknown }) => props.children ?? null,
@@ -101,30 +57,13 @@ const installWindow = ({
   getElementById?: (id: string) => { offsetTop: number } | null;
 } = {}) => {
   const url = new URL(href);
-  const createElement = (tagName = "div") =>
-    ({
-      nodeType: 1,
-      nodeName: tagName.toUpperCase(),
-      tagName: tagName.toUpperCase(),
-      namespaceURI: "http://www.w3.org/1999/xhtml",
-      ownerDocument: null,
-      style: {},
-      childNodes: [],
-      addEventListener: () => undefined,
-      removeEventListener: () => undefined,
-      appendChild: () => undefined,
-      removeChild: () => undefined,
-      insertBefore: () => undefined,
-      setAttribute: () => undefined,
-      removeAttribute: () => undefined,
-    }) as unknown as HTMLDivElement;
   const body = { style: {} } as HTMLBodyElement;
   const document = {
     nodeType: 9,
     body,
-    documentElement: createElement("html"),
+    documentElement: fakeElement("html"),
     defaultView: null,
-    createElement,
+    createElement: fakeElement,
     getElementById: getElementById ?? (() => null),
     addEventListener: () => undefined,
     removeEventListener: () => undefined,
@@ -157,7 +96,7 @@ const installWindow = ({
 const renderHook = <T,>(hook: (props?: unknown) => T, initialProps?: unknown): RenderHookResult<T> => {
   let current: T;
   const render = (props?: unknown) => {
-    hookIndex = 0;
+    hooks.index = 0;
     current = hook(props);
   };
   render(initialProps);
@@ -167,12 +106,12 @@ const renderHook = <T,>(hook: (props?: unknown) => T, initialProps?: unknown): R
     },
     rerender: render,
     unmount: () => {
-      effectCleanups.splice(0).forEach((cleanup) => {
+      hooks.cleanups.splice(0).forEach((cleanup) => {
         cleanup();
       });
-      hookIndex = 0;
-      hookStates.length = 0;
-      hookMemoStates = [];
+      hooks.index = 0;
+      hooks.states.length = 0;
+      hooks.memos.length = 0;
       hookEffectStates = [];
     },
   };
@@ -198,10 +137,10 @@ class TimerController {
         delay: delay ?? 0,
       });
       return id as unknown as ReturnType<typeof setTimeout>;
-    }) as typeof setTimeout;
+    }) as unknown as typeof setTimeout;
     globalThis.clearTimeout = ((id?: ReturnType<typeof setTimeout>) => {
       this.timeouts.delete(Number(id));
-    }) as typeof clearTimeout;
+    }) as unknown as typeof clearTimeout;
     globalThis.setInterval = ((handler: TimerHandler, delay?: number, ...args: unknown[]) => {
       const id = this.nextId++;
       this.intervals.set(id, {
@@ -211,10 +150,10 @@ class TimerController {
         delay: delay ?? 0,
       });
       return id as unknown as ReturnType<typeof setInterval>;
-    }) as typeof setInterval;
+    }) as unknown as typeof setInterval;
     globalThis.clearInterval = ((id?: ReturnType<typeof setInterval>) => {
       this.intervals.delete(Number(id));
-    }) as typeof clearInterval;
+    }) as unknown as typeof clearInterval;
   }
 
   flushTimeouts() {
@@ -286,11 +225,11 @@ afterEach(() => {
   globalThis.clearTimeout = originalClearTimeout;
   globalThis.setInterval = originalSetInterval;
   globalThis.clearInterval = originalClearInterval;
-  effectCleanups.splice(0);
+  hooks.cleanups.splice(0);
   reactLazyLoaders.length = 0;
-  hookIndex = 0;
-  hookStates.length = 0;
-  hookMemoStates = [];
+  hooks.index = 0;
+  hooks.states.length = 0;
+  hooks.memos.length = 0;
   hookEffectStates = [];
 });
 
@@ -416,7 +355,33 @@ describe("promise and timer hooks", () => {
     const hook = renderHook(() => useFetch(promise));
     expect(hook.current).toEqual({ fulfilled: false, value: null });
     await tick();
+    hook.rerender();
     expect(hook.current).toEqual({ fulfilled: true, value: "done" });
+    hook.unmount();
+  });
+
+  test("useFetch follows a new promise and drops the one it replaced", async () => {
+    const { useFetch } = await import("./useFetch");
+    installWindow();
+    let resolveFirst: (value: string) => void = () => undefined;
+    const first = new Promise<string>((resolve) => {
+      resolveFirst = resolve;
+    });
+    const second = Promise.resolve("second");
+    const hook = renderHook((promise) => useFetch(promise as Promise<string>), first);
+
+    hook.rerender(second);
+    resolveFirst("first");
+    await tick();
+    hook.rerender(second);
+    expect(hook.current).toEqual({ fulfilled: true, value: "second" });
+
+    const third = Promise.resolve("third");
+    hook.rerender(third);
+    expect(hook.current).toEqual({ fulfilled: false, value: null });
+    await tick();
+    hook.rerender(third);
+    expect(hook.current).toEqual({ fulfilled: true, value: "third" });
     hook.unmount();
   });
 

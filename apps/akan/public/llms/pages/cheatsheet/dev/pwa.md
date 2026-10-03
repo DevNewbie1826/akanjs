@@ -19,59 +19,181 @@
 
 PWA
 
-A PWA, or Progressive Web App, is a web app that can feel closer to an installed app. It still runs through the browser, but it can use install metadata, app icons, standalone display, and other browser features to create a more app-like experience.
+A PWA (Progressive Web App) runs in the browser but can be installed and launched like an app. The browser adds the icon, the app window without a toolbar, and the install prompt.
 
-Use it when users repeatedly open the same web app and benefit from a home-screen or desktop launcher.
+When it helps.
 
-It is useful for admin tools, field-work apps, internal dashboards, lightweight commerce apps, and content apps.
+Users open the same web app again and again, and a home-screen or desktop launcher saves them time.
 
-Start PWA support by telling the browser what your app is: its name, icon, start URL, display mode, and colors.
+Typical apps.
+
+Admin tools, field-work apps, internal dashboards, lightweight commerce apps and content apps.
+
+Where it starts.
+
+A web app manifest that tells the browser the app's name, icon, start URL, display mode and colors.
+
+Add It In Three Steps
+
+Put the icons in `apps/<app>/public/`. That folder is served from the site root, so `public/icon-192x192.png` loads as `/icon-192x192.png`.
+
+Declare the manifest in one of two ways: a static `manifest.json` linked from `.head()`, or `rootLayout().manifest({...})`.
+
+Deploy, check that every URL in the manifest loads, then test installation.
+
+Two Ways To Declare It
+
+- Static JSON File — apps/<app>/public/manifest.json
+
+  - Keys — Standard snake_case, exactly what the browser reads.
+
+  - Linked by — A `<link rel="manifest">` you write in `.head()`.
+
+  - Pick it when — Designers or operators need to review the JSON directly.
+
+- .manifest() Object — apps/<app>/page/_layout.tsx
+
+  - Keys — camelCase, converted to snake_case for you.
+
+  - Linked by — A `data:` URL link Akan adds to the head, so no file is served.
+
+  - Pick it when — You want TypeScript help and app metadata in one place.
 
 When To Use PWA
 
-Think of PWA as a way to make a web app easier to return to. It is not a replacement for every native app, but it is a strong first choice when web deployment speed matters and the app does not need deep device-specific APIs.
+A PWA makes a web app easier to come back to. It does not replace every native app, but it is a strong first choice when shipping on the web fast matters and the app needs no deep device APIs.
 
-Good fit: users need quick access to the same workflow every day, such as office tasks, approvals, reports, or checklists.
+Situation
 
-Good fit: you want one deployed web app to cover desktop and mobile without app-store distribution first.
+PWA alone
 
-Be careful: if the product depends on deep native features, heavy background work, or strict app-store presence, plan a native wrapper or native app too.
+Native too
+
+- Good fit
+
+  - Daily workflow: Users return to the same flow every day: office tasks, approvals, reports or checklists.
+
+  - No app store first: One deployed web app covers desktop and mobile before any app-store release.
+
+- Be careful
+
+  - Deep native features: The core of the product needs device features the browser does not expose.
+
+  - Heavy background work: The app has to do heavy work while it is not on screen.
+
+  - App-store presence: Being listed in the app stores is a hard requirement.
+
+Applies
+
+Does not apply
+
+In the three careful cases, plan a native wrapper or a native app next to the PWA.
 
 Static Manifest File
 
-Use this when you already have a `manifest.json` file or want to edit the exact JSON that the browser reads.
+Use this when you already have a `manifest.json` or want to edit the exact JSON the browser reads. First, put the file in `public/`:
+
+Then link it from `.head()` of the root `_layout.tsx`:
+
+Standard keys.
+
+The file is served as is, so write the browser's own snake_case keys such as `short_name` and `start_url`.
+
+A real URL.
+
+`public/manifest.json` is served at `/manifest.json`, so you can open it in the browser to check it.
 
 Layout Manifest Object
 
-Akan can also read a `manifest` export from the root layout. The object is converted into a manifest link for the document head.
+`rootLayout().manifest({...})` keeps the manifest in app code instead of a separate JSON file. Write the keys in camelCase:
 
-Write author-facing keys in camelCase, such as `shortName`, `startUrl`, and `themeColor`.
+camelCase in, snake_case out.
 
-Akan converts them to standard manifest keys like `short_name`, `start_url`, and `theme_color`.
+`shortName`, `startUrl` and `themeColor` reach the browser as the standard `short_name`, `start_url` and `theme_color`, at every depth.
 
-This is convenient when the manifest belongs to app code instead of a standalone JSON file.
+No file to serve.
+
+The object becomes a `<link rel="manifest">` in the head whose `href` is a `data:` URL, so there is no `/manifest.json` to open.
+
+Root layout only.
+
+`.manifest()` is a `rootLayout()` stage, so it goes in the app's (or a base path's) root `_layout.tsx`.
+
+Keys You Can Write
+
+The argument is typed as `WebAppManifest` from `akanjs/client`. Every key is optional.
+
+- name (string): Full app name shown in the install dialog and the app list.
+
+- shortName (string): Short name shown under the home-screen icon.
+
+- description (string): One-line description of the app.
+
+- startUrl (string): The page the installed app opens first.
+
+- scope (string): The URLs that stay inside the installed app window.
+
+- display ("fullscreen" | "standalone" | "minimal-ui" | "browser"): How the window opens; `standalone` hides the browser toolbar.
+
+- displayOverride (string[]): Display modes to try in order before `display`.
+
+- orientation (string): Default screen orientation, such as `portrait`.
+
+- themeColor (string): Color of the title bar and system UI around the app.
+
+- backgroundColor (string): Background of the splash screen shown while the app loads.
+
+- lang (string): Language of text values such as `name` and `description`, for example `ko`.
+
+- dir ("ltr" | "rtl" | "auto"): Text direction of those same text values.
+
+- icons (WebAppManifestIcon[]): App icons; each entry takes `src`, plus optional `sizes`, `type` and `purpose`.
+
+- categories (string[]): Categories that describe the app, such as `business`.
+
+- screenshots (WebAppManifestIcon[]): Images for richer install dialogs, in the same shape as `icons`.
+
+- [key: string] (unknown): Any other member, such as `shortcuts` or `id`, passes through with its keys converted.
 
 Required Assets
 
-Before testing installation, make sure every URL in the manifest is reachable from the deployed app.
+Before testing installation, make sure every URL in the manifest loads on the deployed app. These are the ones to check first:
 
-`/icon-192x192.png` and `/icon-512x512.png` are good first icon sizes for browser install prompts.
+File or key
 
-`startUrl` is the page that opens when the installed app starts.
+- /icon-192x192.png, /icon-512x512.png: Good first sizes for install prompts; Chrome needs at least one icon of 144px or larger.
 
-`scope` limits which URLs belong to the installed app window.
+- startUrl: The page the installed app opens at launch, so it must load on the deployed app.
 
-`display: "standalone"` makes the app open without the normal browser toolbar.
+- scope: Limits which URLs belong to the installed app window.
+
+- display: "standalone": Opens the app without the normal browser toolbar.
 
 Tips
 
-Start with one simple manifest, then add screenshots, categories, or shortcuts after installation works.
+Start simple.
 
-If your app is served under a base path, set `startUrl` and `scope` to that path instead of `/`.
+Ship one minimal manifest first. Add `screenshots`, `categories` or `shortcuts` once installation works.
 
-Use the static JSON file when designers or operators need to review the manifest directly.
+Under a base path.
 
-Use the layout object when you want TypeScript help and app metadata in one place.
+Set `startUrl` and `scope` to that path instead of `/`. A base path's root `_layout.tsx` with no `.manifest()` of its own uses the app root's.
+
+Pick one method.
+
+With both, the page carries two `<link rel="manifest">` tags and the browser reads only the first.
+
+Test over HTTPS.
+
+Browsers offer installation only on HTTPS or localhost. Chrome DevTools → Application → Manifest shows what the browser parsed and why it will not install.
+
+Read next
+
+- Root Layout Stages — Every stage only the root layout takes, next to `.manifest()`.
+
+- Base Paths — How one app serves several services under separate page folders.
+
+- Mobile Setup — Build the same app as a native iOS and Android app with the @akanjs/native runtime.
 
 ## Code Examples
 
@@ -108,57 +230,54 @@ Use the layout object when you want TypeScript help and app metadata in one plac
 ### apps/myapp/page/_layout.tsx
 
 ```ts
-import type { LayoutProps } from "akanjs/client";
+import "./styles.css";
+import { rootLayout } from "akanjs/client";
 
-export const head = (
-  <>
-    <title>My Akan App</title>
-    <link rel="icon" href="/favicon.ico" />
-    <link rel="manifest" href="/manifest.json" />
-  </>
-);
-
-export default function Layout({ children }: LayoutProps) {
-  return <>{children}</>;
-}
+export default rootLayout()
+  .head(
+    <>
+      <title>My Akan App</title>
+      <link rel="icon" href="/favicon.ico" />
+      <link rel="manifest" href="/manifest.json" />
+    </>,
+  )
+  .render(({ children }) => children);
 ```
 
 ### apps/myapp/page/_layout.tsx
 
 ```ts
-import type { LayoutProps, WebAppManifest } from "akanjs/client";
+import "./styles.css";
+import { rootLayout } from "akanjs/client";
 
-export const manifest: WebAppManifest = {
-  name: "My Akan App",
-  shortName: "MyApp",
-  description: "A simple Akan app",
-  startUrl: "/",
-  scope: "/",
-  display: "standalone",
-  orientation: "portrait",
-  themeColor: "#0C1E3E",
-  backgroundColor: "#ffffff",
-  icons: [
-    {
-      src: "/icon-192x192.png",
-      sizes: "192x192",
-      type: "image/png",
-      purpose: "any maskable",
-    },
-    {
-      src: "/icon-512x512.png",
-      sizes: "512x512",
-      type: "image/png",
-      purpose: "any maskable",
-    },
-  ],
-};
-
-export const head = <title>My Akan App</title>;
-
-export default function Layout({ children }: LayoutProps) {
-  return <>{children}</>;
-}
+export default rootLayout()
+  .manifest({
+    name: "My Akan App",
+    shortName: "MyApp",
+    description: "A simple Akan app",
+    startUrl: "/",
+    scope: "/",
+    display: "standalone",
+    orientation: "portrait",
+    themeColor: "#0C1E3E",
+    backgroundColor: "#ffffff",
+    icons: [
+      {
+        src: "/icon-192x192.png",
+        sizes: "192x192",
+        type: "image/png",
+        purpose: "any maskable",
+      },
+      {
+        src: "/icon-512x512.png",
+        sizes: "512x512",
+        type: "image/png",
+        purpose: "any maskable",
+      },
+    ],
+  })
+  .head(<title>My Akan App</title>)
+  .render(({ children }) => children);
 ```
 
 ## Agent Notes

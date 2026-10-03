@@ -38,6 +38,9 @@ export const dictionary = modelDictionary(["en", "ko"])
   }))
   .insight<FileInsight>((t) => ({}))
   .query<FileFilter>((fn) => ({
+    byIds: fn(["By Ids", "Id별 조회"]).arg((t) => ({
+      ids: t(["Ids", "Id"]).desc(["Ids to search", "Id로 조회"]),
+    })),
     byFilename: fn(["By Filename", "파일명별 조회"]).arg((t) => ({
       filename: t(["Filename", "파일명"]).desc(["Filename to search", "파일명으로 조회"]),
     })),
@@ -54,8 +57,18 @@ export const dictionary = modelDictionary(["en", "ko"])
       "File is being uploaded, but not yet created",
       "파일이 업로드중이며 아직 생성되지 않았습니다",
     ]),
+    failed: t(["Failed", "실패"]).desc([
+      "The upload stopped before it finished; upload the file again",
+      "업로드가 끝나기 전에 멈췄습니다. 파일을 다시 올려야 합니다",
+    ]),
   }))
-  .slice<FileSlice>((fn) => ({}))
+  .slice<FileSlice>((fn) => ({
+    inIds: fn(["In Ids", "Id별 조회"])
+      .desc(["Files in ids", "Id에 해당하는 파일"])
+      .arg((t) => ({
+        ids: t(["Ids", "Id"]).desc(["Ids to search", "Id로 조회"]),
+      })),
+  }))
   .endpoint<FileEndpoint>((fn) => ({
     addFiles: fn(["Add Files", "파일 추가"])
       .desc(["Add files to the database", "데이터베이스에 파일 추가"])
@@ -91,4 +104,5 @@ export const dictionary = modelDictionary(["en", "ko"])
       "파일 스트림과 파일 메타의 수가 일치하지 않습니다",
     ],
     cloudPathNotFound: ["Cloud path is not found", "클라우드 경로를 찾을 수 없습니다"],
+    fileReadFailed: ["Failed to read the file data of {filename}", "{filename} 파일 데이터를 읽지 못했습니다"],
   });

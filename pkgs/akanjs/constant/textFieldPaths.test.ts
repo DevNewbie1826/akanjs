@@ -61,8 +61,7 @@ describe("TextFieldPaths", () => {
   });
 
   test("rejects an indexed child under a secret or hidden parent", () => {
-    // `_doc` stores a secret in plaintext, so the mirror would publish `noti.label` even though `noti` itself is
-    // never serialised to a client. Checking only the leaf field leaves that whole subtree open.
+    // `_doc` stores a secret in plaintext, so the mirror would publish `noti.label` though `noti` never leaves.
     expect(() => via((f) => ({ noti: f.secret(NotiInput) }))).toThrow(
       'Text field "noti.label" is under a secret field',
     );
@@ -106,10 +105,13 @@ describe("TextFieldPaths", () => {
     expect([...Full.text.desc]).toEqual(["summary"]);
   });
 
+  // The `@ts-expect-error` lines are half the assertion; the throw is the backstop for what the type cannot see.
   test("rejects secret and hidden fields", () => {
+    // @ts-expect-error a secret field takes no text role
     expect(() => via((f) => ({ token: f.secret(String, { text: "title" }) }))).toThrow(
       'Text field "token" is secret and must not be indexed',
     );
+    // @ts-expect-error a hidden field takes no text role
     expect(() => via((f) => ({ token: f.hidden(String, { text: "title" }) }))).toThrow(
       'Text field "token" is hidden and must not be indexed',
     );
@@ -118,6 +120,7 @@ describe("TextFieldPaths", () => {
   test("rejects resolved fields, which never reach _doc", () => {
     const Input = via((f) => ({ headline: f(String) }));
     const Object_ = via(Input, (f) => ({}));
+    // @ts-expect-error a resolved field takes no text role
     expect(() => via(Object_, ["headline"] as const, (r) => ({ derived: r(String, { text: "title" }) }))).toThrow(
       'Text field "derived" is resolved and is absent from _doc',
     );

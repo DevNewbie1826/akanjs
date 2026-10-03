@@ -1,0 +1,105 @@
+import { beforeAll, describe, expect, test } from "bun:test";
+import { createElement } from "react";
+import { renderToReadableStream } from "react-dom/server.browser";
+import { setTestEnv, stubSignal } from "../../store/store.fixture";
+
+let html: string;
+let bridge: InstanceType<typeof import("akanjs/store")["AgentBridge"]>;
+let Dock: typeof import("./Dock")["Dock"];
+
+beforeAll(async () => {
+  setTestEnv("docktest");
+
+  const [{ Int }, { ConstantRegistry, via }, storeFacet, dockFacet] = await Promise.all([
+    import("akanjs/base"),
+    import("akanjs/constant"),
+    import("akanjs/store"),
+    import("./Dock"),
+  ]);
+  const { AgentBridge, store, StoreInstance, StoreRegistry } = storeFacet;
+
+  const DeskInput = via((f) => ({
+    label: f(String),
+    seats: f(Int, { default: 0 }),
+  }));
+  const DeskObject = via(DeskInput, () => ({}));
+  const DeskLight = via(DeskObject, ["label"] as const, () => ({}));
+  const DeskFull = via(DeskObject, DeskLight, () => ({}));
+  const DeskInsight = via(DeskFull, (f) => ({ count: f(Int, { default: 0 }) }));
+  const cnst = ConstantRegistry.buildModel("dockDesk", DeskInput, DeskObject, DeskFull, DeskLight, DeskInsight, {
+    DeskInput,
+    DeskObject,
+    DeskFull,
+    DeskLight,
+    DeskInsight,
+  });
+
+  const serializedSignal = {
+    prefix: "dockDesk",
+    getGuards: ["SignedIn"],
+    cruGuards: ["SignedIn"],
+    endpoint: {},
+    slice: { "": { args: [] } },
+  };
+  const signal = stubSignal("dockDesk", cnst, serializedSignal);
+
+  class DeskStore extends store(signal, () => ({ deskDraft: "" })) {
+    wipeDesk() {
+      this.set({ deskDraft: "" });
+    }
+  }
+  StoreRegistry.register(DeskStore);
+  const instance = new StoreInstance(StoreRegistry.merge("dockRoot", DeskStore));
+  Dock = dockFacet.Dock;
+  bridge = new AgentBridge(instance);
+  instance.retainLive("deskDraft");
+  html = await new Response(await renderToReadableStream(createElement(Dock, { bridge, open: true }))).text();
+});
+
+describe("Agent.Dock", () => {
+  test("renders the state keys a page can read", () => {
+    expect(html).toContain("deskDraft");
+    expect(html).toContain("dockDeskForm");
+  });
+
+  test("the withheld section is empty once the catalogue refuses nothing", () => {
+    const count = html.match(/Withheld<\/span><span[^>]*>(\d+)</)?.[1];
+    expect(count).toBe("0");
+  });
+
+  test("offers no tool the page did not declare", () => {
+    expect(html).not.toContain("wipeDesk");
+    expect(html).not.toContain("setLabelOnDockDesk");
+  });
+
+  test("offers an assemble preview of the turn context", () => {
+    expect(html).toContain("Assemble");
+  });
+
+  test("offers the assemble preview on every env but main, whatever NODE_ENV says", async () => {
+    const previous = process.env.NODE_ENV;
+    process.env.NODE_ENV = "develop";
+    try {
+      const develop = await new Response(
+        await renderToReadableStream(createElement(Dock, { bridge, open: true })),
+      ).text();
+      expect(develop).toContain("Assemble");
+    } finally {
+      process.env.NODE_ENV = previous;
+    }
+  });
+
+  test("renders nothing in production", async () => {
+    const previous = process.env.AKAN_PUBLIC_ENV;
+    process.env.AKAN_PUBLIC_ENV = "main";
+    try {
+      const production = await new Response(
+        await renderToReadableStream(createElement(Dock, { bridge, open: true })),
+      ).text();
+      expect(production).not.toContain("Assemble");
+      expect(production).not.toContain("Agent");
+    } finally {
+      process.env.AKAN_PUBLIC_ENV = previous;
+    }
+  });
+});

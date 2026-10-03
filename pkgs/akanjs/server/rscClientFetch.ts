@@ -5,11 +5,10 @@ import {
   readAkanRscPatchMetadataResponseHeaders,
 } from "./routeState";
 
-type RscNavigate = (href: string, options?: { replace?: boolean; scrollToTop?: boolean }) => Promise<void> | void;
-
 export type RscClientFetchResponseResult =
   | { type: "response"; response: Response }
   | { type: "patch"; response: Response; patch: AkanRscPatchMetadata }
+  | { type: "not-found" }
   | { type: "redirected"; status?: number };
 
 export async function fetchRscNavigationResponse(
@@ -17,7 +16,7 @@ export async function fetchRscNavigationResponse(
   options: {
     buildId?: number;
     currentRouterState: AkanRouterStateV1 | null;
-    navigate?: RscNavigate;
+    navigate?: (href: string, options?: { replace?: boolean; scrollToTop?: boolean }) => Promise<void> | void;
     sendRouterState?: boolean;
     shouldApplyNavigation?: () => boolean;
   },
@@ -40,6 +39,11 @@ export async function fetchRscNavigationResponse(
     const status = statusHeader ? Number(statusHeader) : undefined;
     if (shouldApplyNavigation()) await options.navigate?.(redirect, { replace: method !== "push", scrollToTop: true });
     return { type: "redirected", status };
+  }
+  // A 404 carries `0:null`, a Flight root of null that would commit an empty tree over the document if decoded.
+  if (response.status === 404) {
+    await response.body?.cancel();
+    return { type: "not-found" };
   }
   if (response.headers.get("X-Akan-Rsc-Partial") === "patch") {
     const patch = readAkanRscPatchMetadataResponseHeaders(response.headers);

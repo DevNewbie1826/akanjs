@@ -7,6 +7,19 @@ import type { ReactNode } from "react";
 import { Modal } from "../Modal";
 import View from "./View";
 
+interface ViewToolsProps {
+  modelName: string;
+  closeView: () => void;
+}
+
+// Mounted only by the open modal, so a list of per-row `ViewModal`s publishes the close verb once.
+const ViewTools = ({ modelName, closeView }: ViewToolsProps) => {
+  st.tool(`closeViewOf${capitalize(modelName)}`)
+    .desc(`Close the ${modelName} detail view.`)
+    .exec(closeView);
+  return null;
+};
+
 interface ViewModalProps {
   id: string;
   modal?: string;
@@ -29,7 +42,7 @@ export default function ViewModal({
 }: ViewModalProps) {
   const storeUse = st.use as unknown as { [key: string]: () => unknown };
   const storeDo = st.do as unknown as { [key: string]: (...args: any[]) => void };
-  const { refName, sliceName } = slice;
+  const { refName } = slice;
   const [modelName, ModelName] = [refName, capitalize(refName)];
   const names = {
     model: modelName,
@@ -55,17 +68,15 @@ export default function ViewModal({
     return render;
   };
 
+  const closeView = () => {
+    storeDo[names.resetModel]();
+  };
   return (
-    <Modal
-      open={isModalOpen}
-      onCancel={() => {
-        storeDo[names.resetModel]();
-      }}
-      className={modalClassName}
-      title={<Title />}
-      action={<Action />}
-    >
-      <View className={viewClassName} model={model} modelLoading={modelLoading} render={renderView} />
-    </Modal>
+    <>
+      {isModalOpen ? <ViewTools modelName={modelName} closeView={closeView} /> : null}
+      <Modal open={isModalOpen} onCancel={closeView} className={modalClassName} title={<Title />} action={<Action />}>
+        <View className={viewClassName} model={model} modelLoading={modelLoading} render={renderView} />
+      </Modal>
+    </>
   );
 }

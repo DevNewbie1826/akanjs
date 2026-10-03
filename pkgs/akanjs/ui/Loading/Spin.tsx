@@ -1,22 +1,58 @@
-import { clsx } from "akanjs/client";
+import { cn, usePage } from "akanjs/client";
 import type { ReactNode } from "react";
-import { AiOutlineLoading } from "react-icons/ai";
+import { AiOutlineLoading3Quarters } from "react-icons/ai";
 
 export interface SpinProps {
+  className?: string;
+  /** Replaces the built-in icon; the wrapper spins it, so it needs no `animate-spin` of its own. */
   indicator?: ReactNode;
   isCenter?: boolean;
-  className?: string;
+  /** A named step, or the pixel size the icon is drawn at. */
+  size?: "sm" | "md" | "lg" | number;
+  /** `"current"` inherits the surface's foreground, for a filled surface; a `text-*` in `className` beats any tone. */
+  tone?: "primary" | "current" | "muted";
 }
-export const Spin = ({ indicator, isCenter, className }: SpinProps) => {
+
+const sizeClass = { sm: "text-sm", md: "text-xl", lg: "text-3xl" } as const;
+const toneClass = { primary: "text-primary/70", current: "", muted: "text-muted-foreground" } as const;
+
+// Color and size sit on the wrapper and cascade to the `1em`/`currentColor` icon, so a caller's `className` wins.
+export const Spin = ({ className, indicator, isCenter, size = "md", tone = "primary" }: SpinProps) => (
+  <div
+    className={cn(
+      "inline-block py-1",
+      !indicator && toneClass[tone],
+      typeof size === "string" && sizeClass[size],
+      isCenter && "absolute inset-0 flex size-full items-center justify-center py-0",
+      className,
+    )}
+    style={typeof size === "number" ? { fontSize: size } : undefined}
+  >
+    {indicator ? (
+      <span className="[&>svg]:animate-spin">{indicator}</span>
+    ) : (
+      <AiOutlineLoading3Quarters className="animate-spin" />
+    )}
+  </div>
+);
+
+export interface AreaProps {
+  className?: string;
+  indicator?: ReactNode;
+  children?: ReactNode;
+}
+
+export const Area = ({ className, indicator, children }: AreaProps) => {
+  const { l } = usePage();
   return (
-    <div className={clsx("inline-block py-1", className)}>
-      <div className={isCenter ? "absolute inset-0 flex size-full flex-none items-center justify-center" : ""}>
-        {indicator ? (
-          <div className="[&>svg]:animate-spin">{indicator}</div>
-        ) : (
-          <AiOutlineLoading className="animate-spin text-lg text-primary/60" />
-        )}
-      </div>
+    <div
+      className={cn(
+        "absolute inset-0 flex size-full flex-col items-center justify-center gap-2 rounded-[inherit] bg-background/60 backdrop-blur-sm",
+        className,
+      )}
+    >
+      {indicator ?? <Spin />}
+      <div className="text-foreground/60 text-sm">{children ?? l("base.processing")}</div>
     </div>
   );
 };

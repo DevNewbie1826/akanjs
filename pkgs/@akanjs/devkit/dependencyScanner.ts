@@ -7,6 +7,12 @@ import { FileSys } from "./fileSys";
 import type { PackageJson, TsConfigJson } from "./types";
 
 const testFileRegex = /\.(?:test|spec)\.[cm]?[tj]sx?$/;
+// `__fixtures__` holds deliberately invalid lint-rule samples, whose imports are violations, not dependencies.
+const skipDirs = ["node_modules", "dist", "build", ".git", ".next", "public", "ios", "android", "__fixtures__"];
+const isSkippedPath = (filePath: string) => {
+  const posixPath = filePath.split(path.sep).join("/");
+  return skipDirs.some((dir) => posixPath.includes(`/${dir}/`) || posixPath.startsWith(`${dir}/`));
+};
 const builtinModuleSet = new Set([...builtinModules, ...builtinModules.map((mod) => `node:${mod}`)]);
 const stripShebang = (source: string) => source.replace(/^#!.*(?:\r?\n|$)/, "");
 
@@ -17,10 +23,10 @@ export class TypeScriptDependencyScanner {
   #visitedFiles = new Set<string>();
   readonly #tsTranspiler = new Bun.Transpiler({ loader: "ts" });
   readonly #tsxTranspiler = new Bun.Transpiler({ loader: "tsx" });
-  private readonly directory: string;
-  private readonly rootPackageJson: PackageJson;
-  private readonly ig: ReturnType<typeof ignore>;
-  private readonly workspaceRoot: string;
+  readonly #directory: string;
+  readonly #rootPackageJson: PackageJson;
+  readonly #ig: ReturnType<typeof ignore>;
+  readonly #workspaceRoot: string;
 
   constructor(
     directory: string,
@@ -30,10 +36,10 @@ export class TypeScriptDependencyScanner {
       gitignorePatterns = [],
     }: { workspaceRoot: string; tsconfig: TsConfigJson; rootPackageJson: PackageJson; gitignorePatterns?: string[] },
   ) {
-    this.directory = directory;
-    this.rootPackageJson = rootPackageJson;
-    this.ig = ignore().add(gitignorePatterns);
-    this.workspaceRoot = workspaceRoot;
+    this.#directory = directory;
+    this.#rootPackageJson = rootPackageJson;
+    this.#ig = ignore().add(gitignorePatterns);
+    this.#workspaceRoot = workspaceRoot;
   }
 
   async getMonorepoDependencies(
@@ -41,7 +47,7 @@ export class TypeScriptDependencyScanner {
     { pkgs = [], libs = [] }: { pkgs?: string[]; libs?: string[] } = {},
   ): Promise<{ pkgDeps: string[]; libDeps: string[]; npmDeps: string[]; npmDevDeps: string[] }> {
     const npmSet = new Set(
-      Object.keys({ ...this.rootPackageJson.dependencies, ...this.rootPackageJson.devDependencies }),
+      Object.keys({ ...this.#rootPackageJson.dependencies, ...this.#rootPackageJson.devDependencies }),
     );
     const pkgPathSet = new Set(pkgs);
     const libPathSet = new Set(libs.map((lib) => `@libs/${lib}`));
@@ -68,11 +74,8 @@ export class TypeScriptDependencyScanner {
   ): Promise<{ npmDeps: string[]; npmDevDeps: string[]; missingDeps: string[] }> {
     const runtimeDeps = new Set<string>();
     const devDeps = new Set<string>();
-    const sourceFiles = await this.#findTypeScriptFiles(this.directory, {
-      excludeBuildFiles: true,
-      excludeTestFiles: true,
-    });
-    const cssFiles = await this.#findCssFiles(this.directory);
+    const sourceFiles = await this.#findFiles("**/*.{ts,tsx}", { excludeBuildFiles: true, excludeTestFiles: true });
+    const cssFiles = await this.#findFiles("**/*.css");
 
     for (const filePath of sourceFiles) {
       const fileContent = await FileSys.readText(filePath);
@@ -86,7 +89,7 @@ export class TypeScriptDependencyScanner {
       this.#addNormalizedImports(runtimeDeps, this.#extractCssPluginImports(fileContent), projectName);
     }
 
-    const buildFilePath = path.join(this.directory, "build.ts");
+    const buildFilePath = path.join(this.#directory, "build.ts");
     if (await FileSys.fileExists(buildFilePath)) {
       const fileContent = await FileSys.readText(buildFilePath);
       const { imports, typeImports } = this.#extractImports(fileContent, buildFilePath);
@@ -95,7 +98,7 @@ export class TypeScriptDependencyScanner {
 
     for (const dep of runtimeDeps) devDeps.delete(dep);
 
-    const rootDeps = { ...this.rootPackageJson.dependencies, ...this.rootPackageJson.devDependencies };
+    const rootDeps = { ...this.#rootPackageJson.dependencies, ...this.#rootPackageJson.devDependencies };
     const missingDeps: string[] = [];
     for (const dep of [...runtimeDeps, ...devDeps]) {
       if (rootDeps[dep] || (await this.#hasWorkspacePackage(dep))) continue;
@@ -109,7 +112,7 @@ export class TypeScriptDependencyScanner {
   }
 
   async #hasWorkspacePackage(dep: string) {
-    const packageJsonPath = path.join(this.workspaceRoot, "pkgs", dep, "package.json");
+    const packageJsonPath = path.join(this.#workspaceRoot, "pkgs", dep, "package.json");
     if (!(await Bun.file(packageJsonPath).exists())) return false;
     try {
       const packageJson = await FileSys.readJson<PackageJson>(packageJsonPath);
@@ -128,25 +131,19 @@ export class TypeScriptDependencyScanner {
     depSets: DepSets,
     fileDependencies: Map<string, string[]>,
   ): DepSets {
-    const importedDepSets = new Array<Set<string>>(depSets.length);
-    for (let i = 0; i < depSets.length; i++) importedDepSets[i] = new Set<string>();
-    fileDependencies.forEach((imps) => {
-      imps.forEach((imp) => {
-        if (imp.startsWith(".")) return;
-        const moduleName = imp;
-        const moduleNameParts = moduleName.split("/");
-        const subModuleLength = moduleNameParts.length;
-        for (let i = 0; i < subModuleLength; i++) {
-          const importName = moduleNameParts.slice(0, i + 1).join("/");
-          for (let j = 0; j < depSets.length; j++) {
-            if (depSets[j]?.has(importName)) {
-              importedDepSets[j]?.add(importName);
-              return;
-            }
-          }
+    const importedDepSets = depSets.map(() => new Set<string>());
+    for (const imps of fileDependencies.values())
+      for (const imp of imps) {
+        if (imp.startsWith(".")) continue;
+        const parts = imp.split("/");
+        for (let length = 1; length <= parts.length; length++) {
+          const importName = parts.slice(0, length).join("/");
+          const setIndex = depSets.findIndex((depSet) => depSet.has(importName));
+          if (setIndex === -1) continue;
+          importedDepSets[setIndex]?.add(importName);
+          break;
         }
-      });
-    });
+      }
     return importedDepSets as DepSets;
   }
 
@@ -156,50 +153,24 @@ export class TypeScriptDependencyScanner {
     this.#fileTypeDependencies.clear();
     this.#visitedFiles.clear();
 
-    const files = await this.#findTypeScriptFiles(this.directory);
-
-    for (const file of files) await this.#analyzeFile(file, this.directory);
-
+    for (const file of await this.#findFiles("**/*.{ts,tsx}")) await this.#analyzeFile(file, this.#directory);
     return this.#fileDependencies;
   }
 
-  async #findTypeScriptFiles(
-    directory: string,
+  async #findFiles(
+    pattern: string,
     {
       excludeBuildFiles = false,
       excludeTestFiles = false,
     }: { excludeBuildFiles?: boolean; excludeTestFiles?: boolean } = {},
   ): Promise<string[]> {
     const files: string[] = [];
-    const skipDirs = ["node_modules", "dist", "build", ".git", ".next", "public", "ios", "android"];
-
-    const glob = new Bun.Glob("**/*.{ts,tsx}");
-    for await (const filePath of glob.scan({ cwd: directory, onlyFiles: true })) {
-      if (skipDirs.some((dir) => filePath.includes(`/${dir}/`) || filePath.startsWith(`${dir}/`))) continue;
+    for await (const filePath of new Bun.Glob(pattern).scan({ cwd: this.#directory, onlyFiles: true })) {
+      if (isSkippedPath(filePath)) continue;
       if (excludeBuildFiles && filePath === "build.ts") continue;
       if (excludeTestFiles && testFileRegex.test(filePath)) continue;
-
-      const fullPath = path.join(directory, filePath);
-      const relativePath = path.relative(this.workspaceRoot, fullPath);
-      if (this.ig.ignores(relativePath)) continue;
-
-      files.push(fullPath);
-    }
-    return files;
-  }
-
-  async #findCssFiles(directory: string): Promise<string[]> {
-    const files: string[] = [];
-    const skipDirs = ["node_modules", "dist", "build", ".git", ".next", "public", "ios", "android"];
-    const glob = new Bun.Glob("**/*.css");
-    for await (const filePath of glob.scan({ cwd: directory, onlyFiles: true })) {
-      if (skipDirs.some((dir) => filePath.includes(`/${dir}/`) || filePath.startsWith(`${dir}/`))) continue;
-
-      const fullPath = path.join(directory, filePath);
-      const relativePath = path.relative(this.workspaceRoot, fullPath);
-      if (this.ig.ignores(relativePath)) continue;
-
-      files.push(fullPath);
+      const fullPath = path.join(this.#directory, filePath);
+      if (!this.#ig.ignores(path.relative(this.#workspaceRoot, fullPath))) files.push(fullPath);
     }
     return files;
   }
@@ -212,12 +183,8 @@ export class TypeScriptDependencyScanner {
     try {
       const fileContent = await FileSys.readText(filePath);
       const { imports, typeImports } = this.#extractImports(fileContent, filePath);
-
-      // Convert imports to absolute or relative paths
       const resolvedImports = await this.#resolveImports(imports, filePath, baseDir);
       const resolvedTypeImports = await this.#resolveImports(typeImports, filePath, baseDir);
-
-      // Store the dependencies
       const relativePath = path.relative(baseDir, filePath);
       this.#fileDependencies.set(relativePath, [...new Set([...resolvedImports, ...resolvedTypeImports])]);
       this.#fileRuntimeDependencies.set(relativePath, resolvedImports);
@@ -230,12 +197,8 @@ export class TypeScriptDependencyScanner {
   async #resolveImports(imports: string[], filePath: string, baseDir: string): Promise<string[]> {
     return await Promise.all(
       imports.map(async (importPath) => {
-        if (importPath.startsWith(".")) {
-          // Handle relative imports
-          const resolvedPath = `./${path.join(path.relative(baseDir, filePath), importPath)}`;
-          return await this.#ensureExtension(resolvedPath);
-        }
-        return importPath; // Keep package imports as is
+        if (!importPath.startsWith(".")) return importPath;
+        return await this.#ensureExtension(`./${path.join(path.relative(baseDir, filePath), importPath)}`);
       }),
     );
   }
@@ -321,19 +284,10 @@ export class TypeScriptDependencyScanner {
       const projectImports = imports.filter((i) => !i.startsWith("react") && !i.startsWith("@"));
       const externalImports = imports.filter((i) => i.startsWith("react") || i.startsWith("@"));
 
-      if (projectImports.length > 0) {
-        graph += "  Project dependencies:\n";
-        projectImports.forEach((imp) => {
-          graph += `    → ${imp}\n`;
-        });
-      }
-
-      if (externalImports.length > 0) {
-        graph += "  External dependencies:\n";
-        externalImports.forEach((imp) => {
-          graph += `    → ${imp}\n`;
-        });
-      }
+      if (projectImports.length > 0)
+        graph += `  Project dependencies:\n${projectImports.map((imp) => `    → ${imp}\n`).join("")}`;
+      if (externalImports.length > 0)
+        graph += `  External dependencies:\n${externalImports.map((imp) => `    → ${imp}\n`).join("")}`;
 
       graph += "\n";
     }

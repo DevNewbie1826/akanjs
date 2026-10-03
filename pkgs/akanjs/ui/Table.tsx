@@ -1,5 +1,5 @@
 "use client";
-import { clsx } from "akanjs/client";
+import { cn } from "akanjs/client";
 import type { Responsive } from "akanjs/constant";
 import { st } from "akanjs/store";
 import type React from "react";
@@ -11,39 +11,35 @@ import { Pagination, type PaginationProps } from "./Pagination";
 import { createOverridable } from "./UiOverride";
 
 export interface Column {
-  /** Stable column key. Defaults to index when omitted. */
+  /** Defaults to the index. */
   key?: string;
-  /** Header label. */
   title: ReactNode;
-  /** Field name read from each row object. */
+  /** The field read from each row. */
   dataIndex: string;
-  /** Custom cell renderer. */
   render?: (text: any, record: any, idx: number) => React.ReactNode;
-  /** Responsive breakpoints where this column should be visible. */
+  /** Breakpoints the column shows at. */
   responsive?: Responsive["value"][];
 }
 
 export interface TableProps {
-  /** Column definitions. */
   columns: Column[];
-  /** Rows rendered by the table. */
   dataSource: any[];
-  /** Show a centered loading spinner and dim rows. */
+  /** Dims the rows under a centered spinner. */
   loading?: boolean;
-  /** Table density. */
   size?: "small" | "middle";
-  /** Add a border around the table wrapper. */
   bordered?: boolean;
-  /** Pagination config, or false to hide pagination. */
+  /** `false` hides the pager. */
   pagination?: PaginationProps | false;
-  /** Show header always, never, or only at selected responsive breakpoints. */
+  /** An array shows the header only at those breakpoints. */
   showHeader?: boolean | Responsive["value"][];
-  /** Row event factory. */
   onRow?: (record: any, index: number) => { onClick: (() => void) | (() => Promise<boolean>) };
-  /** Row class or class factory. */
   rowClassName?: string | ((record: any, index: number) => string) | undefined;
-  /** Custom row key resolver. */
   rowKey?: (model: any) => string;
+  header?: ReactNode;
+  /** Drawn under the pager. */
+  footer?: ReactNode;
+  empty?: ReactNode;
+  loadingIndicator?: ReactNode;
 }
 
 export const DefaultTable = ({
@@ -57,67 +53,81 @@ export const DefaultTable = ({
   onRow,
   rowClassName,
   rowKey,
+  header,
+  footer,
+  empty,
+  loadingIndicator,
 }: TableProps) => {
-  const sizeClassName = size === "small" ? "table-compact" : "";
-  const loadingClassName = loading ? "opacity-30" : "";
-  const borderedClassName = bordered ? "border border-gray-200 rounded-xl" : "";
-  const responsive = st.use.responsive();
-  const renderedColumns = useMemo(() => {
-    return columns
-      .filter((c) => !c.responsive || c.responsive.includes(responsive))
-      .map((column, idx) => (
-        <th key={idx} className="whitespace-nowrap">
-          {column.title}
-        </th>
-      ));
-  }, [columns, responsive]);
-
-  const renderedRows = useMemo(() => {
-    return dataSource.map((rowData: { [key: string]: any }, rowIndex) => {
-      const renderedCells = columns
-        .filter((c) => !c.responsive || c.responsive.includes(responsive))
-        .map((column, idx) => (
-          <td
-            key={idx}
-            className={clsx(
-              "whitespace-nowrap",
-              rowClassName ? (typeof rowClassName === "string" ? rowClassName : rowClassName(rowData, rowIndex)) : "",
-            )}
-            {...onRow?.(rowData, rowIndex)}
-          >
-            {column.render
-              ? column.render(rowData[column.dataIndex], rowData, rowIndex)
-              : column.dataIndex
-                ? rowData[column.dataIndex]
-                : null}
-          </td>
-        ));
-
-      return <tr key={rowIndex}>{renderedCells}</tr>;
-    });
-  }, [columns, dataSource, responsive]);
+  const responsive = st.use.responsive({ agent: false });
+  const visible = useMemo(
+    () => columns.filter((column) => !column.responsive || column.responsive.includes(responsive)),
+    [columns, responsive],
+  );
+  const withHeader = showHeader === true || (Array.isArray(showHeader) && showHeader.includes(responsive));
 
   return (
-    <div className={clsx("relative w-full", loadingClassName, borderedClassName)}>
-      {loading && (
-        <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2">
-          <AiOutlineLoading3Quarters className="animate-spin text-3xl" />
+    <div className="w-full">
+      {header}
+      <div className="relative">
+        <div
+          className={cn(
+            "scrollbar-thin w-full overflow-x-auto",
+            bordered && "rounded-box border border-border",
+            loading && "opacity-30",
+          )}
+        >
+          <table
+            className={cn("w-full border-collapse text-left text-sm", size === "small" && "[&_td]:py-1 [&_th]:py-1")}
+          >
+            {withHeader ? (
+              <thead className="bg-muted/40">
+                <tr className="border-border border-b">
+                  {visible.map((column, idx) => (
+                    <th
+                      key={column.key ?? idx}
+                      className="whitespace-nowrap px-3 py-2 text-left font-medium text-muted-foreground"
+                    >
+                      {column.title}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+            ) : null}
+            {dataSource.length ? (
+              <tbody>
+                {dataSource.map((rowData: { [key: string]: any }, rowIndex) => (
+                  <tr
+                    key={rowKey?.(rowData) ?? rowIndex}
+                    className={cn(
+                      "border-border border-b transition-colors last:border-b-0 hover:bg-muted/40",
+                      onRow && "cursor-pointer",
+                      typeof rowClassName === "string" ? rowClassName : rowClassName?.(rowData, rowIndex),
+                    )}
+                    {...onRow?.(rowData, rowIndex)}
+                  >
+                    {visible.map((column, idx) => (
+                      <td key={column.key ?? idx} className="whitespace-nowrap px-3 py-2 align-middle">
+                        {column.render
+                          ? column.render(rowData[column.dataIndex], rowData, rowIndex)
+                          : column.dataIndex
+                            ? rowData[column.dataIndex]
+                            : null}
+                      </td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            ) : null}
+          </table>
+          {dataSource.length ? null : (empty ?? <Empty minHeight={160} />)}
         </div>
-      )}
-      <table className={clsx("table w-full", sizeClassName)}>
-        {showHeader === true || (Array.isArray(showHeader) && showHeader.includes(responsive)) ? (
-          <thead className="normal-case">
-            <tr>{renderedColumns}</tr>
-          </thead>
+        {loading ? (
+          <div className="absolute inset-0 flex items-center justify-center">
+            {loadingIndicator ?? <AiOutlineLoading3Quarters className="animate-spin text-3xl text-primary/70" />}
+          </div>
         ) : null}
-        {!!dataSource.length && <tbody>{renderedRows}</tbody>}
-      </table>
-      {!dataSource.length && (
-        <div className="w-full">
-          <Empty />
-        </div>
-      )}
-      {pagination && (
+      </div>
+      {pagination ? (
         <div className="mt-3 flex justify-center">
           <Pagination
             currentPage={pagination.currentPage}
@@ -126,13 +136,10 @@ export const DefaultTable = ({
             itemsPerPage={pagination.itemsPerPage}
           />
         </div>
-      )}
+      ) : null}
+      {footer}
     </div>
   );
 };
 
-/**
- * Data table. Resolves to a route-scoped override when a `page/**\/_overrides.tsx`
- * in the route's ancestry declares one, otherwise renders {@link DefaultTable}.
- */
 export const Table = createOverridable("Table", DefaultTable);

@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import type { BaseEnv } from "akanjs/base";
+import { getDefaultInjectRegistry, getDefaultLiveRegistry } from "akanjs/service";
 import type { DiLifecycle } from "../di/diLifecycle";
 import { DevtoolsRouter, type DevtoolsRouterContext } from "./devtoolsRouter";
 
@@ -10,12 +11,24 @@ const makeEnv = (environment: string): BaseEnv =>
     appName: "devtools",
     environment,
     operationMode: "local",
-    tunnelUsername: "root",
-    tunnelPassword: "akan",
   }) as BaseEnv;
 
-const makeContext = (environment: string): DevtoolsRouterContext => ({
-  di: {} as DiLifecycle,
+const emptyDi = () =>
+  ({
+    live: getDefaultLiveRegistry(),
+    registry: getDefaultInjectRegistry(),
+    modules: {
+      database: new Map(),
+      service: new Map(),
+      scalar: new Map(),
+      adaptor: new Map(),
+      middleware: new Map(),
+    },
+    hierarchy: { adaptorStages: [], serviceStages: [] },
+  }) as unknown as DiLifecycle;
+
+const makeContext = (environment: string, di: DiLifecycle = emptyDi()): DevtoolsRouterContext => ({
+  di,
   env: makeEnv(environment),
   name: "AkanServer",
   serverMode: "all",
@@ -72,11 +85,11 @@ describe("DevtoolsRouter gating", () => {
   });
 
   test("a serializer failure answers 500 instead of crashing the dev server", async () => {
-    const routes = (new DevtoolsRouter(makeContext("local")).createRoutes() ?? {}) as Record<
+    const brokenDi = {} as DiLifecycle;
+    const routes = (new DevtoolsRouter(makeContext("local", brokenDi)).createRoutes() ?? {}) as Record<
       string,
       { GET: (req: Request) => Response }
     >;
-    // `di` is a bare object here, so the signal serializer throws on the first registry access.
     const response = routes["/_akan/signal"].GET(new Request("http://localhost/_akan/signal"));
     expect(response.status).toBe(500);
     expect((await response.json()) as { kind: string }).toMatchObject({ kind: "signal" });

@@ -1,8 +1,8 @@
 "use client";
 import { cnst } from "@libs/util";
 import { GoogleMap, type Libraries, useJsApiLoader } from "@react-google-maps/api";
-import { clsx } from "akanjs/client";
-import { useEffect, useState } from "react";
+import { cn } from "akanjs/client";
+import { type ReactNode, useEffect, useState } from "react";
 
 import { MapViewContext } from "./context";
 
@@ -20,7 +20,7 @@ export interface GoogleProps {
   onLoad?: () => void;
   onMouseMove?: (coordinate: cnst.Coordinate, e: google.maps.MapMouseEvent) => void;
   options?: google.maps.MapOptions;
-  children: any;
+  children: ReactNode;
 }
 const libraries: Libraries = ["core", "maps", "marker"];
 export default function Google({
@@ -78,7 +78,7 @@ export default function Google({
     <MapViewContext.Provider value={{ type: "google" }}>
       <GoogleMap
         id="google-map-container"
-        mapContainerClassName={clsx("h-72 w-full", className)}
+        mapContainerClassName={cn("h-72 w-full", className)}
         onLoad={(mapInstance) => {
           if (map) return;
           setMap(mapInstance);
@@ -129,6 +129,6 @@ export default function Google({
       </GoogleMap>
     </MapViewContext.Provider>
   ) : (
-    <div className={clsx("h-72 w-full", className)}></div>
+    <div className={cn("h-72 w-full", className)}></div>
   );
 }

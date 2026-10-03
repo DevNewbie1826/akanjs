@@ -1,4 +1,4 @@
-import type { BaseEnv } from "akanjs/base";
+import { type BackendEnv, DatabaseModes, getEnv } from "akanjs/base";
 import { Logger } from "akanjs/common";
 import {
   type Adaptor,
@@ -12,37 +12,43 @@ import {
   srv,
   type WebsocketAdaptor,
 } from "akanjs/service";
+import { agent as agentSignal } from "../../signal/agent.signal";
+import { agentTurnConstant, agentTurnDocument } from "../../signal/agentTurn";
 import { Base, BaseEndpoint, BaseInternal } from "../../signal/base.signal";
-import type { Endpoint } from "../../signal/endpoint";
+import type { Endpoint, EndpointCls } from "../../signal/endpoint";
 import type { Internal } from "../../signal/internal";
-import { Logging, type MiddlewareCls } from "../../signal/middleware";
+import { Logging, type MiddlewareCls, Timeout } from "../../signal/middleware";
 import type { ServerSignal, ServerSignalCls } from "../../signal/serverSignal";
 import { SignalRegistry } from "../../signal/signalRegistry";
 import type { AkanLib, DatabaseModule, ScalarModule, ServiceModule } from "../akanLib";
 import { createDefaultAkanOption } from "../akanOption";
 import type { WebProxyRegistration } from "../proxy";
-import { DatabaseResolver, ServiceResolver, SignalResolver } from "../resolver";
+import { CascadeRunner, DatabaseResolver, ServiceResolver, SignalResolver } from "../resolver";
 import type { SignalRoutes, WebsocketRoutes } from "../types";
-import { getPredefinedAdaptor, predefinedAdaptorRole } from "./predefinedAdaptor";
-import { collectAdaptors, resolveAdaptorHierarchy } from "./resolveAdaptorHierarchy";
-import { resolveServiceHierarchy } from "./resolveServiceHierarchy";
+import { collectPredefinedDependencies, getPredefinedAdaptor, predefinedAdaptorRole } from "./predefinedAdaptor";
+import { collectAdaptors, resolveAdaptorHierarchy, resolveServiceHierarchy } from "./resolveHierarchy";
 import {
+  assertUniqueRegistrations,
   type DiModuleCandidate,
+  getModuleCascadeRefNames,
   getModuleDependencyRefNames,
   isDestroyableUse,
   normalizeAdaptorRefName,
   normalizeServiceRefName,
   normalizeSignalRefName,
+  type Registration,
   reasonMessage,
   runStage,
-  toError,
+  throwStageFailures,
 } from "./utils";
 
-/**
- * Owns the app's DI container state (registry + live maps + init order) and
- * encapsulates every init / destroy step. `AkanServer` delegates to this so the
- * top-level class can focus on HTTP / WS wiring and process lifecycle.
- */
+export interface DiLifecycleProps {
+  env: BackendEnv;
+  modules?: string[];
+  disableModules?: string[];
+  disableLibs?: string[];
+}
+
 export class DiLifecycle {
   readonly logger: Logger = new Logger("DiLifecycle");
   readonly registry = getDefaultInjectRegistry();
@@ -51,7 +57,7 @@ export class DiLifecycle {
     adaptorStages: [] as string[][],
     serviceStages: [] as string[][],
   };
-  readonly #env: BaseEnv;
+  readonly #env: BackendEnv;
   readonly #libs: AkanLib[];
   readonly #database = new Map<string, DatabaseModule>();
   readonly #service = new Map<string, ServiceModule>();
@@ -59,12 +65,10 @@ export class DiLifecycle {
   readonly #adaptor = new Map<string, AdaptorCls>();
   readonly #middleware = new Map<string, MiddlewareCls>();
   readonly webProxies: WebProxyRegistration[] = [];
-  /** refName → why the module was dropped at construction time. Kept for introspection, not control flow. */
   readonly disabledModules = new Map<string, string>();
   readonly #predefinedAdaptor;
-  readonly #predefinedAdaptorRole = predefinedAdaptorRole;
+  readonly #cascade = new CascadeRunner();
 
-  /** Read-only view of the resolved module maps, for tooling that needs to describe the container. */
   get modules(): {
     database: ReadonlyMap<string, DatabaseModule>;
     service: ReadonlyMap<string, ServiceModule>;
@@ -81,15 +85,56 @@ export class DiLifecycle {
     };
   }
 
-  constructor(env: BaseEnv, serverMode: "federation" | "batch" | "all", ...libs: AkanLib[]) {
+  #allModules(): (ServiceModule | DatabaseModule)[] {
+    return [...this.#service.values(), ...this.#database.values()];
+  }
+
+  // Fails the boot with what to fix, instead of an import error inside an adaptor's init.
+  static #databaseMode() {
+    const { environment, operationMode } = getEnv();
+    const mode = DatabaseModes.resolve({
+      requested: process.env.AKAN_DATABASE_MODE,
+      declared: process.env.AKAN_DATABASE_MODES,
+      local: environment === "local" || operationMode === "local",
+    });
+    const missing = DatabaseModes.drivers[mode].filter((driver) => {
+      try {
+        import.meta.resolve(driver);
+        return false;
+      } catch {
+        return true;
+      }
+    });
+    if (missing.length)
+      throw new Error(
+        `The ${mode} database mode imports ${missing.join(", ")}, which this build does not carry. Declare "${mode}" in database.modes of akan.config.ts: akan build bundles the drivers of every declared mode, and akan start installs them.`,
+      );
+    return mode;
+  }
+
+  static #envOn(...names: string[]) {
+    return !names.some((name) => process.env[name] === "false" || process.env[name] === "0");
+  }
+
+  constructor({ env, modules = [], disableModules = [], disableLibs = [] }: DiLifecycleProps, ...libs: AkanLib[]) {
     this.#env = env;
-    this.#predefinedAdaptor = getPredefinedAdaptor(env.databaseMode ?? "single");
+    const databaseMode = DiLifecycle.#databaseMode();
+    this.logger.debug(`Database mode: ${DatabaseModes.describe(databaseMode)}`);
+    // Copied: "single" mode hands back the shared module-scope object, and applyAdaptor overrides mutate per app.
+    this.#predefinedAdaptor = { ...getPredefinedAdaptor(databaseMode) };
     this.#libs = libs;
     this.#service.set("base", {
       service: srv.base,
       signal: SignalRegistry.registerService("base" as const, BaseInternal, BaseEndpoint, Base),
     });
+    // A lib still carrying its own `agent` module wins the refName below (candidates merge last).
+    const frameworkAgent: ServiceModule | null = DiLifecycle.#envOn("AKAN_AGENT", "AKAN_PUBLIC_AGENT")
+      ? { service: srv.agent, signal: agentSignal }
+      : null;
+    if (frameworkAgent) this.#service.set("agent", frameworkAgent);
     this.#middleware.set(Logging.refName, Logging);
+    // Always registered: it gives a declared `timeout` its meaning and stands aside when none is declared.
+    this.#middleware.set(Timeout.refName, Timeout);
     const defaultOption = createDefaultAkanOption();
     defaultOption.getMiddlewares().forEach((middleware) => {
       this.#middleware.set(middleware.refName, middleware);
@@ -97,22 +142,41 @@ export class DiLifecycle {
     this.webProxies.push(...defaultOption.getWebProxies());
     const databaseCandidates = new Map<string, DiModuleCandidate>();
     const serviceCandidates = new Map<string, DiModuleCandidate>();
+    // Last writer wins like the candidate maps, so disabling a lib never takes a module it did not provide.
+    const moduleLibs = new Map<string, string>();
     libs.forEach((lib) => {
       lib.option.getMiddlewares().forEach((middleware) => {
         this.#middleware.set(middleware.refName, middleware);
       });
+      lib.option.getAdaptorOverrides().forEach(({ role, adaptor }) => {
+        const roleKey = Object.entries(predefinedAdaptorRole).find(([, roleCls]) => roleCls === role)?.[0];
+        if (!roleKey) {
+          this.logger.warn(`applyAdaptor got an unknown role "${role.refName}" — override ignored`);
+          return;
+        }
+        (this.#predefinedAdaptor as Record<string, AdaptorCls>)[roleKey] = adaptor;
+      });
       this.webProxies.push(...lib.option.getWebProxies());
       lib.database.forEach((mod) => {
         databaseCandidates.set(mod.constant.refName, { refName: mod.constant.refName, module: mod });
+        moduleLibs.set(mod.constant.refName, lib.name);
       });
       lib.service.forEach((mod) => {
         serviceCandidates.set(mod.service.srv.refName, { refName: mod.service.srv.refName, module: mod });
+        moduleLibs.set(mod.service.srv.refName, lib.name);
       });
       lib.scalar.forEach((mod) => {
         this.#scalar.set(mod.constant.refName, mod);
       });
     });
-    const disabledModules = this.#resolveDisabledModules(databaseCandidates, serviceCandidates);
+    const disabledModules = this.#resolveDisabledModules({
+      databaseCandidates,
+      serviceCandidates,
+      modules,
+      disableModules,
+      disableLibs,
+      moduleLibs,
+    });
     databaseCandidates.forEach(({ refName, module }) => {
       if (disabledModules.has(refName)) return;
       this.#database.set(refName, module as DatabaseModule);
@@ -121,29 +185,76 @@ export class DiLifecycle {
       if (disabledModules.has(refName)) return;
       this.#service.set(refName, module as ServiceModule);
     });
-    this.#database.forEach((mod) => {
-      const databaseAdaptor = DatabaseResolver.resolveDatabase(mod.constant, mod.database);
-      this.#adaptor.set(databaseAdaptor.refName, databaseAdaptor);
-    });
-    const services = [
-      ...[...this.#service.values()].map((mod) => mod.service.srv),
-      ...[...this.#database.values()].map((mod) => mod.service.srv),
-    ];
-    for (const adaptor of collectAdaptors(services)) {
+    if (frameworkAgent && this.#service.get("agent") !== frameworkAgent)
+      this.logger.info("agent relay is provided by a lib module — the framework's is skipped");
+    if (!this.#scalar.has("agentTurn"))
+      this.#scalar.set("agentTurn", { constant: agentTurnConstant, database: agentTurnDocument });
+    const adaptorClaims = new Map<string, AdaptorCls>();
+    const adaptorRegistrations: Registration[] = [];
+    const claimAdaptor = (adaptorCls: AdaptorCls, owner: string) => {
+      const claimed = adaptorClaims.get(adaptorCls.refName);
+      if (claimed === adaptorCls) return;
+      if (!claimed) adaptorClaims.set(adaptorCls.refName, adaptorCls);
+      adaptorRegistrations.push({ key: adaptorCls.refName, owner });
+    };
+    for (const [role, adaptorCls] of Object.entries(this.#predefinedAdaptor))
+      claimAdaptor(adaptorCls, `predefined adaptor "${role}"`);
+    for (const adaptor of collectPredefinedDependencies(this.#predefinedAdaptor)) {
       this.#adaptor.set(adaptor.refName, adaptor);
+      claimAdaptor(adaptor, "a predefined adaptor's dependency");
     }
+    this.#database.forEach((mod) => {
+      const { adaptor, schema } = DatabaseResolver.resolveDatabase(mod.constant, mod.database);
+      this.#adaptor.set(adaptor.refName, adaptor);
+      claimAdaptor(adaptor, `database module "${mod.constant.refName}"`);
+      this.#cascade.register(mod.constant, schema, mod.service.srv);
+    });
+    for (const service of this.#allModules().map((mod) => mod.service.srv)) {
+      for (const adaptor of collectAdaptors([service])) {
+        this.#adaptor.set(adaptor.refName, adaptor);
+        claimAdaptor(adaptor, `service "${service.refName}"`);
+      }
+    }
+    assertUniqueRegistrations("adaptor", adaptorRegistrations);
   }
 
-  #resolveDisabledModules(
-    databaseCandidates: Map<string, DiModuleCandidate>,
-    serviceCandidates: Map<string, DiModuleCandidate>,
-  ) {
+  #resolveDisabledModules({
+    databaseCandidates,
+    serviceCandidates,
+    modules,
+    disableModules,
+    disableLibs,
+    moduleLibs,
+  }: {
+    databaseCandidates: Map<string, DiModuleCandidate>;
+    serviceCandidates: Map<string, DiModuleCandidate>;
+    modules: string[];
+    disableModules: string[];
+    disableLibs: string[];
+    moduleLibs: Map<string, string>;
+  }) {
     const candidates = new Map<string, DiModuleCandidate>([...databaseCandidates, ...serviceCandidates]);
     const disabledReasons = new Map<string, string>();
 
     candidates.forEach(({ refName, module }) => {
       if (!module.service.srv.enabled) disabledReasons.set(refName, "service disabled");
     });
+
+    // Applied over the enabled set rather than beside it: naming a module the workspace disabled does not enable it.
+    const selected = this.#resolveSelectedModules(candidates, modules);
+    if (selected) {
+      candidates.forEach(({ refName }) => {
+        if (!selected.has(refName) && !disabledReasons.has(refName))
+          disabledReasons.set(refName, 'not named by the "modules" option');
+      });
+    }
+
+    const excluded = this.#resolveExcludedModules({ candidates, disableModules, disableLibs, moduleLibs });
+    // Last, so it wins over a selection: `modules` says what a process is for, the exclusions what it must not run.
+    excluded.forEach((reason, refName) => {
+      if (!disabledReasons.has(refName)) disabledReasons.set(refName, reason);
+    });
+    const excludedClosure = new Set(excluded.keys());
 
     let changed = true;
     while (changed) {
@@ -155,6 +266,7 @@ export class DiLifecycle {
           const dependencyReason = disabledReasons.get(dependencyRefName);
           if (!dependencyReason) continue;
           disabledReasons.set(refName, `depends on disabled module "${dependencyRefName}"`);
+          if (excludedClosure.has(dependencyRefName)) excludedClosure.add(refName);
           changed = true;
           break;
         }
@@ -165,11 +277,95 @@ export class DiLifecycle {
       this.disabledModules.set(refName, reason);
       this.logger.verbose(`Skipping disabled module "${refName}": ${reason}`);
     });
+    const cascaded = [...excludedClosure]
+      .filter((refName) => !excluded.has(refName))
+      .sort((a, b) => a.localeCompare(b));
+    if (cascaded.length) {
+      const option = [disableModules.length && "disableModules", disableLibs.length && "disableLibs"]
+        .filter(Boolean)
+        .join("/");
+      this.logger.info(`${option} also dropped ${cascaded.length} dependent module(s): ${cascaded.join(", ")}`);
+    }
     return new Set(disabledReasons.keys());
   }
 
-  /** Run every init stage in dependency order and collect the generated routes. */
+  // Unknown names throw: a typo here would keep a module running silently.
+  #resolveExcludedModules({
+    candidates,
+    disableModules,
+    disableLibs,
+    moduleLibs,
+  }: {
+    candidates: Map<string, DiModuleCandidate>;
+    disableModules: string[];
+    disableLibs: string[];
+    moduleLibs: Map<string, string>;
+  }) {
+    const excluded = new Map<string, string>();
+    if (disableModules.length) {
+      const known = new Set([...candidates.keys(), ...this.#service.keys()]);
+      DiLifecycle.#assertKnown(disableModules, known, "[DI:disableModules] unknown module", "Registered");
+      disableModules.forEach((refName) => {
+        if (candidates.has(refName)) excluded.set(refName, 'named by the "disableModules" option');
+      });
+    }
+    if (disableLibs.length) {
+      // Every mounted lib counts: one carrying only scalars or an `option.ts` is a legitimate name.
+      const known = new Set(this.#libs.map((lib) => lib.name));
+      DiLifecycle.#assertKnown(disableLibs, known, "[DI:disableLibs] unknown lib", "Mounted");
+      const excludedLibs = new Set(disableLibs);
+      moduleLibs.forEach((libName, refName) => {
+        if (!excludedLibs.has(libName) || !candidates.has(refName) || excluded.has(refName)) return;
+        excluded.set(refName, `in lib "${libName}", named by the "disableLibs" option`);
+      });
+    }
+    return excluded;
+  }
+
+  // Unknown names throw: a typo would otherwise boot with the module silently missing.
+  #resolveSelectedModules(candidates: Map<string, DiModuleCandidate>, modules: string[]) {
+    if (!modules.length) return null;
+    const known = new Set([...candidates.keys(), ...this.#service.keys()]);
+    DiLifecycle.#assertKnown(modules, known, "[DI:modules] unknown module", "Registered");
+    const selected = new Set<string>();
+    const pending = modules.filter((refName) => candidates.has(refName));
+    while (pending.length) {
+      const refName = pending.pop();
+      if (!refName || selected.has(refName)) continue;
+      selected.add(refName);
+      const candidate = candidates.get(refName);
+      if (!candidate) continue;
+      const dependencies = [
+        ...getModuleDependencyRefNames(candidate.module),
+        ...getModuleCascadeRefNames(candidate.module),
+      ];
+      for (const dependency of dependencies) if (candidates.has(dependency)) pending.push(dependency);
+    }
+    const mounted = [...selected].sort((a, b) => a.localeCompare(b)).join(", ");
+    this.logger.debug(`Mounting ${selected.size} of ${candidates.size} module(s): ${mounted}`);
+    return selected;
+  }
+
+  static #assertKnown(names: string[], known: Set<string>, unknownLabel: string, knownLabel: string) {
+    const unknown = names.filter((name) => !known.has(name));
+    if (!unknown.length) return;
+    const listed = [...known].sort((a, b) => a.localeCompare(b)).join(", ");
+    throw new Error(`${unknownLabel} ${unknown.map((name) => `"${name}"`).join(", ")}. ${knownLabel}: ${listed}`);
+  }
+
+  // Unwinds on failure: stage siblings that succeeded are live, and a retrying caller would accumulate them.
   async initializeAll(): Promise<SignalRoutes> {
+    try {
+      return await this.#initializeAll();
+    } catch (error) {
+      await this.destroyAll().catch((destroyError: unknown) => {
+        this.logger.warn(`Failed to unwind a partial init: ${reasonMessage(destroyError)}`);
+      });
+      throw error;
+    }
+  }
+
+  async #initializeAll(): Promise<SignalRoutes> {
     await this.#initializeUses();
     await this.#initializeAdaptor();
     await this.#initializeServerSignal();
@@ -185,45 +381,41 @@ export class DiLifecycle {
       wsRoutes: endpointWsRoutes,
       routeOptions: endpointRouteOptions,
     } = await this.#initializeEndpoint();
+    const routes: SignalRoutes["routes"] = {};
+    SignalResolver.mergeHttpRoutes(routes, sliceRoutes);
+    SignalResolver.mergeHttpRoutes(routes, endpointRoutes);
     return {
-      routes: { ...sliceRoutes, ...endpointRoutes },
+      routes,
       wsRoutes: { ...sliceWsRoutes, ...endpointWsRoutes },
       routeOptions: { ...(sliceRouteOptions ?? {}), ...(endpointRouteOptions ?? {}) },
     };
   }
   async destroyAll() {
-    // 1. Run destroy internals (scheduled jobs, etc.)
-    const internalNow = Date.now();
-    this.logger.verbose("Running destroy internals...");
-    try {
-      await this.runSchedulerDestroy();
-    } catch (error) {
-      this.logger.warn(`Error in destroy internals: ${error instanceof Error ? error.message : String(error)}`);
-    }
-    this.logger.verbose(`Destroy internals in ${Date.now() - internalNow}ms`);
-
-    // 2. Destroy services (reverse order)
-    const serviceNow = Date.now();
-    this.logger.verbose("Destroying services...");
-    await this.destroyServices();
-    this.logger.verbose(`Destroy services in ${Date.now() - serviceNow}ms`);
-
-    // 3. Destroy adaptors (reverse order)
-    const adaptorNow = Date.now();
-    this.logger.verbose("Destroying adaptors...");
-    await this.destroyAdaptors();
-    this.logger.verbose(`Destroy adaptors in ${Date.now() - adaptorNow}ms`);
-
-    // 4. Destroy external uses (SDK clients, API wrappers, etc.)
-    const usesNow = Date.now();
-    this.logger.verbose("Destroying uses...");
-    await this.destroyUses();
-    this.logger.verbose(`Destroy uses in ${Date.now() - usesNow}ms`);
+    await this.#timed("Running destroy internals...", "Destroy internals", () =>
+      this.runSchedulerDestroy().catch((error: unknown) => {
+        this.logger.warn(`Error in destroy internals: ${error instanceof Error ? error.message : String(error)}`);
+      }),
+    );
+    await this.#timed("Destroying services...", "Destroy services", () =>
+      this.#destroyStages(this.hierarchy.serviceStages, "service", this.live.service, (service) =>
+        service._libsOnDestroy(),
+      ),
+    );
+    await this.#timed("Destroying adaptors...", "Destroy adaptors", () =>
+      this.#destroyStages(this.hierarchy.adaptorStages, "adaptor", this.live.adaptor, (adaptor) => adaptor.onDestroy()),
+    );
+    await this.#timed("Destroying uses...", "Destroy uses", () => this.destroyUses());
   }
 
-  /** Register scheduled jobs declared on internal signals. */
+  async #timed(startMessage: string, doneLabel: string, run: () => Promise<unknown>) {
+    const now = Date.now();
+    this.logger.verbose(startMessage);
+    await run();
+    this.logger.verbose(`${doneLabel} in ${Date.now() - now}ms`);
+  }
+
   registerSchedule(serverMode: "federation" | "batch" | "all") {
-    const internals = [...this.#service.values(), ...this.#database.values()].map((mod) => mod.signal.internal);
+    const internals = this.#allModules().map((mod) => mod.signal.internal);
     const failures: { label: string; reason: unknown }[] = [];
     for (const internalCls of internals) {
       try {
@@ -234,62 +426,35 @@ export class DiLifecycle {
         failures.push({ label: `schedule:${internalCls.refName}`, reason: err });
       }
     }
-    if (failures.length === 0) return;
-    const summary = failures.map((f) => `  • ${f.label}: ${reasonMessage(f.reason)}`).join("\n");
-    throw new AggregateError(
-      failures.map((f) => toError(f.reason)),
-      `[DI:schedule] ${failures.length}/${internals.length} task(s) failed:\n${summary}`,
-    );
+    throwStageFailures("schedule", failures, internals.length);
   }
 
-  /** Run the framework-level scheduler's onInit hooks after routes come up. */
   async runSchedulerInit() {
-    const scheduler = this.#getScheduler();
-    await scheduler._runInit();
+    await this.#getScheduler()._runInit();
   }
 
-  /** Run the framework-level scheduler's onDestroy hooks during shutdown. */
   async runSchedulerDestroy() {
-    const scheduler = this.#getScheduler();
-    await scheduler._runDestroy();
+    await this.#getScheduler()._runDestroy();
   }
 
-  /** Destroy services in reverse init order. Errors are logged, not thrown. */
-  async destroyServices(): Promise<void> {
-    const reversedStages = [...this.hierarchy.serviceStages].reverse();
-    for (const stage of reversedStages) {
+  async #destroyStages<T extends { logger: Logger }>(
+    stages: string[][],
+    kind: string,
+    live: Map<string, T>,
+    destroy: (instance: T) => unknown,
+  ) {
+    for (const stage of [...stages].reverse()) {
       await Promise.allSettled(
         stage.map(async (refName) => {
-          const service = this.live.service.get(refName);
-          if (!service) return;
+          const instance = live.get(refName);
+          if (!instance) return;
           try {
             const now = Date.now();
-            service.logger.verbose(`${refName} service destroying...`);
-            await service._libsOnDestroy();
-            service.logger.verbose(`${refName} service destroyed in ${Date.now() - now}ms`);
+            instance.logger.verbose(`${refName} ${kind} destroying...`);
+            await destroy(instance);
+            instance.logger.verbose(`${refName} ${kind} destroyed in ${Date.now() - now}ms`);
           } catch (error) {
-            service.logger.warn(`Failed to destroy ${refName} service: ${reasonMessage(error)}`);
-          }
-        }),
-      );
-    }
-  }
-
-  /** Destroy adaptors in reverse init order. Errors are logged, not thrown. */
-  async destroyAdaptors(): Promise<void> {
-    const reversedStages = [...this.hierarchy.adaptorStages].reverse();
-    for (const stage of reversedStages) {
-      await Promise.allSettled(
-        stage.map(async (refName) => {
-          const adaptor = this.live.adaptor.get(refName);
-          if (!adaptor) return;
-          try {
-            const now = Date.now();
-            adaptor.logger.verbose(`${refName} adaptor destroying...`);
-            await adaptor.onDestroy();
-            adaptor.logger.verbose(`${refName} adaptor destroyed in ${Date.now() - now}ms`);
-          } catch (error) {
-            adaptor.logger.warn(`Failed to destroy ${refName} adaptor: ${reasonMessage(error)}`);
+            instance.logger.warn(`Failed to destroy ${refName} ${kind}: ${reasonMessage(error)}`);
           }
         }),
       );
@@ -310,7 +475,7 @@ export class DiLifecycle {
   }
 
   getWebsocketAdaptor(): WebsocketAdaptor | undefined {
-    const adaptorCls = this.registry.adaptorRole.get(this.#predefinedAdaptorRole.websocket);
+    const adaptorCls = this.registry.adaptorRole.get(predefinedAdaptorRole.websocket);
     return adaptorCls ? (this.registry.adaptor.get(adaptorCls) as WebsocketAdaptor | undefined) : undefined;
   }
 
@@ -332,45 +497,51 @@ export class DiLifecycle {
   }
 
   getService<T = Service>(refName: string): T {
-    const serviceRefName = normalizeServiceRefName(refName);
-    const serviceCls = this.registry.serviceCls.get(serviceRefName);
-    if (!serviceCls) throw new Error(`Service "${serviceRefName}" is not registered.`);
-    const service = this.registry.service.get(serviceCls);
-    if (!service) throw new Error(`Service "${serviceRefName}" is not initialized.`);
-    return service as T;
+    const { serviceCls, service } = this.registry;
+    return DiLifecycle.#lookup("Service", normalizeServiceRefName(refName), serviceCls, service) as T;
   }
 
   getSignal<T = ServerSignal>(refName: string): T {
-    const signalRefName = normalizeSignalRefName(refName);
-    const serverSignalCls = this.registry.serverSignalCls.get(signalRefName);
-    if (!serverSignalCls) throw new Error(`Server signal "${signalRefName}" is not registered.`);
-    const serverSignal = this.registry.serverSignal.get(serverSignalCls);
-    if (!serverSignal) throw new Error(`Server signal "${signalRefName}" is not initialized.`);
-    return serverSignal as T;
+    const { serverSignalCls, serverSignal } = this.registry;
+    return DiLifecycle.#lookup("Server signal", normalizeSignalRefName(refName), serverSignalCls, serverSignal) as T;
   }
 
   getAdaptor<T = Adaptor>(refName: string): T {
-    const adaptorRefName = normalizeAdaptorRefName(refName);
-    const adaptorCls = this.registry.adaptorCls.get(adaptorRefName);
-    if (!adaptorCls) throw new Error(`Adaptor "${adaptorRefName}" is not registered.`);
-    const adaptor = this.registry.adaptor.get(adaptorCls);
-    if (!adaptor) throw new Error(`Adaptor "${adaptorRefName}" is not initialized.`);
-    return adaptor as T;
+    const { adaptorCls, adaptor } = this.registry;
+    return DiLifecycle.#lookup("Adaptor", normalizeAdaptorRefName(refName), adaptorCls, adaptor) as T;
+  }
+
+  static #lookup<C, I>(label: string, refName: string, classes: Map<string, C>, instances: Map<C, I>): I {
+    const cls = classes.get(refName);
+    if (!cls) throw new Error(`${label} "${refName}" is not registered.`);
+    const instance = instances.get(cls);
+    if (!instance) throw new Error(`${label} "${refName}" is not initialized.`);
+    return instance;
   }
 
   #getScheduler(): Scheduler {
-    const adaptorCls = this.registry.adaptorRole.get(this.#predefinedAdaptorRole.schedule);
+    const adaptorCls = this.registry.adaptorRole.get(predefinedAdaptorRole.schedule);
     const scheduler = adaptorCls ? this.registry.adaptor.get(adaptorCls) : undefined;
     if (!scheduler) throw new Error("Scheduler is not registered");
     return scheduler as Scheduler;
   }
 
   async #initializeUses() {
-    const uses = Object.assign({}, ...this.#libs.map((lib) => lib.option.getUses(this.#env)));
-    const entries = Object.entries(uses);
+    // `llmOption` is seeded first so the predefined LLM adaptor always resolves its `use`, with or without an app.
+    const entries = [
+      {
+        key: "llmOption",
+        owner: "the framework",
+        value: Object.assign({}, ...this.#libs.map((lib) => lib.option.getLlm(this.#env))) as unknown,
+      },
+      ...this.#libs.flatMap((lib) =>
+        lib.option.getUses(this.#env).map(([key, value]) => ({ key, owner: `lib "${lib.name}"`, value })),
+      ),
+    ];
+    assertUniqueRegistrations("use", entries);
     await runStage(
       "uses",
-      entries.map(([key, value]) => ({
+      entries.map(({ key, value }) => ({
         label: `uses:${key}`,
         run: async () => {
           const useValue = value instanceof Promise ? await value : value;
@@ -386,7 +557,7 @@ export class DiLifecycle {
       ...this.#adaptor.entries(),
     ]);
     for (const [role, adaptorCls] of Object.entries(this.#predefinedAdaptor)) {
-      const roleCls = this.#predefinedAdaptorRole[role as keyof typeof predefinedAdaptorRole];
+      const roleCls = predefinedAdaptorRole[role as keyof typeof predefinedAdaptorRole];
       this.registry.adaptorRole.set(roleCls, adaptorCls);
       this.registry.adaptorCls.set(roleCls.refName, roleCls);
     }
@@ -409,7 +580,7 @@ export class DiLifecycle {
             this.live.adaptor.set(refName, adaptor);
             this.registry.adaptorCls.set(refName, adaptorCls);
             this.registry.adaptor.set(adaptorCls, adaptor);
-            for (const [role, roleAdaptorCls] of Object.entries(this.#predefinedAdaptorRole)) {
+            for (const [role, roleAdaptorCls] of Object.entries(predefinedAdaptorRole)) {
               if (this.#predefinedAdaptor[role as keyof typeof predefinedAdaptorRole] === adaptorCls) {
                 this.registry.adaptor.set(roleAdaptorCls, adaptor);
               }
@@ -422,10 +593,9 @@ export class DiLifecycle {
   }
 
   async #initializeServerSignal() {
-    const serverSignalClsEntries = [
-      ...[...this.#service.values()].map((mod) => [mod.signal.server.refName, mod.signal.server] as const),
-      ...[...this.#database.values()].map((mod) => [mod.signal.server.refName, mod.signal.server] as const),
-    ];
+    const serverSignalClsEntries = this.#allModules().map(
+      (mod) => [mod.signal.server.refName, mod.signal.server] as const,
+    );
     await runStage(
       "serverSignal",
       serverSignalClsEntries.map(([refName, serverSignalCls]) => ({
@@ -442,10 +612,9 @@ export class DiLifecycle {
   }
 
   async #initializeService() {
-    const serviceMap = new Map<string, ServiceCls>([
-      ...[...this.#service.values()].map((mod) => [mod.service.srv.refName, mod.service.srv] as const),
-      ...[...this.#database.values()].map((mod) => [mod.service.srv.refName, mod.service.srv] as const),
-    ]);
+    const serviceMap = new Map<string, ServiceCls>(
+      this.#allModules().map((mod) => [mod.service.srv.refName, mod.service.srv] as const),
+    );
     const { stages: serviceStages } = resolveServiceHierarchy(serviceMap);
     this.hierarchy.serviceStages = serviceStages;
 
@@ -460,14 +629,7 @@ export class DiLifecycle {
             if (serviceCls.type === "database") {
               const databaseModule = this.#database.get(serviceCls.refName);
               if (!databaseModule) throw new Error(`Database "${serviceCls.refName}" is not registered`);
-              ServiceResolver.resolveDatabaseService(
-                databaseModule.constant,
-                databaseModule.database,
-                serviceCls,
-                // Deliberately lazy. Resolving a cascade target eagerly would add an init-order edge between two
-                // services that have no dependency at boot, and a cascade cycle would then fail the whole boot.
-                (refName) => this.getService(refName),
-              );
+              ServiceResolver.resolveDatabaseService(databaseModule.database, serviceCls, this.#cascade);
             }
             const service = new serviceCls();
             await InjectInfo.resolveInjection(service, serviceCls, this.registry, this.#env);
@@ -480,13 +642,14 @@ export class DiLifecycle {
         })),
       );
     }
+    // Sealed after every onInit: remove listeners registered there count, and an unmounted target fails here.
+    this.#cascade.seal((refName: string) => this.getService(refName));
   }
 
   async #initializeInternal() {
-    const internalClsEntries = [
-      ...[...this.#service.values()].map((mod) => [mod.signal.internal.refName, mod.signal.internal] as const),
-      ...[...this.#database.values()].map((mod) => [mod.signal.internal.refName, mod.signal.internal] as const),
-    ];
+    const internalClsEntries = this.#allModules().map(
+      (mod) => [mod.signal.internal.refName, mod.signal.internal] as const,
+    );
     await runStage(
       "internal",
       internalClsEntries.map(([refName, internalCls]) => ({
@@ -509,6 +672,7 @@ export class DiLifecycle {
     const routes: SignalRoutes["routes"] = {};
     const routeOptions: NonNullable<SignalRoutes["routeOptions"]> = {};
     const wsRoutes: WebsocketRoutes = {};
+    const liveKeys: string[] = [];
     await runStage(
       "slice",
       sliceClsEntries.map(([refName, sliceCls]) => ({
@@ -517,33 +681,34 @@ export class DiLifecycle {
           const sliceEndpointCls = SignalResolver.resolveSlice(sliceCls);
           const sliceEndpoint = new sliceEndpointCls();
           await InjectInfo.resolveInjection(sliceEndpoint, sliceEndpointCls, this.registry, this.#env);
-          const {
-            routes: sliceRoutes,
-            wsRoutes: sliceWsRoutes,
-            routeOptions: sliceRouteOptions,
-          } = SignalResolver.resolveEndpoint(sliceEndpointCls, sliceEndpoint, {
-            registry: this.registry,
-            env: this.#env,
-            live: this.live,
-            middleware: this.#middleware,
-          });
-          Object.assign(routes, sliceRoutes);
-          Object.assign(routeOptions, sliceRouteOptions);
-          Object.assign(wsRoutes, sliceWsRoutes);
+          this.#mountEndpoint(sliceEndpointCls, sliceEndpoint, { routes, wsRoutes, routeOptions });
           this.registry.endpointCls.set(refName, sliceEndpointCls);
           this.registry.endpoint.set(sliceEndpointCls, sliceEndpoint);
           this.live.sliceCls.set(sliceCls.baseName, sliceCls);
+          liveKeys.push(...SignalResolver.registerLiveSync(sliceCls, { registry: this.registry, live: this.live }));
         },
       })),
     );
+    if (liveKeys.length) this.logger.verbose(`Live sync: ${liveKeys.length} live slice(s) — ${liveKeys.join(", ")}`);
     return { routes, wsRoutes, routeOptions };
   }
 
+  #mountEndpoint(endpointCls: EndpointCls, endpoint: Endpoint, into: Required<SignalRoutes>) {
+    const resolved = SignalResolver.resolveEndpoint(endpointCls, endpoint, {
+      registry: this.registry,
+      env: this.#env,
+      live: this.live,
+      middleware: this.#middleware,
+    });
+    SignalResolver.mergeHttpRoutes(into.routes, resolved.routes);
+    Object.assign(into.routeOptions, resolved.routeOptions);
+    Object.assign(into.wsRoutes, resolved.wsRoutes);
+  }
+
   async #initializeEndpoint(): Promise<SignalRoutes> {
-    const endpointClsEntries = [
-      ...[...this.#service.values()].map((mod) => [mod.signal.endpoint.refName, mod.signal.endpoint] as const),
-      ...[...this.#database.values()].map((mod) => [mod.signal.endpoint.refName, mod.signal.endpoint] as const),
-    ];
+    const endpointClsEntries = this.#allModules().map(
+      (mod) => [mod.signal.endpoint.refName, mod.signal.endpoint] as const,
+    );
     const routes: SignalRoutes["routes"] = {};
     const routeOptions: NonNullable<SignalRoutes["routeOptions"]> = {};
     const wsRoutes: WebsocketRoutes = {};
@@ -554,19 +719,7 @@ export class DiLifecycle {
         run: async () => {
           const endpoint = new endpointCls();
           await InjectInfo.resolveInjection(endpoint, endpointCls, this.registry, this.#env);
-          const {
-            routes: endpointRoutes,
-            wsRoutes: endpointWsRoutes,
-            routeOptions: endpointRouteOptions,
-          } = SignalResolver.resolveEndpoint(endpointCls, endpoint as Endpoint, {
-            registry: this.registry,
-            env: this.#env,
-            live: this.live,
-            middleware: this.#middleware,
-          });
-          Object.assign(routes, endpointRoutes);
-          Object.assign(routeOptions, endpointRouteOptions);
-          Object.assign(wsRoutes, endpointWsRoutes);
+          this.#mountEndpoint(endpointCls, endpoint as Endpoint, { routes, wsRoutes, routeOptions });
           this.registry.endpointCls.set(refName, endpointCls);
           this.registry.endpoint.set(endpointCls, endpoint);
           this.live.endpointCls.set(endpointCls.baseName, endpointCls);

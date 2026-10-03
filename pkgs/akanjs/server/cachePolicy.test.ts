@@ -1,6 +1,5 @@
 import { describe, expect, test } from "bun:test";
 import {
-  combineMinRevalidate,
   createRouteCacheEntry,
   createRouteCacheKey,
   getClientFacingOrigin,
@@ -10,7 +9,6 @@ import {
   normalizeRouteCacheTtl,
   parsePositiveInt,
   resolveAutoRouteCacheTtl,
-  resolvePublicRouteCacheEntry,
   resolvePublicRouteCacheEntryDecision,
   resolveRouteCacheStoreTtl,
   shouldInvalidateRouteCacheEntry,
@@ -34,12 +32,6 @@ describe("route cache policy helpers", () => {
     expect(resolveAutoRouteCacheTtl({ enabled: "1" })).toBe(30);
     expect(resolveAutoRouteCacheTtl({ enabled: "1", ttl: "60" })).toBe(60);
     expect(resolveAutoRouteCacheTtl({ enabled: "1", ttl: "0" })).toBeNull();
-  });
-
-  test("uses min lifetime semantics for revalidate values", () => {
-    expect(combineMinRevalidate(120, 60, undefined)).toBe(60);
-    expect(combineMinRevalidate(undefined, null)).toBeUndefined();
-    expect(combineMinRevalidate(120, false, 60)).toBe(false);
   });
 
   test("creates a normalized route cache key shared by RSC and HTML caches", () => {
@@ -154,13 +146,13 @@ describe("route cache policy helpers", () => {
       deny: "/docs/private",
     };
 
-    const entry = resolvePublicRouteCacheEntry({ request, url, theme: "dark", env });
+    const entry = resolvePublicRouteCacheEntryDecision({ request, url, theme: "dark", env }).entry;
     expect(entry).toEqual({
       key: createRouteCacheKey({ request, url, theme: "dark" }),
       ttl: 45,
     });
-    expect(resolvePublicRouteCacheEntry({ request, url, theme: "light", env })?.key).not.toBe(entry?.key);
-    expect(resolvePublicRouteCacheEntry({ request, url, env: { ...env, enabled: "0" } })).toBeNull();
+    expect(resolvePublicRouteCacheEntryDecision({ request, url, theme: "light", env }).entry?.key).not.toBe(entry?.key);
+    expect(resolvePublicRouteCacheEntryDecision({ request, url, env: { ...env, enabled: "0" } }).entry).toBeNull();
     expect(
       resolvePublicRouteCacheEntryDecision({
         request,
@@ -193,25 +185,25 @@ describe("route cache policy helpers", () => {
       reason: "path-excluded",
     });
     expect(
-      resolvePublicRouteCacheEntry({
+      resolvePublicRouteCacheEntryDecision({
         request,
         url: new URL("https://example.test/docs/private/secret"),
         env,
-      }),
+      }).entry,
     ).toBeNull();
     expect(
-      resolvePublicRouteCacheEntry({
+      resolvePublicRouteCacheEntryDecision({
         request: new Request(request.url, { headers: { authorization: "Bearer token" } }),
         url,
         env,
-      }),
+      }).entry,
     ).toBeNull();
     expect(
-      resolvePublicRouteCacheEntry({
+      resolvePublicRouteCacheEntryDecision({
         request: new Request(request.url, { headers: { cookie: "session=secret" } }),
         url,
         env,
-      }),
+      }).entry,
     ).toBeNull();
   });
 
@@ -305,6 +297,126 @@ describe("route cache policy helpers", () => {
     cache.set("delete-me", "D", 30);
     expect(cache.delete("delete-me")).toBe(true);
     expect(cache.get("delete-me")).toBeNull();
+  });
+
+  test("evicts an empty-string key like any other once the cache is full", () => {
+    const cache = new LruTtlCache<string>(2);
+    cache.set("", "empty", 30);
+    cache.set("a", "A", 30);
+    cache.set("b", "B", 30);
+    expect(cache.size).toBe(2);
+    expect(cache.get("")).toBeNull();
+    expect(cache.get("b")).toBe("B");
+  });
+
+  test("tracks payload bytes across every path that adds or drops an entry", async () => {
+    const cache = new LruTtlCache<string>(2, { sizeOf: (value) => value.length });
+    expect(cache.byteSize).toBe(0);
+
+    cache.set("a", "1234", 30);
+    cache.set("b", "12345", 30);
+    expect(cache.byteSize).toBe(9);
+
+    cache.set("a", "1", 30);
+    expect(cache.byteSize).toBe(6);
+
+    cache.set("c", "123", 30);
+    expect(cache.size).toBe(2);
+    expect(cache.byteSize).toBe(4);
+
+    cache.delete("c");
+    expect(cache.byteSize).toBe(1);
+
+    cache.set("short", "1234567", 0.001);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(cache.get("short")).toBeNull();
+    expect(cache.byteSize).toBe(1);
+
+    cache.clear();
+    expect(cache.byteSize).toBe(0);
+  });
+
+  test("subtracts bytes for entries dropped by invalidate", () => {
+    const cache = new LruTtlCache<{ routeId: string; html: string }>(5, { sizeOf: (value) => value.html.length });
+    cache.set("a", { routeId: "/docs", html: "1234" }, 30);
+    cache.set("b", { routeId: "/blog", html: "12345" }, 30);
+    expect(cache.byteSize).toBe(9);
+
+    expect(cache.invalidate((_key, value) => value.routeId === "/docs")).toBe(1);
+    expect(cache.byteSize).toBe(5);
+  });
+
+  test("never lets a measurement failure skew the total or fail the write", () => {
+    const cache = new LruTtlCache<string>(4, {
+      sizeOf: (value) => {
+        if (value === "throws") throw new Error("boom");
+        return value === "nan" ? Number.NaN : value.length;
+      },
+    });
+    cache.set("a", "throws", 30);
+    cache.set("b", "nan", 30);
+    cache.set("c", "1234", 30);
+    expect(cache.get("a")).toBe("throws");
+    expect(cache.get("b")).toBe("nan");
+    expect(cache.byteSize).toBe(4);
+
+    cache.clear();
+    expect(cache.byteSize).toBe(0);
+  });
+
+  test("sweeps expired entries so an idle cache shrinks without being read", async () => {
+    const cache = new LruTtlCache<string>(10, { sizeOf: (value) => value.length });
+    cache.set("live", "1234", 30);
+    cache.set("dying", "12345", 0.001);
+    expect(cache.byteSize).toBe(9);
+
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(cache.sweepExpired()).toBe(1);
+    expect(cache.size).toBe(1);
+    expect(cache.byteSize).toBe(4);
+    expect(cache.get("live")).toBe("1234");
+  });
+
+  test("sweeps entries whose expiry does not follow map order", async () => {
+    const cache = new LruTtlCache<string>(10);
+    cache.set("long", "L", 30);
+    cache.set("short", "S", 0.001);
+    cache.get("long");
+
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(cache.sweepExpired()).toBe(1);
+    expect(cache.get("short")).toBeNull();
+    expect(cache.get("long")).toBe("L");
+  });
+
+  test("enforces a total byte ceiling by evicting least recently used entries", () => {
+    const cache = new LruTtlCache<string>(100, { sizeOf: (value) => value.length, maxBytes: 10 });
+    cache.set("a", "1234", 30);
+    cache.set("b", "1234", 30);
+    expect(cache.byteSize).toBe(8);
+
+    cache.set("c", "1234", 30);
+    expect(cache.size).toBe(2);
+    expect(cache.byteSize).toBe(8);
+    expect(cache.get("a")).toBeNull();
+    expect(cache.get("c")).toBe("1234");
+  });
+
+  test("rejects an oversized entry instead of evicting everything else to fit it", () => {
+    const cache = new LruTtlCache<string>(100, { sizeOf: (value) => value.length, maxEntryBytes: 5 });
+    expect(cache.set("small", "1234", 30)).toBe(true);
+    expect(cache.set("huge", "1234567890", 30)).toBe(false);
+    expect(cache.size).toBe(1);
+    expect(cache.byteSize).toBe(4);
+    expect(cache.get("small")).toBe("1234");
+    expect(cache.get("huge")).toBeNull();
+  });
+
+  test("parses byte ceilings from env strings", () => {
+    expect(LruTtlCache.parseByteCeiling("1048576")).toBe(1048576);
+    expect(LruTtlCache.parseByteCeiling(undefined)).toBe(0);
+    expect(LruTtlCache.parseByteCeiling("0")).toBe(0);
+    expect(LruTtlCache.parseByteCeiling("nope", 42)).toBe(42);
   });
 
   test("invalidates matching entries with a predicate", () => {

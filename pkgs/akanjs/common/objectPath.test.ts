@@ -3,6 +3,7 @@ import { describe, expect, test } from "bun:test";
 import dayjs from "dayjs";
 
 import { applyMixins, deepObjectify, getAllPropertyDescriptors, isQueryEqual, objectify, pathGet, pathSet } from ".";
+import { pathGetLoose } from "./objectPath";
 
 class ParentFixture {
   get parentValue() {
@@ -32,6 +33,36 @@ describe("object and path helpers", () => {
     expect(pathGet("user.profile.name", null, ".", "unknown")).toBe("unknown");
   });
 
+  test("reads bracket paths, so what writeOn can write can be read back", () => {
+    const obj = { cutFrames: [{ content: "a wide shot" }, { content: "a slow pan" }] };
+
+    expect(pathGet("cutFrames[1].content", obj)).toBe("a slow pan");
+    expect(pathGet("cutFrames.1.content", obj)).toBe("a slow pan");
+    expect(pathGet(["cutFrames", 1, "content"], obj)).toBe("a slow pan");
+  });
+
+  test("reads map entries, the way pathSet writes them", () => {
+    const obj = { prompts: new Map([["photo", { text: "a cinematic still" }]]) };
+
+    expect(pathGet("prompts.photo.text", obj)).toBe("a cinematic still");
+    expect(pathGet("prompts.missing", obj, ".", "none")).toBe("none");
+  });
+
+  test("a round trip through both spellings lands on one value", () => {
+    const obj: Record<string, unknown> = {};
+
+    pathSet(obj, "cutFrames[2].content", "a wide shot");
+    expect(pathGet("cutFrames.2.content", obj)).toBe("a wide shot");
+    pathSet(obj, "cutFrames.2.content", "a slow pan");
+    expect(pathGet("cutFrames[2].content", obj)).toBe("a slow pan");
+  });
+
+  test("a caller that named its own separator keeps the plain split", () => {
+    const obj = { "a.b": { c: 1 } };
+
+    expect(pathGet("a.b/c", obj, "/")).toBe(1);
+  });
+
   test("sets nested object and array paths in place", () => {
     const obj: Record<string, unknown> = {};
 
@@ -43,6 +74,17 @@ describe("object and path helpers", () => {
       user: { profile: { name: "Akan" } },
       items: [{ id: "first" }],
     });
+  });
+
+  test("sets map entries instead of stray properties", () => {
+    const obj = { prompts: new Map([["photo", "a cinematic still"]]) };
+
+    pathSet(obj, "prompts.photo", "a wide shot");
+    pathSet(obj, ["prompts", "video"], "a slow pan");
+
+    expect(obj.prompts.get("photo")).toBe("a wide shot");
+    expect(obj.prompts.get("video")).toBe("a slow pan");
+    expect(Object.keys(obj.prompts)).toEqual([]);
   });
 
   test("objectifies own data fields and skips functions", () => {
@@ -68,19 +110,39 @@ describe("object and path helpers", () => {
       modelLike,
     };
 
-    expect(deepObjectify(source)).toEqual({
+    expect(deepObjectify(source) as unknown).toEqual({
       date,
       day: dayjs(date),
       nested: [{ id: "a" }],
       modelLike,
     });
-    expect(deepObjectify(source, { serializable: true, convertDate: "string" })).toEqual({
+    expect(deepObjectify(source, { serializable: true, convertDate: "string" }) as unknown).toEqual({
       date: "2025-01-01T00:00:00.000Z",
       day: "2025-01-01T00:00:00.000Z",
       nested: [{ id: "a" }],
       modelLike: { __ModelType__: "User", id: "u1" },
     });
-    expect(deepObjectify(date, { convertDate: "number" })).toBe(date.getTime());
+    expect(deepObjectify(date, { convertDate: "number" }) as unknown).toBe(date.getTime());
+  });
+
+  test("deep objectifies maps and sets into clones, and into plain data when serializable", () => {
+    const prompts = new Map([["photo", { text: "a cinematic still" }]]);
+    const tags = new Set(["hero", "landing"]);
+    const source = { prompts, tags };
+
+    const cloned = deepObjectify(source);
+
+    expect(cloned.prompts).toBeInstanceOf(Map);
+    expect(cloned.prompts).not.toBe(prompts);
+    expect(cloned.prompts.get("photo")).toEqual({ text: "a cinematic still" });
+    expect(cloned.prompts.get("photo")).not.toBe(prompts.get("photo"));
+    expect(cloned.tags).toBeInstanceOf(Set);
+    expect([...cloned.tags]).toEqual(["hero", "landing"]);
+
+    expect(deepObjectify(source, { serializable: true })).toEqual({
+      prompts: { photo: { text: "a cinematic still" } },
+      tags: ["hero", "landing"],
+    } as never);
   });
 
   test("compares query values deeply including dates", () => {
@@ -104,5 +166,42 @@ describe("object and path helpers", () => {
     expect(mixed.childMethod()).toBe("child method");
     expect((mixed as TargetFixture & ParentFixture).parentValue).toBe("parent");
     expect("parentMethod" in mixed).toBe(false);
+  });
+});
+
+const dict = {
+  llmModel: {
+    "gpt-5.6-terra": { t: "GPT 5.6 Terra", desc: { t: "The model is GPT 5.6 Terra" } },
+    "claude-opus-5": { t: "Claude Opus 5" },
+  },
+  user: { signal: { createUser: { arg: { data: { t: "Data" } } } } },
+  ambiguous: { "a.b": { t: "literal" }, a: { b: { t: "nested" } } },
+};
+
+describe("pathGetLoose", () => {
+  test("resolves a segment that contains the separator", () => {
+    expect((pathGetLoose("llmModel.gpt-5.6-terra", dict) as { t: string }).t).toBe("GPT 5.6 Terra");
+  });
+
+  test("keeps resolving past a dotted segment", () => {
+    expect((pathGetLoose("llmModel.gpt-5.6-terra.desc", dict) as { t: string }).t).toBe("The model is GPT 5.6 Terra");
+  });
+
+  test("resolves a plain dotted path unchanged", () => {
+    expect((pathGetLoose("user.signal.createUser.arg.data", dict) as { t: string }).t).toBe("Data");
+  });
+
+  test("takes a segment array", () => {
+    expect((pathGetLoose(["gpt-5", "6-terra"], dict.llmModel) as { t: string }).t).toBe("GPT 5.6 Terra");
+  });
+
+  test("returns the fallback for a missing leaf and a missing branch", () => {
+    expect(pathGetLoose("llmModel.gpt-6", dict, ".", { t: "fb" })).toEqual({ t: "fb" });
+    expect(pathGetLoose("llmModel.gpt-5.6-terra.missing", dict, ".", { t: "fb" })).toEqual({ t: "fb" });
+    expect(pathGetLoose("user.signal", null, ".", { t: "fb" })).toEqual({ t: "fb" });
+  });
+
+  test("prefers the nested path over a literal dotted key, so existing keys resolve as before", () => {
+    expect((pathGetLoose("ambiguous.a.b", dict) as { t: string }).t).toBe("nested");
   });
 });

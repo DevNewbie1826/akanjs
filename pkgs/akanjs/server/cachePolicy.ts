@@ -1,3 +1,4 @@
+import { originFromRequest } from "akanjs/common";
 import { type AkanDynamicUsage, type AkanRequestPolicy, parseCookieHeader } from "akanjs/fetch";
 
 export const DEFAULT_ROUTE_CACHE_TTL_SECONDS = 30;
@@ -82,29 +83,8 @@ export function resolveAutoRouteCacheTtl(input: {
   return normalizeRouteCacheTtl(input.ttl, input.defaultTtl ?? DEFAULT_ROUTE_CACHE_TTL_SECONDS);
 }
 
-export function combineMinRevalidate(...values: Array<number | false | null | undefined>): number | false | undefined {
-  let out: number | undefined;
-  for (const value of values) {
-    if (value === undefined || value === null) continue;
-    if (value === false) return false;
-    out = out === undefined ? value : Math.min(out, value);
-  }
-  return out;
-}
-
 export function getClientFacingOrigin(request: Request, url = new URL(request.url)): string {
-  const forwardedProto = request.headers.get("x-forwarded-proto")?.split(",")[0]?.trim();
-  const forwardedHost = request.headers.get("x-forwarded-host")?.split(",")[0]?.trim();
-  const host = forwardedHost ?? request.headers.get("host")?.split(",")[0]?.trim();
-  const proto = forwardedProto ?? url.protocol.slice(0, -1);
-  if (host && proto) {
-    try {
-      return new URL(`${proto}://${host}`).origin;
-    } catch {
-      /* fall through to parsed request origin */
-    }
-  }
-  return url.origin;
+  return originFromRequest(request.headers, url);
 }
 
 export function isPublicRouteCacheableRequest(request: Request): boolean {
@@ -114,6 +94,9 @@ export function isPublicRouteCacheableRequest(request: Request): boolean {
   if (!cookie) return true;
   return [...parseCookieHeader(cookie).keys()].every((name) => name === "theme");
 }
+
+const isAtOrUnder = (value: string, prefix: string) =>
+  value === prefix || value.startsWith(prefix.endsWith("/") ? prefix : `${prefix}/`);
 
 export function isRouteCachePathAllowed(
   pathname: string,
@@ -125,9 +108,7 @@ export function isRouteCachePathAllowed(
       .map((prefix) => prefix.trim())
       .filter(Boolean);
     if (prefixes.length === 0) return false;
-    return prefixes.some(
-      (prefix) => pathname === prefix || pathname.startsWith(prefix.endsWith("/") ? prefix : `${prefix}/`),
-    );
+    return prefixes.some((prefix) => isAtOrUnder(pathname, prefix));
   };
   if (matches(options.deny)) return false;
   const allow = options.allow ?? "";
@@ -175,10 +156,6 @@ export function resolvePublicRouteCacheEntryDecision(input: PublicRouteCacheEntr
   return { entry: createRouteCacheEntry({ request: input.request, url: input.url, theme: input.theme, ttl }) };
 }
 
-export function resolvePublicRouteCacheEntry(input: PublicRouteCacheEntryInput): RouteCacheEntry | null {
-  return resolvePublicRouteCacheEntryDecision(input).entry;
-}
-
 export function resolveRouteCacheStoreTtl(baseTtl: number, state: RouteCacheRenderState): number | null {
   if (!state.cacheable || state.revalidate === false) return null;
   if (typeof state.revalidate !== "number") return baseTtl;
@@ -195,7 +172,7 @@ export function shouldStoreRouteCache(input: {
   const dynamicUsage = input.dynamicUsage ? { ...input.dynamicUsage } : undefined;
   const routeId = input.policy?.routeId;
   const tags = input.policy ? [...input.policy.tags] : undefined;
-  const revalidate = combineMinRevalidate(input.policy?.revalidate);
+  const revalidate = input.policy?.revalidate;
   if (input.renderControlType) {
     const reason =
       input.renderControlType === "redirect" && input.lateRedirect
@@ -225,30 +202,60 @@ export function shouldInvalidateRouteCacheEntry(
       if (!path) return false;
       const normalized = path.startsWith("/") ? path : `/${path}`;
       return (
-        metadata.pathname === normalized ||
-        metadata.pathname.startsWith(normalized.endsWith("/") ? normalized : `${normalized}/`) ||
-        metadata.routeId === normalized ||
-        Boolean(metadata.routeId?.startsWith(normalized.endsWith("/") ? normalized : `${normalized}/`))
+        isAtOrUnder(metadata.pathname, normalized) || (!!metadata.routeId && isAtOrUnder(metadata.routeId, normalized))
       );
     });
   }
   return false;
 }
 
-export class LruTtlCache<T> {
-  readonly #entries = new Map<string, { value: T; expiresAt: number }>();
+export interface LruTtlCacheOptions<T> {
+  /** Defaults to reporting 0 rather than guessing, so `byteSize` stays honest about not knowing. */
+  sizeOf?: (value: T) => number;
+  /** Total payload ceiling. 0 leaves the cache bounded only by `maxEntries`. */
+  maxBytes?: number;
+  /** An entry over this is not stored at all, rather than evicting everything else to fit it. */
+  maxEntryBytes?: number;
+  /** Idle sweep cadence; without it a cache nobody reads or writes never releases expired entries. 0 disables it. */
+  sweepIntervalMs?: number;
+}
 
-  constructor(readonly maxEntries = 100) {}
+export class LruTtlCache<T> {
+  readonly #entries = new Map<string, { value: T; expiresAt: number; byteLength: number }>();
+  #byteLength = 0;
+  #sweepTimer: ReturnType<typeof setInterval> | null = null;
+  readonly #sizeOf: (value: T) => number;
+  readonly #maxBytes: number;
+  readonly #maxEntryBytes: number;
+
+  constructor(
+    readonly maxEntries = 100,
+    options: LruTtlCacheOptions<T> = {},
+  ) {
+    this.#sizeOf = options.sizeOf ?? (() => 0);
+    this.#maxBytes = options.maxBytes ?? 0;
+    this.#maxEntryBytes = options.maxEntryBytes ?? 0;
+    const sweepIntervalMs = options.sweepIntervalMs ?? 0;
+    if (sweepIntervalMs > 0) {
+      this.#sweepTimer = setInterval(() => this.sweepExpired(), sweepIntervalMs);
+      // Reclaiming an idle cache must never be the reason a process refuses to exit.
+      (this.#sweepTimer as { unref?: () => void }).unref?.();
+    }
+  }
 
   get size(): number {
     return this.#entries.size;
+  }
+
+  get byteSize(): number {
+    return this.#byteLength;
   }
 
   get(key: string): T | null {
     const entry = this.#entries.get(key);
     if (!entry) return null;
     if (entry.expiresAt <= Date.now()) {
-      this.#entries.delete(key);
+      this.#remove(key);
       return null;
     }
     this.#entries.delete(key);
@@ -256,26 +263,49 @@ export class LruTtlCache<T> {
     return entry.value;
   }
 
-  set(key: string, value: T, ttlSeconds: number): void {
-    this.#entries.delete(key);
+  set(key: string, value: T, ttlSeconds: number): boolean {
+    this.#remove(key);
+    const byteLength = LruTtlCache.#measure(this.#sizeOf, value);
+    if (this.#maxEntryBytes > 0 && byteLength > this.#maxEntryBytes) return false;
+    this.sweepExpired();
     const maxEntries = this.maxEntries > 0 ? this.maxEntries : 100;
     while (this.#entries.size >= maxEntries) {
-      const oldest = this.#entries.keys().next().value;
-      if (!oldest) break;
-      this.#entries.delete(oldest);
+      if (!this.#removeOldest()) break;
     }
-    this.#entries.set(key, { value, expiresAt: Date.now() + ttlSeconds * 1000 });
+    while (this.#maxBytes > 0 && this.#entries.size > 0 && this.#byteLength + byteLength > this.#maxBytes) {
+      if (!this.#removeOldest()) break;
+    }
+    this.#entries.set(key, { value, expiresAt: Date.now() + ttlSeconds * 1000, byteLength });
+    this.#byteLength += byteLength;
+    return true;
+  }
+
+  // A full scan on purpose: map order is LRU (`get` reinserts) and TTLs differ, so expiry is not monotonic in it.
+  sweepExpired(now = Date.now()): number {
+    let removed = 0;
+    for (const [key, entry] of this.#entries) {
+      if (entry.expiresAt > now) continue;
+      this.#remove(key);
+      removed += 1;
+    }
+    return removed;
+  }
+
+  dispose(): void {
+    if (!this.#sweepTimer) return;
+    clearInterval(this.#sweepTimer);
+    this.#sweepTimer = null;
   }
 
   delete(key: string): boolean {
-    return this.#entries.delete(key);
+    return this.#remove(key);
   }
 
   invalidate(predicate: (key: string, value: T) => boolean): number {
     let count = 0;
     for (const [key, entry] of this.#entries) {
       if (!predicate(key, entry.value)) continue;
-      this.#entries.delete(key);
+      this.#remove(key);
       count += 1;
     }
     return count;
@@ -283,5 +313,34 @@ export class LruTtlCache<T> {
 
   clear(): void {
     this.#entries.clear();
+    this.#byteLength = 0;
+  }
+
+  static parseByteCeiling(value: string | undefined | null, fallback = 0): number {
+    return parsePositiveInt(value) ?? fallback;
+  }
+
+  #remove(key: string): boolean {
+    const entry = this.#entries.get(key);
+    if (!entry) return false;
+    this.#entries.delete(key);
+    this.#byteLength -= entry.byteLength;
+    return true;
+  }
+
+  #removeOldest(): boolean {
+    const oldest = this.#entries.keys().next().value;
+    if (oldest === undefined) return false;
+    return this.#remove(oldest);
+  }
+
+  /** A measurement must never fail a cache write, and a bad measurement must never skew the total. */
+  static #measure<T>(sizeOf: (value: T) => number, value: T): number {
+    try {
+      const measured = sizeOf(value);
+      return Number.isFinite(measured) && measured > 0 ? measured : 0;
+    } catch {
+      return 0;
+    }
   }
 }

@@ -4,11 +4,6 @@ import type { GuardCls } from "./guard";
 import type { MiddlewareCls } from "./middleware";
 import type { SliceCls } from "./slice";
 
-// --- ServiceModel projection helpers (D1) ---
-// Use these instead of re-typing `NonNullable<SrvModule["cnst"]>["_Full"]` /
-// `SlceCls["srv"]["cnst"]["_Full"]` everywhere. Centralizing the path keeps
-// type derivations consistent and dramatically reduces the amount of text
-// TypeScript has to re-evaluate at each callsite.
 export type CnstOf<S extends ServiceModel> = NonNullable<S["cnst"]>;
 export type DbOf<S extends ServiceModel> = NonNullable<S["db"]>;
 export type SrvOf<S extends ServiceModel> = S["srv"];
@@ -17,9 +12,9 @@ export type SrvMap<S extends ServiceModel> = S["srvMap"];
 
 export type CnstRefName<S extends ServiceModel> = CnstOf<S>["refName"];
 export type CnstInput<S extends ServiceModel> = CnstOf<S>["_Input"];
-export type CnstFull<S extends ServiceModel> = UnCls<CnstOf<S>["full"]> & CnstOf<S>["_Full"];
-export type CnstLight<S extends ServiceModel> = UnCls<CnstOf<S>["light"]> & CnstOf<S>["_Light"];
-export type CnstInsight<S extends ServiceModel> = UnCls<CnstOf<S>["insight"]> & CnstOf<S>["_Insight"];
+export type CnstFull<S extends ServiceModel> = CnstOf<S>["_Full"];
+export type CnstLight<S extends ServiceModel> = CnstOf<S>["_Light"];
+export type CnstInsight<S extends ServiceModel> = CnstOf<S>["_Insight"];
 export type CnstDefault<S extends ServiceModel> = CnstOf<S>["_Default"];
 export type CnstDefaultInput<S extends ServiceModel> = CnstOf<S>["_DefaultInput"];
 export type CnstDefaultState<S extends ServiceModel> = CnstOf<S>["_DefaultState"];
@@ -33,8 +28,6 @@ export type DbDoc<S extends ServiceModel> = DbOf<S>["_Doc"];
 export type DbQuery<S extends ServiceModel> = DbOf<S>["_Query"];
 export type DbSort<S extends ServiceModel> = DbOf<S>["_Sort"];
 
-// Slice-cls shortcuts (common in store/state/action). The branches that
-// include `SlceCls extends SliceCls` preserve `ServiceModel` inference.
 export type SlceSrv<S extends SliceCls> = S["srv"];
 export type SlceCnstRefName<S extends SliceCls> = CnstRefName<SlceSrv<S>>;
 export type SlceCnstInput<S extends SliceCls> = CnstInput<SlceSrv<S>>;
@@ -59,6 +52,8 @@ interface InitOption {
   serverMode?: "federation" | "batch" | "all";
   operationMode?: ("cloud" | "edge" | "local" | (string & {}))[];
   enabled?: boolean;
+  /** Instances booting together take turns and one that waited skips its own run; unset, every instance runs it. */
+  once?: boolean;
 }
 
 interface TimerOption {
@@ -66,6 +61,18 @@ interface TimerOption {
   operationMode?: ("cloud" | "edge" | "local" | (string & {}))[];
   lock?: boolean;
   enabled?: boolean;
+}
+
+export type HttpMutationMethod = "POST" | "PATCH" | "PUT" | "DELETE";
+
+export interface LiveEndpointOption {
+  refName: string;
+  sliceKey: string;
+  sort: string[];
+  fallback: "invalidate" | null;
+  payload: "light" | "id";
+  /** Room arguments that must be empty for the room to exist at all. Enforced here as well as in the client. */
+  pauseOn: string[];
 }
 
 export interface SignalOption<Response = any, Nullable extends boolean = false, _Key = keyof UnCls<Response>>
@@ -76,23 +83,39 @@ export interface SignalOption<Response = any, Nullable extends boolean = false, 
   default?: boolean;
   path?: string;
   serverMode?: "federation" | "batch" | "all";
+  /**
+   * Milliseconds; the server rejects with `base.error.gatewayTimeout` and the client sizes its request budget from
+   * it. Losing the race does not stop the handler, which runs to completion with nobody holding its result.
+   */
   timeout?: number;
   partial?: _Key[] | readonly _Key[];
+  /**
+   * Milliseconds to reuse the answer, keyed by endpoint and arguments; unset caches nothing. Only a `query` with no
+   * internal argument may carry one (those answer per caller), and the lookup runs after the guards.
+   */
   cache?: number;
   guards?: GuardCls[];
   middlewares?: MiddlewareCls[];
   prefix?: false | string;
   globalPrefix?: false;
-  /** Marks this mutation as the framework file-upload endpoint (see resolveFileUploadCapability). */
+  /** HTTP verb of a `mutation`, `POST` unless named; every other endpoint type ignores it. */
+  method?: HttpMutationMethod;
   fileUpload?: boolean;
+  /** `false` keeps it out of the MCP catalogue (default `true`); curation, not authorization — HTTP still serves it. */
+  mcp?: boolean;
+  /**
+   * A slow subscriber of a `pubsub(Binary)`: `"coalesce"` (default) keeps only the newest frame per room, `"queue"`
+   * delivers every frame and grows the send buffer with the slowest subscriber.
+   */
+  backpressure?: "coalesce" | "queue";
+  /** Set by the resolver on the pubsub endpoint it generates for a `.live()` slice, never by hand. */
+  live?: LiveEndpointOption;
 
-  // * ==================== Schedule ==================== * //
   scheduleType?: "init" | "destroy" | "cron" | "interval" | "timeout";
   scheduleCron?: string;
   scheduleTime?: number;
   lock?: boolean;
   enabled?: boolean;
-  // * ==================== Schedule ==================== * //
 }
 
 interface SerializedSignalOption {
@@ -101,9 +124,17 @@ interface SerializedSignalOption {
   prefix?: false | string;
   globalPrefix?: false;
   guards?: string[];
+  method?: HttpMutationMethod;
   fileUpload?: boolean;
+  /** Only ever `false`, when declared. Resolved here because the API explorer holds guard names, not classes. */
+  mcp?: false;
+  /** Only ever `false`, when a guard declares `static agents = false` (a person-only act). */
+  agents?: false;
 }
-export interface SerializedSlice extends SerializedSignalOption {}
+export interface SerializedSlice extends SerializedSignalOption {
+  /** `sort`: keys a subscriber may place a new row under itself (others refetch); `pauseOn` travels only when set. */
+  live?: { sort: string[]; pauseOn?: string[] };
+}
 
 export interface SerializedReturns {
   refName: Exclude<DefaultPrimitiveName, "Map" | "Upload"> | (string & {});
@@ -121,14 +152,21 @@ export interface SerializedArg {
   nullable?: boolean;
   example?: string | number | boolean | Date;
   enum?: string;
+  oneOf?: (string | number)[];
+  /** The model a filter's id argument points at, so a UI can offer a picker. */
+  ref?: string;
 }
 export interface SerializedEndpoint extends SerializedSignalOption {
   type: "query" | "mutation" | "pubsub" | "message";
   returns: SerializedReturns;
+  /** Milliseconds; the client sizes its request budget from it. */
+  timeout?: number;
 }
 export interface SerializedFilter {
   filter: { [key: string]: SerializedArg[] };
   sortKeys: string[];
+  /** The field map behind each sort key, which a live subscriber needs to place a new row itself. */
+  sorts?: { [key: string]: { [path: string]: 1 | -1 } };
 }
 
 export interface SerializedSignal {
@@ -141,13 +179,44 @@ export interface SerializedSignal {
   createGuards?: string[];
   updateGuards?: string[];
   removeGuards?: string[];
+  /** Generated CRUD verbs kept off the agent shelf, carried here because `FetchClient.getBaseEndpoint` synthesizes them. */
+  mcp?: SerializedSignalMcp;
+  /** Which generated CRUD verbs a person-only guard protects, by the same verb map; only the `false` keys travel. */
+  agents?: SerializedSignalMcp;
+}
+
+/** Keyed by generated verb, mirroring the `guards` map `slice()` takes. The root slice's own flag rides on `slice[""]`. */
+export interface SerializedSignalMcp {
+  get?: false;
+  create?: false;
+  update?: false;
+  remove?: false;
 }
 
 export type SignalType = "restapi" | "websocket";
 
 export type WebsocketReqData = { key: string; data: unknown[]; subscribe?: boolean };
 export type WebsocketMessageData = { type: "msg"; key: string; data: object | object[] };
-export type WebsocketSubscribeAck = { type: "sub"; roomId: string; subscribe: boolean };
+/**
+ * `op` is relative to the room, not the database: a row edited out of a filter is `leave` there and `enter` where it
+ * joined, a soft delete is `leave` everywhere, and `invalidate` (no document) means refetch.
+ */
+export interface LiveEventPayload {
+  op: "enter" | "update" | "leave" | "invalidate";
+  id: string;
+  light?: object | null;
+}
+
+/**
+ * `roomId` is the room the server joined, `requestRoomId` the one the client built; they differ only for a live room,
+ * whose id also carries the caller's internal arguments. The client re-keys on the pair.
+ */
+export type WebsocketSubscribeAck = {
+  type: "sub";
+  roomId: string;
+  requestRoomId: string;
+  subscribe: boolean;
+};
 export type WebsocketPublishData = { type: "pub"; roomId: string; data: object | object[] };
 export type WebsocketAuthAck = { type: "auth"; revokedRooms: string[] };
 export type WebsocketResData = WebsocketMessageData | WebsocketSubscribeAck | WebsocketPublishData | WebsocketAuthAck;

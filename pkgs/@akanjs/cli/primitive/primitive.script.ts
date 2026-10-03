@@ -9,9 +9,11 @@ import {
   coerceFieldDefault,
   compactDiagnostics,
   createPrimitiveWriteReport,
+  ensureBaseImport,
   ensureBaseTypeImport,
   ensureConstantTypeImport,
   ensureEnumImport,
+  ensureNamedImport,
   type FactoryParamPlan,
   fieldExpression,
   generatedFilesForSync,
@@ -28,13 +30,11 @@ import {
   insertLightProjectionField,
   insertSignalFactoryEntry,
   insertTemplateField,
-  lowerlize,
   moduleComponentName,
   moduleSourcePaths,
   nextActionsForTarget,
   normalizeFieldType,
   type PrimitiveChangedFile,
-  type PrimitiveGeneratedFile,
   type PrimitiveTargetInput,
   parseValues,
   sourceFile,
@@ -42,8 +42,9 @@ import {
   validationCommandsForTarget,
   viaBuilderParameterName,
   type WorkflowDiagnostic,
+  workflowStatus,
 } from "@akanjs/devkit/workflow";
-import { capitalize } from "akanjs/common";
+import { capitalize, lowerlize } from "akanjs/common";
 import { ModuleScript } from "../module/module.script";
 
 export class PrimitiveScript extends script("primitive", [ModuleScript]) {
@@ -57,28 +58,14 @@ export class PrimitiveScript extends script("primitive", [ModuleScript]) {
 
   async createUi(workspace: Workspace, input: PrimitiveTargetInput & { surface: UiSurface }) {
     const sys = await this.resolveSys(workspace, input.app);
-    if (!sys || !input.module) {
-      return createPrimitiveWriteReport({
-        command: "create-ui",
-        changedFiles: [],
-        generatedFiles: [],
-        validationCommands: [],
-        diagnostics: compactDiagnostics([
-          !sys && {
-            severity: "error",
-            code: "primitive-target-missing",
-            message: "Target app or library was not found.",
-          },
-          !input.module && {
-            severity: "error",
-            code: "primitive-input-missing",
-            message: "Module is required.",
-            input: "module",
-          },
-        ] as WorkflowDiagnostic[]),
-        nextActions: [],
-      });
-    }
+    if (!sys || !input.module)
+      return PrimitiveScript.#refuse(
+        "create-ui",
+        compactDiagnostics([
+          !sys && PrimitiveScript.#targetMissing(),
+          !input.module && PrimitiveScript.#inputMissing("module"),
+        ]),
+      );
     const mod = ModuleExecutor.from(sys, input.module);
     if (input.surface === "view") return await this.moduleScript.createView(mod);
     if (input.surface === "unit") return await this.moduleScript.createUnit(mod);
@@ -99,32 +86,16 @@ export class PrimitiveScript extends script("primitive", [ModuleScript]) {
   }
 
   async addFieldToSources(workspace: Workspace, input: AddFieldInput, { enumValues }: { enumValues: string[] | null }) {
+    const command = enumValues ? "add-enum-field" : "add-field";
     const sys = await this.resolveSys(workspace, input.app);
     const ambiguousNumberTypes = new Set(["number", "numeric"]);
     const normalizedType = input.type ? normalizeFieldType(input.type) : null;
     const diagnostics = compactDiagnostics([
-      !sys && { severity: "error", code: "primitive-target-missing", message: "Target app or library was not found." },
-      !input.module && {
-        severity: "error",
-        code: "primitive-input-missing",
-        message: "Module is required.",
-        input: "module",
-      },
-      !input.field && {
-        severity: "error",
-        code: "primitive-input-missing",
-        message: "Field is required.",
-        input: "field",
-      },
-      !input.type && {
-        severity: "error",
-        code: "primitive-input-missing",
-        message: "Type is required.",
-        input: "type",
-      },
-      enumValues && enumValues.length === 0
-        ? { severity: "error", code: "primitive-input-missing", message: "Enum values are required.", input: "values" }
-        : null,
+      !sys && PrimitiveScript.#targetMissing(),
+      !input.module && PrimitiveScript.#inputMissing("module"),
+      !input.field && PrimitiveScript.#inputMissing("field"),
+      !input.type && PrimitiveScript.#inputMissing("type"),
+      enumValues?.length === 0 && PrimitiveScript.#inputMissing("values", "Enum values are required."),
       input.type && ambiguousNumberTypes.has(input.type.toLowerCase())
         ? {
             severity: "error",
@@ -143,22 +114,8 @@ export class PrimitiveScript extends script("primitive", [ModuleScript]) {
           }
         : null,
     ] as WorkflowDiagnostic[]);
-    if (
-      !sys ||
-      !input.module ||
-      !input.field ||
-      !input.type ||
-      diagnostics.some((diagnostic) => diagnostic.severity === "error")
-    ) {
-      return createPrimitiveWriteReport({
-        command: enumValues ? "add-enum-field" : "add-field",
-        changedFiles: [],
-        generatedFiles: [],
-        validationCommands: [],
-        diagnostics,
-        nextActions: [],
-      });
-    }
+    if (!sys || !input.module || !input.field || !input.type || workflowStatus(diagnostics) === "failed")
+      return PrimitiveScript.#refuse(command, diagnostics);
 
     const moduleClassName = moduleComponentName(input.module);
     const inputClassName = `${moduleClassName}Input`;
@@ -167,32 +124,11 @@ export class PrimitiveScript extends script("primitive", [ModuleScript]) {
     const dictionaryPath = paths.dictionary;
     const templatePath = paths.template;
     const changedFiles: PrimitiveChangedFile[] = [];
-    const generatedFiles: PrimitiveGeneratedFile[] = generatedFilesForSync(sys);
     const [hasConstant, hasDictionary] = await Promise.all([sys.exists(constantPath), sys.exists(dictionaryPath)]);
-    if (!hasConstant) {
-      diagnostics.push({
-        severity: "error",
-        code: "primitive-source-missing",
-        message: `Constant source file was not found: ${constantPath}.`,
-      });
-    }
-    if (!hasDictionary) {
-      diagnostics.push({
-        severity: "error",
-        code: "primitive-source-missing",
-        message: `Dictionary source file was not found: ${dictionaryPath}.`,
-      });
-    }
-    if (diagnostics.some((diagnostic) => diagnostic.severity === "error")) {
-      return createPrimitiveWriteReport({
-        command: enumValues ? "add-enum-field" : "add-field",
-        changedFiles,
-        generatedFiles,
-        validationCommands: validationCommandsForTarget(sys.name),
-        diagnostics,
-        nextActions: nextActionsForTarget(sys.name),
-      });
-    }
+    if (!hasConstant) diagnostics.push(PrimitiveScript.#sourceMissing("Constant", constantPath));
+    if (!hasDictionary) diagnostics.push(PrimitiveScript.#sourceMissing("Dictionary", dictionaryPath));
+    if (workflowStatus(diagnostics) === "failed")
+      return PrimitiveScript.#report(command, sys, changedFiles, diagnostics);
 
     let constantContent = await sys.readFile(constantPath);
     let dictionaryContent = await sys.readFile(dictionaryPath);
@@ -228,6 +164,8 @@ export class PrimitiveScript extends script("primitive", [ModuleScript]) {
       const defaultCoercion = coerceFieldDefault(input.type, input.defaultValue);
       if (defaultCoercion.diagnostic) diagnostics.push(defaultCoercion.diagnostic);
       constantContent = ensureBaseTypeImport(constantContent, input.type);
+      if (input.type === "Date" && defaultCoercion.expression)
+        constantContent = ensureBaseImport(constantContent, "dayjs");
     }
     if (enumValues) {
       const defaultCoercion = coerceFieldDefault("enum", input.defaultValue, { enumValues });
@@ -351,11 +289,7 @@ export class PrimitiveScript extends script("primitive", [ModuleScript]) {
       }
     }
 
-    if (
-      !diagnostics.some((diagnostic) => diagnostic.severity === "error") &&
-      nextConstantContentWithLight &&
-      nextDictionaryContent
-    ) {
+    if (workflowStatus(diagnostics) === "passed" && nextConstantContentWithLight && nextDictionaryContent) {
       await sys.writeFile(constantPath, nextConstantContentWithLight);
       await sys.writeFile(dictionaryPath, nextDictionaryContent);
       changedFiles.push(
@@ -368,14 +302,7 @@ export class PrimitiveScript extends script("primitive", [ModuleScript]) {
       }
     }
 
-    return createPrimitiveWriteReport({
-      command: enumValues ? "add-enum-field" : "add-field",
-      changedFiles,
-      generatedFiles,
-      validationCommands: validationCommandsForTarget(sys.name),
-      diagnostics,
-      nextActions: nextActionsForTarget(sys.name),
-    });
+    return PrimitiveScript.#report(command, sys, changedFiles, diagnostics);
   }
 
   async addMutation(workspace: Workspace, input: AddMutationInput) {
@@ -404,7 +331,7 @@ export class PrimitiveScript extends script("primitive", [ModuleScript]) {
         ? {
             className: `${moduleClassName}Endpoint`,
             entryLine: [
-              `${name}: mutation(Boolean)`,
+              `${name}: mutation(Boolean, { guards: [None] })`,
               `    .exec(async function () {`,
               `      return await this.${serviceRef}Service.${name}();`,
               `    }),`,
@@ -444,7 +371,7 @@ export class PrimitiveScript extends script("primitive", [ModuleScript]) {
           ? {
               className: `${moduleClassName}Slice`,
               entryLine: [
-                `${name}: init()`,
+                `${name}: init({ guards: [None] })`,
                 `    .exec(function () {`,
                 `      return this.${serviceRef}Service.${queryName}();`,
                 `    }),`,
@@ -470,61 +397,21 @@ export class PrimitiveScript extends script("primitive", [ModuleScript]) {
   ) {
     const sys = await this.resolveSys(workspace, spec.app);
     const diagnostics = compactDiagnostics([
-      !sys && { severity: "error", code: "primitive-target-missing", message: "Target app or library was not found." },
-      !spec.module && {
-        severity: "error",
-        code: "primitive-input-missing",
-        message: "Module is required.",
-        input: "module",
-      },
-      !spec.entryName && {
-        severity: "error",
-        code: "primitive-input-missing",
-        message: `${capitalize(spec.requiredInput)} name is required.`,
-        input: spec.requiredInput,
-      },
-    ] as WorkflowDiagnostic[]);
-    if (!sys || !spec.module || !spec.entryName || !spec.serviceMethod || !spec.signal) {
-      return createPrimitiveWriteReport({
-        command: spec.command,
-        changedFiles: [],
-        generatedFiles: [],
-        validationCommands: [],
-        diagnostics,
-        nextActions: [],
-      });
-    }
+      !sys && PrimitiveScript.#targetMissing(),
+      !spec.module && PrimitiveScript.#inputMissing("module"),
+      !spec.entryName &&
+        PrimitiveScript.#inputMissing(spec.requiredInput, `${capitalize(spec.requiredInput)} name is required.`),
+    ]);
+    if (!sys || !spec.module || !spec.entryName || !spec.serviceMethod || !spec.signal)
+      return PrimitiveScript.#refuse(spec.command, diagnostics);
 
-    const paths = moduleSourcePaths(spec.module);
-    const servicePath = paths.service;
-    const signalPath = paths.signal;
+    const { service: servicePath, signal: signalPath } = moduleSourcePaths(spec.module);
     const changedFiles: PrimitiveChangedFile[] = [];
-    const generatedFiles: PrimitiveGeneratedFile[] = generatedFilesForSync(sys);
     const [hasServiceFile, hasSignalFile] = await Promise.all([sys.exists(servicePath), sys.exists(signalPath)]);
-    if (!hasServiceFile) {
-      diagnostics.push({
-        severity: "error",
-        code: "primitive-source-missing",
-        message: `Service source file was not found: ${servicePath}.`,
-      });
-    }
-    if (!hasSignalFile) {
-      diagnostics.push({
-        severity: "error",
-        code: "primitive-source-missing",
-        message: `Signal source file was not found: ${signalPath}.`,
-      });
-    }
-    if (diagnostics.some((diagnostic) => diagnostic.severity === "error")) {
-      return createPrimitiveWriteReport({
-        command: spec.command,
-        changedFiles,
-        generatedFiles,
-        validationCommands: validationCommandsForTarget(sys.name),
-        diagnostics,
-        nextActions: nextActionsForTarget(sys.name),
-      });
-    }
+    if (!hasServiceFile) diagnostics.push(PrimitiveScript.#sourceMissing("Service", servicePath));
+    if (!hasSignalFile) diagnostics.push(PrimitiveScript.#sourceMissing("Signal", signalPath));
+    if (workflowStatus(diagnostics) === "failed")
+      return PrimitiveScript.#report(spec.command, sys, changedFiles, diagnostics);
 
     const serviceClassName = `${moduleComponentName(spec.module)}Service`;
     const serviceContent = await sys.readFile(servicePath);
@@ -550,13 +437,17 @@ export class PrimitiveScript extends script("primitive", [ModuleScript]) {
     const nextServiceContent = serviceMethodExists
       ? serviceContent
       : insertClassMethod(serviceContent, serviceClassName, spec.serviceMethod.block);
-    const nextSignalContent = insertSignalFactoryEntry(
+    // `None` refuses every caller until the author names a guard; a guardless entry would serve unguarded over HTTP.
+    const insertedSignalContent = insertSignalFactoryEntry(
       signalContent,
       spec.signal.className,
       spec.entryName,
       spec.signal.entryLine,
       spec.signal.param,
     );
+    const nextSignalContent = insertedSignalContent
+      ? ensureNamedImport(insertedSignalContent, "akanjs/signal", "None")
+      : insertedSignalContent;
     if (!nextServiceContent) {
       diagnostics.push({
         severity: "error",
@@ -596,7 +487,7 @@ export class PrimitiveScript extends script("primitive", [ModuleScript]) {
       });
     }
 
-    if (!diagnostics.some((diagnostic) => diagnostic.severity === "error") && nextServiceContent && nextSignalContent) {
+    if (workflowStatus(diagnostics) === "passed" && nextServiceContent && nextSignalContent) {
       await sys.writeFile(servicePath, nextServiceContent);
       await sys.writeFile(signalPath, nextSignalContent);
       changedFiles.push(
@@ -605,13 +496,44 @@ export class PrimitiveScript extends script("primitive", [ModuleScript]) {
       );
     }
 
+    return PrimitiveScript.#report(spec.command, sys, changedFiles, diagnostics);
+  }
+
+  static #refuse(command: string, diagnostics: WorkflowDiagnostic[]) {
     return createPrimitiveWriteReport({
-      command: spec.command,
+      command,
+      changedFiles: [],
+      generatedFiles: [],
+      validationCommands: [],
+      diagnostics,
+      nextActions: [],
+    });
+  }
+
+  static #report(command: string, sys: Sys, changedFiles: PrimitiveChangedFile[], diagnostics: WorkflowDiagnostic[]) {
+    return createPrimitiveWriteReport({
+      command,
       changedFiles,
-      generatedFiles,
+      generatedFiles: generatedFilesForSync(sys),
       validationCommands: validationCommandsForTarget(sys.name),
       diagnostics,
       nextActions: nextActionsForTarget(sys.name),
     });
+  }
+
+  static #targetMissing(): WorkflowDiagnostic {
+    return { severity: "error", code: "primitive-target-missing", message: "Target app or library was not found." };
+  }
+
+  static #inputMissing(input: string, message = `${capitalize(input)} is required.`): WorkflowDiagnostic {
+    return { severity: "error", code: "primitive-input-missing", message, input };
+  }
+
+  static #sourceMissing(kind: string, path: string): WorkflowDiagnostic {
+    return {
+      severity: "error",
+      code: "primitive-source-missing",
+      message: `${kind} source file was not found: ${path}.`,
+    };
   }
 }

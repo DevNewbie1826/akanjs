@@ -18,7 +18,6 @@ import {
 } from ".";
 import type { ConstantType, DefaultOf, DocumentModel, QueryOf } from "./types";
 
-/** Runtime registry for Akan constant model metadata, refs, enums, and generated model contracts. */
 export class ConstantRegistry {
   static database = new Map<string, ConstantModel>();
   static scalar = new Map<string, ScalarConstantModel>();
@@ -124,38 +123,14 @@ export class ConstantRegistry {
     lightRef: LightRef,
     insightRef: InsightRef,
     constExports: Record<string, unknown>,
-  ): ConstantModel<
-    T,
-    Input,
-    Obj,
-    Full,
-    Light,
-    Insight,
-    FullFieldObj,
-    Capitalize<T>,
-    DefaultOf<Full>,
-    DefaultOf<Input>,
-    GetStateObject<Full>,
-    GetStateObject<Input>,
-    DefaultOf<Insight>,
-    PurifiedModel<Input>,
-    DocumentModel<Full>,
-    DocumentModel<Input>,
-    QueryOf<DocumentModel<Full>>,
-    GetStateObject<Light>,
-    GetStateObject<Insight>
-  > {
+  ) {
     const modelRefSet = new Set([inputRef, objectRef, fullRef, lightRef, insightRef]);
-    modelRefSet.forEach((modelRef) => {
-      ConstantRegistry.modelRefNameMap.set(modelRef, refName);
-    });
+    for (const modelRef of modelRefSet) ConstantRegistry.modelRefNameMap.set(modelRef, refName);
     inputRef.modelType = "input";
     objectRef.modelType = "object";
     fullRef.modelType = "full";
     lightRef.modelType = "light";
     insightRef.modelType = "insight";
-    type Doc = DocumentModel<Full>;
-    type DocInput = DocumentModel<Input>;
     const cnst: ConstantModel<
       T,
       Input,
@@ -171,8 +146,8 @@ export class ConstantRegistry {
       GetStateObject<Input>,
       DefaultOf<Insight>,
       PurifiedModel<Input>,
-      Doc,
-      DocInput,
+      DocumentModel<Full>,
+      DocumentModel<Input>,
       QueryOf<any>,
       GetStateObject<Light>,
       GetStateObject<Insight>
@@ -202,12 +177,7 @@ export class ConstantRegistry {
       _StateInsight: null as unknown as GetStateObject<Insight>,
     };
     ConstantRegistry.setDatabase(refName, cnst as unknown as ConstantModel);
-    Object.entries(constExports).forEach(([key, value]) => {
-      if ((modelRefSet as Set<unknown>).has(value)) return;
-      else if (typeof value === "function" && isEnum(value as Cls))
-        ConstantRegistry.enum.set(lowerlize(key), value as EnumInstance);
-      else ConstantRegistry.value.set(key, value);
-    });
+    ConstantRegistry.#registerExports(constExports, modelRefSet);
     return cnst;
   }
   static buildScalar<T extends string, Model>(
@@ -224,30 +194,26 @@ export class ConstantRegistry {
       _PurifiedInput: null as unknown as PurifiedModel<Model>,
     };
     ConstantRegistry.setScalar(refName, cnst as unknown as ScalarConstantModel);
-    Object.entries(constExports).forEach(([key, value]) => {
-      if (value === Model) return;
-      else if (typeof value === "function" && isEnum(value as Cls))
+    ConstantRegistry.#registerExports(constExports, new Set([Model]));
+    return cnst;
+  }
+  static #registerExports(constExports: Record<string, unknown>, modelRefs: Set<unknown>) {
+    for (const [key, value] of Object.entries(constExports)) {
+      if (modelRefs.has(value)) continue;
+      if (typeof value === "function" && isEnum(value as Cls))
         ConstantRegistry.enum.set(lowerlize(key), value as EnumInstance);
       else ConstantRegistry.value.set(key, value);
-    });
-    return cnst as unknown as ScalarConstantModel<
-      T,
-      Model,
-      DefaultOf<Model>,
-      DocumentModel<Model>,
-      PurifiedModel<Model>
-    >;
+    }
   }
-  static serialize<Value>(modelRef: Cls | Cls[], value: Value, nullable: boolean = false): Value {
+  static serialize<Value>(modelRef: Cls | Cls[], value: Value, nullable: boolean = false, of?: Cls | Cls[]): Value {
     if (Array.isArray(value) && Array.isArray(modelRef)) {
       const singleModelRef = modelRef.at(0);
       if (!singleModelRef) throw new Error("No model ref found");
       return value.map((v: object) => ConstantRegistry.serialize(singleModelRef as Cls, v)) as unknown as Value;
     } else if (modelRef === Map && value instanceof Map) {
+      if (!of) throw new Error("A Map needs its value type (of) to serialize");
       return Object.fromEntries(
-        [...value.entries()].map(([key, value]: [string, unknown]) => {
-          return [key, ConstantRegistry.serialize(value as Cls, value)];
-        }),
+        [...value.entries()].map(([key, entry]: [string, unknown]) => [key, ConstantRegistry.serialize(of, entry)]),
       ) as unknown as Value;
     } else if (PrimitiveRegistry.has(modelRef as Cls)) {
       return (modelRef as typeof PrimitiveScalar)._serialize(value as PrimitiveValue) as unknown as Value;
@@ -255,17 +221,15 @@ export class ConstantRegistry {
       return serialize(modelRef as ConstantCls, 0, value, "object", { nullable }) as unknown as Value;
     } else throw new Error(`No serialize function for modelRef: ${modelRef}`);
   }
-  static deserialize<Value>(modelRef: Cls | Cls[], value: Value, nullable: boolean = false): Value {
+  static deserialize<Value>(modelRef: Cls | Cls[], value: Value, nullable: boolean = false, of?: Cls | Cls[]): Value {
     if (Array.isArray(value) && Array.isArray(modelRef)) {
       const singleModelRef = modelRef.at(0);
       if (!singleModelRef) throw new Error("No model ref found");
       return value.map((v: object) => ConstantRegistry.deserialize(singleModelRef as Cls, v)) as unknown as Value;
-    } else if (modelRef === Map && value instanceof Map) {
-      return new Map(
-        Object.entries(value).map(([key, value]: [string, unknown]) => {
-          return [key, ConstantRegistry.deserialize(value as Cls, value)];
-        }),
-      ) as unknown as Value;
+    } else if (modelRef === Map && value !== null && typeof value === "object") {
+      if (!of) throw new Error("A Map needs its value type (of) to deserialize");
+      const entries: [string, unknown][] = value instanceof Map ? [...value.entries()] : Object.entries(value);
+      return new Map(entries.map(([key, entry]) => [key, ConstantRegistry.deserialize(of, entry)])) as unknown as Value;
     } else if (PrimitiveRegistry.has(modelRef as Cls)) {
       return (modelRef as typeof PrimitiveScalar)._parse(value as PrimitiveValue) as unknown as Value;
     } else if (ConstantRegistry.modelRefNameMap.has(modelRef as Cls)) {

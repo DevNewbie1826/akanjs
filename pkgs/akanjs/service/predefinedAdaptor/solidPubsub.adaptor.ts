@@ -1,31 +1,42 @@
-import type { BaseEnv, Cls } from "akanjs/base";
+import { getEnv } from "akanjs/base";
 import { adapt } from "../adapt";
 import { sendAkanIpc } from "../ipcTypes";
-import type { WebsocketAdaptor, WsRedisEventHandler, WsSocketData } from "./websocket.adaptor";
+import type {
+  LiveChange,
+  LiveChangeHandler,
+  WebsocketAdaptor,
+  WsRedisEventHandler,
+  WsSocketData,
+} from "./websocket.adaptor";
 
-const getSocketId = (ws: Bun.ServerWebSocket<unknown>, serverId: string) => {
+/** `AppWsData` mints the id at the handshake; the fallback covers a socket upgraded outside the app router. */
+const getSocketId = (ws: Bun.ServerWebSocket<unknown>) => {
   const data = ws.data as WsSocketData;
-  if (!data.socketId) data.socketId = `${serverId}-${Bun.randomUUIDv7()}`;
+  data.socketId ??= Bun.randomUUIDv7();
   return data.socketId;
 };
 
 export class SolidPubSub
   extends adapt("solidPubsub", ({ env }) => ({
-    serverId: env(
-      ({ appName, environment, operationMode }: BaseEnv) =>
-        `${appName}-${environment}-${operationMode}-${process.env.AKAN_REPLICA_IDX ?? "0"}-${process.pid}`,
-    ),
+    serverId: env(() => {
+      const { appName, environment, operationMode } = getEnv();
+      return `${appName}-${environment}-${operationMode}-${process.env.AKAN_REPLICA_IDX ?? "0"}-${process.pid}`;
+    }),
   }))
   implements WebsocketAdaptor
 {
-  readonly #endpointMap = new Map<string, { returnRef: Cls; arrDepth: number }>();
   readonly #socketRooms = new Map<string, Set<string>>();
   #eventHandler: WsRedisEventHandler | null = null;
+  #changeHandler: LiveChangeHandler | null = null;
   readonly #messageHandler = (message: unknown) => {
     if (!message || typeof message !== "object") return;
-    const data = message as { type?: string; roomId?: string; data?: unknown; origin?: string };
+    const data = message as { type?: string; roomId?: string; data?: unknown; origin?: string; change?: LiveChange };
     if (data.type === "pubsub.deliver" && data.roomId && data.origin !== this.serverId) {
       this.#eventHandler?.(data.roomId, data.data);
+      return;
+    }
+    if (data.type === "live.change" && data.change && data.origin !== this.serverId) {
+      this.#changeHandler?.(data.change);
       return;
     }
     if (data.type === "pubsub.snapshot.request") {
@@ -44,11 +55,20 @@ export class SolidPubSub
   override async onDestroy() {
     process.off("message", this.#messageHandler);
     this.#eventHandler = null;
+    this.#changeHandler = null;
     this.#socketRooms.clear();
   }
 
   publish(roomId: string, data: unknown): void {
     sendAkanIpc({ type: "pubsub.publish", roomId, data: data as object | object[], origin: this.serverId });
+  }
+
+  publishChange(change: LiveChange): void {
+    sendAkanIpc({ type: "live.change", change, origin: this.serverId });
+  }
+
+  onChange(handler: LiveChangeHandler): void {
+    this.#changeHandler = handler;
   }
 
   setEventHandler(handler: WsRedisEventHandler): void {
@@ -59,12 +79,8 @@ export class SolidPubSub
     this.#eventHandler = null;
   }
 
-  registerEndpoint(key: string, returnRef: Cls, arrDepth: number): void {
-    this.#endpointMap.set(key, { returnRef, arrDepth });
-  }
-
   async joinRoom(ws: Bun.ServerWebSocket<unknown>, room: string): Promise<void> {
-    const socketId = getSocketId(ws, this.serverId);
+    const socketId = getSocketId(ws);
     const rooms = this.#socketRooms.get(socketId) ?? new Set<string>();
     rooms.add(room);
     this.#socketRooms.set(socketId, rooms);
@@ -72,7 +88,7 @@ export class SolidPubSub
   }
 
   async leaveRoom(ws: Bun.ServerWebSocket<unknown>, room: string): Promise<void> {
-    const socketId = getSocketId(ws, this.serverId);
+    const socketId = getSocketId(ws);
     const rooms = this.#socketRooms.get(socketId);
     rooms?.delete(room);
     if (!rooms || rooms.size === 0) this.#socketRooms.delete(socketId);
@@ -80,7 +96,7 @@ export class SolidPubSub
   }
 
   async leaveAllRooms(ws: Bun.ServerWebSocket<unknown>): Promise<void> {
-    const socketId = getSocketId(ws, this.serverId);
+    const socketId = getSocketId(ws);
     const rooms = this.#socketRooms.get(socketId);
     if (rooms) {
       for (const room of rooms) sendAkanIpc({ type: "pubsub.unsubscribe", roomId: room, socketId, pid: process.pid });
@@ -89,7 +105,7 @@ export class SolidPubSub
   }
 
   async registerSocket(ws: Bun.ServerWebSocket<unknown>): Promise<void> {
-    getSocketId(ws, this.serverId);
+    getSocketId(ws);
   }
 
   async unregisterSocket(ws: Bun.ServerWebSocket<unknown>): Promise<void> {

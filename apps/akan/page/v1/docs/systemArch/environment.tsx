@@ -1,8 +1,9 @@
 import { usePage } from "@apps/akan/client";
 import { Code, Docs } from "@apps/akan/ui";
 import { Scroll } from "@libs/util/ui";
+import { page } from "akanjs/client";
 
-export default function Page() {
+export default page().render(() => {
   const { l } = usePage();
   return (
     <Scroll>
@@ -43,7 +44,7 @@ export default function Page() {
           </div>
         </Docs.Description>
       </Scroll.Slide>
-      <div className="divider" />
+      <div className="my-4 h-px w-full bg-border" />
 
       <Scroll.Slide
         id="root-env"
@@ -106,7 +107,7 @@ NEXT_PUBLIC_CLIENT_PORT=4200`}
           </div>
         </Docs.Description>
       </Scroll.Slide>
-      <div className="divider" />
+      <div className="my-4 h-px w-full bg-border" />
 
       <Scroll.Slide id="base-env" title={l.trans({ en: "baseEnv", ko: "baseEnv" })}>
         <Docs.Title>{l.trans({ en: "baseEnv", ko: "baseEnv" })}</Docs.Title>
@@ -224,7 +225,7 @@ export interface BaseEnv {
           </div>
         </Docs.Description>
       </Scroll.Slide>
-      <div className="divider" />
+      <div className="my-4 h-px w-full bg-border" />
 
       <Scroll.Slide id="base-client-env" title={l.trans({ en: "baseClientEnv", ko: "baseClientEnv" })}>
         <Docs.Title>{l.trans({ en: "baseClientEnv", ko: "baseClientEnv" })}</Docs.Title>
@@ -300,7 +301,7 @@ serverWsUri: "wss://myapp-debug.example.com"`}
           </div>
         </Docs.Description>
       </Scroll.Slide>
-      <div className="divider" />
+      <div className="my-4 h-px w-full bg-border" />
 
       <Scroll.Slide id="usage-examples" title={l.trans({ en: "Usage Examples", ko: "사용 예시" })}>
         <Docs.Title>{l.trans({ en: "Usage Examples", ko: "사용 예시" })}</Docs.Title>
@@ -413,7 +414,7 @@ class Router {
           />
         </Docs.Description>
       </Scroll.Slide>
-      <div className="divider" />
+      <div className="my-4 h-px w-full bg-border" />
 
       <Scroll.Slide id="app-env-config" title={l.trans({ en: "Environment Config", ko: "환경 설정" })}>
         <Docs.Title>{l.trans({ en: "Environment Config", ko: "환경 설정" })}</Docs.Title>
@@ -505,7 +506,7 @@ export const env: ModulesOptions = {
           </div>
         </Docs.Description>
       </Scroll.Slide>
-      <div className="divider" />
+      <div className="my-4 h-px w-full bg-border" />
 
       <Scroll.Slide
         id="best-practices"
@@ -615,9 +616,9 @@ export const env: ModulesOptions = {
           </div>
         </Docs.Description>
       </Scroll.Slide>
-      <div className="divider" />
+      <div className="my-4 h-px w-full bg-border" />
 
-      <Scroll.TitleNavigator className="fixed top-32 right-0 hidden w-[250px] flex-col gap-2 lg:flex" />
+      <Scroll.TitleNavigator className="fixed top-32 right-0 hidden w-[250px] flex-col gap-2 xl:flex" />
     </Scroll>
   );
-}
+});

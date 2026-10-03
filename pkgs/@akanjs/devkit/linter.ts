@@ -3,14 +3,14 @@ import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import chalk from "chalk";
 
-type BiomeSeverity = "error" | "warning" | "information" | "hint";
+export type BiomeSeverity = "error" | "warning" | "information" | "hint";
 
-interface BiomePosition {
+export interface BiomePosition {
   line: number;
   column: number;
 }
 
-interface BiomeDiagnostic {
+export interface BiomeDiagnostic {
   severity: BiomeSeverity;
   message: string;
   category?: string;
@@ -21,7 +21,7 @@ interface BiomeDiagnostic {
   };
 }
 
-interface BiomeReport {
+export interface BiomeReport {
   summary?: {
     changed?: number;
     errors?: number;
@@ -58,19 +58,85 @@ interface LintResponse {
   warnings: LintMessage[];
 }
 
+// Biome mixes config and IO diagnostics into the report stream, and that text can carry braces of its own, so every
+// `{` is tried as a start (string literals skipped) and the first candidate that parses and carries a report field wins.
+export const parseBiomeReport = (output: string): BiomeReport => {
+  for (let start = output.indexOf("{"); start !== -1; start = output.indexOf("{", start + 1)) {
+    const end = objectEndAt(output, start);
+    if (end === -1) break;
+    const report = asBiomeReport(output.slice(start, end + 1));
+    if (report) return report;
+  }
+  throw new Error(output.trim() || "No Biome JSON output");
+};
+
+const objectEndAt = (output: string, start: number): number => {
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let idx = start; idx < output.length; idx += 1) {
+    const char = output[idx];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === '"') inString = false;
+      continue;
+    }
+    if (char === '"') inString = true;
+    else if (char === "{") depth += 1;
+    else if (char === "}" && --depth === 0) return idx;
+  }
+  return -1;
+};
+
+const asBiomeReport = (candidate: string): BiomeReport | null => {
+  try {
+    const parsed = JSON.parse(candidate) as unknown;
+    if (!parsed || typeof parsed !== "object") return null;
+    if (!("diagnostics" in parsed) && !("summary" in parsed)) return null;
+    return parsed as BiomeReport;
+  } catch {
+    return null;
+  }
+};
+
+/** Biome reads `biome.json` first and `biome.jsonc` second; only the latter may carry comments. */
+const BIOME_CONFIG_FILES = ["biome.json", "biome.jsonc"] as const;
+
+const emptyResult = (filePath: string): LintResult => ({
+  filePath,
+  messages: [],
+  errorCount: 0,
+  warningCount: 0,
+  fixableErrorCount: 0,
+  fixableWarningCount: 0,
+});
+
 export class Linter {
+  //? Bun links a package bin as `<name>.exe` (plus a `.bunx` stub) on Windows, and a bare `<name>` elsewhere.
+  static readonly biomeBinName = process.platform === "win32" ? "biome.exe" : "biome";
+
   lintRoot: string;
+  configPath: string;
   #biomeBin: string;
 
   constructor(cwdPath: string) {
     this.lintRoot = this.#findBiomeRootPath(cwdPath);
-    const localBiomeBin = path.join(this.lintRoot, "node_modules/.bin/biome");
+    this.configPath = Linter.#configPathIn(this.lintRoot) ?? path.join(this.lintRoot, "biome.json");
+    const localBiomeBin = path.join(this.lintRoot, "node_modules", ".bin", Linter.biomeBinName);
     this.#biomeBin = existsSync(localBiomeBin) ? localBiomeBin : "biome";
   }
 
+  static #configPathIn(dir: string): string | null {
+    for (const fileName of BIOME_CONFIG_FILES) {
+      const configPath = path.join(dir, fileName);
+      if (existsSync(configPath)) return configPath;
+    }
+    return null;
+  }
+
   #findBiomeRootPath(dir: string): string {
-    const configPath = path.join(dir, "biome.json");
-    if (existsSync(configPath)) return dir;
+    if (Linter.#configPathIn(dir)) return dir;
     const parentDir = path.dirname(dir);
     if (parentDir === dir) throw new Error(`biome.json not found from ${dir}`);
     return this.#findBiomeRootPath(parentDir);
@@ -111,14 +177,6 @@ export class Linter {
     });
   }
 
-  #parseBiomeReport(output: string): BiomeReport {
-    const jsonStart = output.indexOf("{");
-    const jsonEnd = output.lastIndexOf("}");
-    if (jsonStart === -1 || jsonEnd === -1 || jsonEnd < jsonStart)
-      throw new Error(output.trim() || "No Biome JSON output");
-    return JSON.parse(output.slice(jsonStart, jsonEnd + 1)) as BiomeReport;
-  }
-
   #diagnosticFilePath(diagnostic: BiomeDiagnostic, fallbackFilePath: string) {
     const diagnosticPath = diagnostic.location?.path;
     if (!diagnosticPath) return fallbackFilePath;
@@ -145,16 +203,7 @@ export class Linter {
     for (const diagnostic of report.diagnostics ?? []) {
       if (diagnostic.severity !== "error" && diagnostic.severity !== "warning") continue;
       const diagnosticFilePath = this.#diagnosticFilePath(diagnostic, filePath);
-      const result =
-        resultsByPath.get(diagnosticFilePath) ??
-        ({
-          filePath: diagnosticFilePath,
-          messages: [],
-          errorCount: 0,
-          warningCount: 0,
-          fixableErrorCount: 0,
-          fixableWarningCount: 0,
-        } satisfies LintResult);
+      const result = resultsByPath.get(diagnosticFilePath) ?? emptyResult(diagnosticFilePath);
       const message = this.#createLintMessage(diagnostic);
       result.messages.push(message);
       if (message.severity === 2) result.errorCount += 1;
@@ -163,15 +212,7 @@ export class Linter {
     }
 
     return [
-      resultsByPath.get(filePath) ??
-        ({
-          filePath,
-          messages: [],
-          errorCount: 0,
-          warningCount: 0,
-          fixableErrorCount: 0,
-          fixableWarningCount: 0,
-        } satisfies LintResult),
+      resultsByPath.get(filePath) ?? emptyResult(filePath),
       ...[...resultsByPath.entries()].filter(([resultPath]) => resultPath !== filePath).map(([, result]) => result),
     ];
   }
@@ -193,10 +234,10 @@ export class Linter {
       "--max-diagnostics=none",
       "--no-errors-on-unmatched",
       "--config-path",
-      path.join(this.lintRoot, "biome.json"),
+      this.configPath,
       this.#toBiomePath(filePath),
     ]);
-    const report = this.#parseBiomeReport(stdout || stderr);
+    const report = parseBiomeReport(stdout || stderr);
     const results = this.#toLintResults(report, filePath);
     const { errors, warnings } = this.#splitMessages(results);
     const output = write && existsSync(filePath) ? readFileSync(filePath, "utf8") : undefined;
@@ -215,22 +256,12 @@ export class Linter {
     return await this.lintFile(filePath);
   }
 
-  /**
-   * Lint a single file using Biome.
-   * @param filePath - Path to the file to lint
-   * @returns Array of Biome results in the legacy lint result shape
-   */
   async lintFile(filePath: string): Promise<LintResponse> {
     const resolvedFilePath = this.#resolveFilePath(filePath);
     if (!existsSync(resolvedFilePath)) throw new Error(`File not found: ${filePath}`);
     return await this.#checkFile(resolvedFilePath);
   }
 
-  /**
-   * Format lint results for console output
-   * @param results - Array of Biome results
-   * @returns Formatted string
-   */
   formatLintResults(results: LintResult[]): string {
     if (results.length === 0) return "No files to lint";
 
@@ -251,7 +282,7 @@ export class Linter {
             const sourceContent = readFileSync(result.filePath, "utf8");
             sourceLines = sourceContent.split("\n");
           } catch {
-            // Ignore read errors
+            //? An unreadable source only loses its code frame.
           }
         }
 
@@ -264,14 +295,12 @@ export class Linter {
           output.push(`\n  ${icon} ${typeColor(type)}: ${message.message}${ruleInfo}`);
           output.push(`     ${chalk.gray("at")} ${result.filePath}:${chalk.bold(`${message.line}:${message.column}`)}`);
 
-          // Show source line with underline
           if (sourceLines.length > 0 && message.line <= sourceLines.length) {
             const sourceLine = sourceLines[message.line - 1];
             const lineNumber = message.line.toString().padStart(5, " ");
 
             output.push(`\n${chalk.dim(`${lineNumber} |`)} ${sourceLine}`);
 
-            // Create underline
             const underlinePrefix = " ".repeat(message.column - 1);
             const underlineLength = message.endColumn ? message.endColumn - message.column : 1;
             const underline = "^".repeat(Math.max(1, underlineLength));
@@ -291,27 +320,7 @@ export class Linter {
     return summary.concat(output).join("\n");
   }
 
-  /**
-   * Get detailed lint information
-   * @param filePath - Path to the file to lint
-   * @returns Object containing detailed lint information
-   */
-  async getDetailedLintInfo(filePath: string): Promise<{
-    results: LintResult[];
-    details: {
-      line: number;
-      column: number;
-      message: string;
-      ruleId: string | null;
-      severity: "error" | "warning";
-    }[];
-    stats: {
-      errorCount: number;
-      warningCount: number;
-      fixableErrorCount: number;
-      fixableWarningCount: number;
-    };
-  }> {
+  async getDetailedLintInfo(filePath: string) {
     const { results } = await this.lintFile(filePath);
 
     const details = results.flatMap((result) =>
@@ -331,22 +340,13 @@ export class Linter {
         fixableErrorCount: acc.fixableErrorCount + result.fixableErrorCount,
         fixableWarningCount: acc.fixableWarningCount + result.fixableWarningCount,
       }),
-      {
-        errorCount: 0,
-        warningCount: 0,
-        fixableErrorCount: 0,
-        fixableWarningCount: 0,
-      },
+      { errorCount: 0, warningCount: 0, fixableErrorCount: 0, fixableWarningCount: 0 },
     );
 
     return { results, details, stats };
   }
 
-  /**
-   * Check if a file has lint errors
-   * @param filePath - Path to the file to check
-   * @returns true if there are no errors, false otherwise
-   */
+  /** Also false when the file cannot be linted at all. */
   async hasNoLintErrors(filePath: string): Promise<boolean> {
     try {
       const { results } = await this.lintFile(filePath);
@@ -356,32 +356,17 @@ export class Linter {
     }
   }
 
-  /**
-   * Get only error messages (excluding warnings)
-   * @param filePath - Path to the file to lint
-   * @returns Array of error messages
-   */
   async getErrors(filePath: string): Promise<LintMessage[]> {
     const { results } = await this.lintFile(filePath);
     return results.flatMap((result) => result.messages.filter((message) => message.severity === 2));
   }
 
-  /**
-   * Get only warning messages
-   * @param filePath - Path to the file to lint
-   * @returns Array of warning messages
-   */
   async getWarnings(filePath: string): Promise<LintMessage[]> {
     const { results } = await this.lintFile(filePath);
     return results.flatMap((result) => result.messages.filter((message) => message.severity === 1));
   }
 
-  /**
-   * Fix lint errors automatically
-   * @param filePath - Path to the file to fix
-   * @param dryRun - If true, returns the fixed content without writing to file
-   * @returns Fixed content and remaining issues
-   */
+  /** `dryRun` returns the fixed content in `output` without writing the file. */
   async fixFile(filePath: string, dryRun = false): Promise<LintResponse> {
     const resolvedFilePath = this.#resolveFilePath(filePath);
     if (!existsSync(resolvedFilePath)) throw new Error(`File not found: ${filePath}`);
@@ -390,46 +375,45 @@ export class Linter {
 
     const source = readFileSync(resolvedFilePath, "utf8");
     const { stdout } = await this.#runBiome(
-      [
-        "check",
-        "--write",
-        "--config-path",
-        path.join(this.lintRoot, "biome.json"),
-        "--stdin-file-path",
-        this.#toBiomePath(resolvedFilePath),
-      ],
+      ["check", "--write", "--config-path", this.configPath, "--stdin-file-path", this.#toBiomePath(resolvedFilePath)],
       source,
     );
     const lintResult = await this.lintFile(resolvedFilePath);
     return { ...lintResult, fixed: stdout !== source, output: stdout };
   }
 
-  /**
-   * Get Biome configuration for a file
-   * @param filePath - Path to the file
-   * @returns Biome configuration object
-   */
+  // One spawn for all files: Biome's startup dominates a small file. Missing paths are dropped (a template may
+  // decline a file).
+  async fixFiles(filePaths: string[]): Promise<{ fixed: string[] }> {
+    const resolved = filePaths.map((filePath) => this.#resolveFilePath(filePath)).filter(existsSync);
+    if (resolved.length === 0) return { fixed: [] };
+    const before = new Map(resolved.map((filePath) => [filePath, readFileSync(filePath, "utf8")]));
+    await this.#runBiome([
+      "check",
+      "--write",
+      "--reporter=json",
+      "--max-diagnostics=none",
+      "--no-errors-on-unmatched",
+      "--config-path",
+      this.configPath,
+      ...resolved.map((filePath) => this.#toBiomePath(filePath)),
+    ]);
+    return {
+      fixed: resolved.filter((filePath) => readFileSync(filePath, "utf8") !== before.get(filePath)),
+    };
+  }
+
   async getConfigForFile(filePath: string): Promise<unknown> {
     const resolvedFilePath = this.#resolveFilePath(filePath);
     if (!existsSync(resolvedFilePath)) throw new Error(`File not found: ${filePath}`);
-    return JSON.parse(readFileSync(path.join(this.lintRoot, "biome.json"), "utf8")) as unknown;
+    return JSON.parse(readFileSync(this.configPath, "utf8")) as unknown;
   }
 
-  /**
-   * Get rules that are causing errors in a file
-   * @param filePath - Path to the file to check
-   * @returns Object mapping rule IDs to their error counts
-   */
   async getProblematicRules(filePath: string): Promise<Record<string, number>> {
     const { results } = await this.lintFile(filePath);
     const ruleCounts: Record<string, number> = {};
-
-    results.forEach((result) => {
-      result.messages.forEach((message) => {
-        if (message.ruleId) ruleCounts[message.ruleId] = (ruleCounts[message.ruleId] || 0) + 1;
-      });
-    });
-
+    for (const message of results.flatMap((result) => result.messages))
+      if (message.ruleId) ruleCounts[message.ruleId] = (ruleCounts[message.ruleId] || 0) + 1;
     return ruleCounts;
   }
 }

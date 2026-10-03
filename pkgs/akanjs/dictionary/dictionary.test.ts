@@ -3,7 +3,14 @@ import type { ENDPOINT_DICT_SHAPE, FILTER_DICT_SHAPE, SLICE_DICT_SHAPE } from "a
 import type { FilterCls, FilterInfo } from "akanjs/document";
 import type { ServiceModel } from "akanjs/service";
 import type { EndpointCls, EndpointInfo, SliceCls, SliceInfo } from "akanjs/signal";
-import { modelDictionary, scalarDictionary, serviceDictionary } from "./dictInfo";
+import {
+  type ModelDictInfo,
+  modelDictionary,
+  type ServiceDictInfo,
+  scalarDictionary,
+  serviceDictionary,
+} from "./dictInfo";
+import type { registerServiceTrans } from "./locale";
 import { makeDictionary, makeTrans } from "./trans";
 
 type AssertTrue<T extends true> = T;
@@ -25,7 +32,7 @@ type TestFilter = {
 };
 type TestEnum = {
   refName: "dictionaryTestStatus";
-  value: "active" | "archived";
+  value: "active" | "archived" | "v1.2-legacy";
 };
 type TestSlice = {
   active: SliceInfo<
@@ -145,6 +152,55 @@ const assertDictionaryTypeCoverage = () => {
 };
 void assertDictionaryTypeCoverage;
 
+// Type-only: `modelDictionary` returns the base instance, so a key group lost in the merge fails only `l()` keys.
+const extendedDict = modelDictionary(
+  languages,
+  modelDictionary(languages).translate({
+    inheritedMsg: ["Inherited", "상속됨", "已继承", "継承済み"],
+  }),
+).translate({ ownMsg: ["Own", "자체", "自有", "自前"] });
+type ExtendedEtcKey =
+  typeof extendedDict extends ModelDictInfo<
+    infer _Languages,
+    infer _ModelKey,
+    infer _InsightKey,
+    infer _QueryKey,
+    infer _SortKey,
+    infer _EnumKey,
+    infer _BaseSignalKey,
+    infer _SliceKey,
+    infer _EndpointKey,
+    infer _ErrorKey,
+    infer EtcKey
+  >
+    ? EtcKey
+    : never;
+type _ExtendedDictKeepsBaseTranslateKeys = AssertTrue<"inheritedMsg" extends ExtendedEtcKey ? true : false>;
+type _ExtendedDictKeepsOwnTranslateKeys = AssertTrue<"ownMsg" extends ExtendedEtcKey ? true : false>;
+type _ExtendedDictRejectsUndeclaredKeys = AssertTrue<"neverDeclared" extends ExtendedEtcKey ? false : true>;
+
+// Pinned by position: a slot shifted by a new parameter is no type error anywhere, it only drops `l()` keys.
+const slotServiceDict = serviceDictionary(languages)
+  .error({ slotError: ["Slot", "슬롯", "槽", "スロット"] })
+  .translate({ slotEtc: ["Etc", "기타", "其他", "その他"] });
+type SlotServiceKeys =
+  typeof slotServiceDict extends ServiceDictInfo<infer _Languages, infer _EndpointKey, infer ErrorKey, infer EtcKey>
+    ? { error: ErrorKey; etc: EtcKey }
+    : never;
+type _ServiceErrorKeyStaysInItsSlot = AssertTrue<"slotError" extends SlotServiceKeys["error"] ? true : false>;
+type _ServiceEtcKeyStaysInItsSlot = AssertTrue<"slotEtc" extends SlotServiceKeys["etc"] ? true : false>;
+
+// `registerServiceTrans` reads the same slots through its own `infer` list, the one that feeds `l()`.
+type SlotServiceModule = ReturnType<
+  typeof registerServiceTrans<"slotSvc", TestServiceEndpoint, typeof slotServiceDict>
+>;
+type _RegisteredServiceErrorKeyResolves = AssertTrue<
+  "slotSvc.error.slotError" extends SlotServiceModule["__Error_Key__"] ? true : false
+>;
+type _RegisteredServiceEtcKeyResolves = AssertTrue<
+  "slotSvc.slotEtc" extends SlotServiceModule["__Dict_Key__"] ? true : false
+>;
+
 const modelDict = modelDictionary(languages)
   .of((t) =>
     t(["Dictionary Test Item", "사전 테스트 항목", "字典测试项目", "辞書テスト項目"]).desc([
@@ -198,6 +254,12 @@ const modelDict = modelDictionary(languages)
       "보관된 상태",
       "已归档状态",
       "アーカイブ済み状態",
+    ]),
+    "v1.2-legacy": t(["V1.2 Legacy", "V1.2 레거시", "V1.2 旧版", "V1.2 レガシー"]).desc([
+      "Legacy v1.2 status",
+      "레거시 v1.2 상태",
+      "旧版 v1.2 状态",
+      "レガシー v1.2 状態",
     ]),
   }))
   .applyBaseSignal("dictionaryTestItem")
@@ -275,108 +337,94 @@ const trans = makeTrans({
   dictionaryTestService: { dict: serviceDict } as never,
 });
 
+const expectTexts = (entries: [lang: string, key: string, text: string][]) => {
+  for (const [lang, key, text] of entries) expect(trans.translate(lang, key as never)).toBe(text);
+};
+
 describe("makeTrans", () => {
   test("translates registered model dictionary paths", () => {
-    expect(trans.translate("en", "dictionaryTestItem.modelName" as never)).toBe("Dictionary Test Item");
-    expect(trans.translate("ko", "dictionaryTestItem.modelName" as never)).toBe("사전 테스트 항목");
-    expect(trans.translate("zhChs", "dictionaryTestItem.modelName" as never)).toBe("字典测试项目");
-    expect(trans.translate("ja", "dictionaryTestItem.modelName" as never)).toBe("辞書テスト項目");
-    expect(trans.translate("en", "dictionaryTestItem.modelDesc" as never)).toBe("Dictionary test item description");
-    expect(trans.translate("zhChs", "dictionaryTestItem.modelDesc" as never)).toBe("字典测试项目说明");
-    expect(trans.translate("ja", "dictionaryTestItem.modelDesc" as never)).toBe("辞書テスト項目の説明");
-
-    expect(trans.translate("en", "dictionaryTestItem.title" as never)).toBe("Title");
-    expect(trans.translate("ko", "dictionaryTestItem.title.desc" as never)).toBe("제목 설명");
-    expect(trans.translate("zhChs", "dictionaryTestItem.title" as never)).toBe("标题");
-    expect(trans.translate("ja", "dictionaryTestItem.title.desc" as never)).toBe("タイトルの説明");
-    expect(trans.translate("en", "dictionaryTestItem.id" as never)).toBe("ID");
-    expect(trans.translate("ko", "dictionaryTestItem.createdAt.desc" as never)).toBe("데이터 생성 시각");
-
-    expect(trans.translate("en", "dictionaryTestItem.insight.total" as never)).toBe("Total");
-    expect(trans.translate("ko", "dictionaryTestItem.insight.total.desc" as never)).toBe("합계 설명");
-    expect(trans.translate("zhChs", "dictionaryTestItem.insight.total.desc" as never)).toBe("总计说明");
-    expect(trans.translate("ja", "dictionaryTestItem.insight.total" as never)).toBe("合計");
-    expect(trans.translate("en", "dictionaryTestItem.insight.count" as never)).toBe("Count");
+    expectTexts([
+      ["en", "dictionaryTestItem.modelName", "Dictionary Test Item"],
+      ["ko", "dictionaryTestItem.modelName", "사전 테스트 항목"],
+      ["zhChs", "dictionaryTestItem.modelName", "字典测试项目"],
+      ["ja", "dictionaryTestItem.modelName", "辞書テスト項目"],
+      ["en", "dictionaryTestItem.modelDesc", "Dictionary test item description"],
+      ["zhChs", "dictionaryTestItem.modelDesc", "字典测试项目说明"],
+      ["ja", "dictionaryTestItem.modelDesc", "辞書テスト項目の説明"],
+      ["en", "dictionaryTestItem.title", "Title"],
+      ["ko", "dictionaryTestItem.title.desc", "제목 설명"],
+      ["zhChs", "dictionaryTestItem.title", "标题"],
+      ["ja", "dictionaryTestItem.title.desc", "タイトルの説明"],
+      ["en", "dictionaryTestItem.id", "ID"],
+      ["ko", "dictionaryTestItem.createdAt.desc", "데이터 생성 시각"],
+      ["en", "dictionaryTestItem.insight.total", "Total"],
+      ["ko", "dictionaryTestItem.insight.total.desc", "합계 설명"],
+      ["zhChs", "dictionaryTestItem.insight.total.desc", "总计说明"],
+      ["ja", "dictionaryTestItem.insight.total", "合計"],
+      ["en", "dictionaryTestItem.insight.count", "Count"],
+    ]);
   });
 
   test("translates model query, sort, enum, and signal paths", () => {
-    expect(trans.translate("en", "dictionaryTestItem.query.byTitle" as never)).toBe("By Title");
-    expect(trans.translate("ko", "dictionaryTestItem.query.byTitle.desc" as never)).toBe("제목으로 조회");
-    expect(trans.translate("zhChs", "dictionaryTestItem.query.byTitle" as never)).toBe("按标题查询");
-    expect(trans.translate("ja", "dictionaryTestItem.query.byTitle.desc" as never)).toBe("タイトルで検索する");
-    expect(trans.translate("en", "dictionaryTestItem.query.byTitle.arg.title" as never)).toBe("Title Query");
-    expect(trans.translate("ko", "dictionaryTestItem.query.byTitle.arg.title.desc" as never)).toBe("제목 쿼리 설명");
-    expect(trans.translate("zhChs", "dictionaryTestItem.query.byTitle.arg.title.desc" as never)).toBe("标题查询说明");
-    expect(trans.translate("ja", "dictionaryTestItem.query.byTitle.arg.title" as never)).toBe("タイトルクエリ");
-    expect(trans.translate("en", "dictionaryTestItem.query.any" as never)).toBe("Any");
-
-    expect(trans.translate("en", "dictionaryTestItem.sort.popular" as never)).toBe("Popular");
-    expect(trans.translate("ko", "dictionaryTestItem.sort.latest" as never)).toBe("최신순");
-    expect(trans.translate("zhChs", "dictionaryTestItem.sort.popular.desc" as never)).toBe("热门说明");
-    expect(trans.translate("ja", "dictionaryTestItem.sort.popular" as never)).toBe("人気順");
-
-    expect(trans.translate("en", "dictionaryTestStatus.active" as never)).toBe("Active");
-    expect(trans.translate("ko", "dictionaryTestStatus.archived.desc" as never)).toBe("보관된 상태");
-    expect(trans.translate("zhChs", "dictionaryTestStatus.active.desc" as never)).toBe("启用状态");
-    expect(trans.translate("ja", "dictionaryTestStatus.archived" as never)).toBe("アーカイブ済み");
-
-    expect(trans.translate("en", "dictionaryTestItem.signal.createDictionaryTestItem" as never)).toBe(
-      "Create DictionaryTestItem",
-    );
-    expect(trans.translate("ko", "dictionaryTestItem.signal.createDictionaryTestItem.arg.data" as never)).toBe(
-      "데이터",
-    );
-    expect(trans.translate("en", "dictionaryTestItem.signal.dictionaryTestItemListActive" as never)).toBe(
-      "Slice List - Active Items",
-    );
-    expect(trans.translate("en", "dictionaryTestItem.signal.dictionaryTestItemListActive.arg.skip" as never)).toBe(
-      "skip",
-    );
-    expect(trans.translate("zhChs", "dictionaryTestItem.signal.dictionaryTestItemListActive" as never)).toBe(
-      "Slice List - 启用项目",
-    );
-    expect(trans.translate("ja", "dictionaryTestItem.signal.dictionaryTestItemInsightActive" as never)).toBe(
-      "Slice Insight - 有効な項目",
-    );
-    expect(
-      trans.translate("ko", "dictionaryTestItem.signal.dictionaryTestItemInsightActive.arg.status.desc" as never),
-    ).toBe("상태 인자 설명");
-    expect(
-      trans.translate("zhChs", "dictionaryTestItem.signal.dictionaryTestItemInsightActive.arg.status.desc" as never),
-    ).toBe("状态参数说明");
-    expect(trans.translate("ja", "dictionaryTestItem.signal.dictionaryTestItemListActive.arg.status" as never)).toBe(
-      "ステータス引数",
-    );
-    expect(trans.translate("en", "dictionaryTestItem.signal.publish.arg.payload.desc" as never)).toBe(
-      "Payload description",
-    );
-    expect(trans.translate("zhChs", "dictionaryTestItem.signal.publish.desc" as never)).toBe("发布说明");
-    expect(trans.translate("ja", "dictionaryTestItem.signal.publish.arg.payload.desc" as never)).toBe(
-      "ペイロードの説明",
-    );
+    expectTexts([
+      ["en", "dictionaryTestItem.query.byTitle", "By Title"],
+      ["ko", "dictionaryTestItem.query.byTitle.desc", "제목으로 조회"],
+      ["zhChs", "dictionaryTestItem.query.byTitle", "按标题查询"],
+      ["ja", "dictionaryTestItem.query.byTitle.desc", "タイトルで検索する"],
+      ["en", "dictionaryTestItem.query.byTitle.arg.title", "Title Query"],
+      ["ko", "dictionaryTestItem.query.byTitle.arg.title.desc", "제목 쿼리 설명"],
+      ["zhChs", "dictionaryTestItem.query.byTitle.arg.title.desc", "标题查询说明"],
+      ["ja", "dictionaryTestItem.query.byTitle.arg.title", "タイトルクエリ"],
+      ["en", "dictionaryTestItem.query.any", "Any"],
+      ["en", "dictionaryTestItem.sort.popular", "Popular"],
+      ["ko", "dictionaryTestItem.sort.latest", "최신순"],
+      ["zhChs", "dictionaryTestItem.sort.popular.desc", "热门说明"],
+      ["ja", "dictionaryTestItem.sort.popular", "人気順"],
+      ["en", "dictionaryTestStatus.active", "Active"],
+      ["ko", "dictionaryTestStatus.archived.desc", "보관된 상태"],
+      ["zhChs", "dictionaryTestStatus.active.desc", "启用状态"],
+      ["ja", "dictionaryTestStatus.archived", "アーカイブ済み"],
+      // An enum value is a real-world identifier, so a dotted one must not be read as a path into the tree.
+      ["en", "dictionaryTestStatus.v1.2-legacy", "V1.2 Legacy"],
+      ["ko", "dictionaryTestStatus.v1.2-legacy.desc", "레거시 v1.2 상태"],
+      ["en", "dictionaryTestStatus.v1", "dictionaryTestStatus.v1"],
+      ["en", "dictionaryTestItem.signal.createDictionaryTestItem", "Create DictionaryTestItem"],
+      ["ko", "dictionaryTestItem.signal.createDictionaryTestItem.arg.data", "데이터"],
+      ["en", "dictionaryTestItem.signal.dictionaryTestItemListActive", "Slice List - Active Items"],
+      ["en", "dictionaryTestItem.signal.dictionaryTestItemListActive.arg.skip", "skip"],
+      ["zhChs", "dictionaryTestItem.signal.dictionaryTestItemListActive", "Slice List - 启用项目"],
+      ["ja", "dictionaryTestItem.signal.dictionaryTestItemInsightActive", "Slice Insight - 有効な項目"],
+      ["ko", "dictionaryTestItem.signal.dictionaryTestItemInsightActive.arg.status.desc", "상태 인자 설명"],
+      ["zhChs", "dictionaryTestItem.signal.dictionaryTestItemInsightActive.arg.status.desc", "状态参数说明"],
+      ["ja", "dictionaryTestItem.signal.dictionaryTestItemListActive.arg.status", "ステータス引数"],
+      ["en", "dictionaryTestItem.signal.publish.arg.payload.desc", "Payload description"],
+      ["zhChs", "dictionaryTestItem.signal.publish.desc", "发布说明"],
+      ["ja", "dictionaryTestItem.signal.publish.arg.payload.desc", "ペイロードの説明"],
+    ]);
   });
 
   test("translates scalar and service dictionaries", () => {
-    expect(trans.translate("en", "dictionaryTestScalar.modelName" as never)).toBe("Dictionary Test Scalar");
-    expect(trans.translate("ko", "dictionaryTestScalar.modelDesc" as never)).toBe("스칼라 설명");
-    expect(trans.translate("zhChs", "dictionaryTestScalar.modelName" as never)).toBe("字典测试标量");
-    expect(trans.translate("ja", "dictionaryTestScalar.modelDesc" as never)).toBe("スカラーの説明");
-    expect(trans.translate("en", "dictionaryTestScalar.value.desc" as never)).toBe("Value description");
-    expect(trans.translate("ko", "dictionaryTestScalarUnit.byte" as never)).toBe("바이트");
-    expect(trans.translate("zhChs", "dictionaryTestScalar.value.desc" as never)).toBe("值说明");
-    expect(trans.translate("ja", "dictionaryTestScalarUnit.byte.desc" as never)).toBe("バイトの説明");
-    expect(trans.translate("en", "dictionaryTestScalar.summary" as never)).toBe("Scalar summary");
-    expect(trans.translate("zhChs", "dictionaryTestScalar.summary" as never)).toBe("标量摘要");
-    expect(trans.translate("ja", "dictionaryTestScalar.summary" as never)).toBe("スカラー概要");
-
-    expect(trans.translate("en", "dictionaryTestService.signal.ping" as never)).toBe("Ping");
-    expect(trans.translate("ko", "dictionaryTestService.signal.ping.desc" as never)).toBe("핑 설명");
-    expect(trans.translate("zhChs", "dictionaryTestService.signal.ping.desc" as never)).toBe("Ping说明");
-    expect(trans.translate("ja", "dictionaryTestService.signal.ping.arg.body" as never)).toBe("本文");
-    expect(trans.translate("en", "dictionaryTestService.signal.ping.arg.body.desc" as never)).toBe("Body description");
-    expect(trans.translate("ko", "dictionaryTestService.ready" as never)).toBe("서비스 준비됨");
-    expect(trans.translate("zhChs", "dictionaryTestService.ready" as never)).toBe("服务已就绪");
-    expect(trans.translate("ja", "dictionaryTestService.ready" as never)).toBe("サービス準備完了");
+    expectTexts([
+      ["en", "dictionaryTestScalar.modelName", "Dictionary Test Scalar"],
+      ["ko", "dictionaryTestScalar.modelDesc", "스칼라 설명"],
+      ["zhChs", "dictionaryTestScalar.modelName", "字典测试标量"],
+      ["ja", "dictionaryTestScalar.modelDesc", "スカラーの説明"],
+      ["en", "dictionaryTestScalar.value.desc", "Value description"],
+      ["ko", "dictionaryTestScalarUnit.byte", "바이트"],
+      ["zhChs", "dictionaryTestScalar.value.desc", "值说明"],
+      ["ja", "dictionaryTestScalarUnit.byte.desc", "バイトの説明"],
+      ["en", "dictionaryTestScalar.summary", "Scalar summary"],
+      ["zhChs", "dictionaryTestScalar.summary", "标量摘要"],
+      ["ja", "dictionaryTestScalar.summary", "スカラー概要"],
+      ["en", "dictionaryTestService.signal.ping", "Ping"],
+      ["ko", "dictionaryTestService.signal.ping.desc", "핑 설명"],
+      ["zhChs", "dictionaryTestService.signal.ping.desc", "Ping说明"],
+      ["ja", "dictionaryTestService.signal.ping.arg.body", "本文"],
+      ["en", "dictionaryTestService.signal.ping.arg.body.desc", "Body description"],
+      ["ko", "dictionaryTestService.ready", "서비스 준비됨"],
+      ["zhChs", "dictionaryTestService.ready", "服务已就绪"],
+      ["ja", "dictionaryTestService.ready", "サービス準備完了"],
+    ]);
   });
 
   test("returns fallback key for missing translations and exposes dictionaries", () => {
@@ -454,17 +502,31 @@ describe("makeTrans", () => {
       path: "/dictionary-test",
       timestamp: "2026-05-25T00:00:00.000Z",
     });
-    expect(trans.translate("ko", "dictionaryTestItem.error.notFound" as never)).toBe("항목을 찾을 수 없습니다");
-    expect(trans.translate("zhChs", "dictionaryTestItem.error.notFound" as never)).toBe("找不到项目");
-    expect(trans.translate("ja", "dictionaryTestItem.error.notFound" as never)).toBe("項目が見つかりません");
-    expect(trans.translate("en", "dictionaryTestScalar.error.invalid" as never)).toBe("Invalid scalar");
-    expect(trans.translate("zhChs", "dictionaryTestScalar.error.invalid" as never)).toBe("无效标量");
-    expect(trans.translate("ja", "dictionaryTestScalar.error.invalid" as never)).toBe("無効なスカラー");
-    expect(trans.translate("ko", "dictionaryTestService.error.unavailable" as never)).toBe(
-      "서비스를 사용할 수 없습니다",
-    );
-    expect(trans.translate("zhChs", "dictionaryTestService.error.unavailable" as never)).toBe("服务不可用");
-    expect(trans.translate("ja", "dictionaryTestService.error.unavailable" as never)).toBe("サービスを利用できません");
+    expectTexts([
+      ["ko", "dictionaryTestItem.error.notFound", "항목을 찾을 수 없습니다"],
+      ["zhChs", "dictionaryTestItem.error.notFound", "找不到项目"],
+      ["ja", "dictionaryTestItem.error.notFound", "項目が見つかりません"],
+      ["en", "dictionaryTestScalar.error.invalid", "Invalid scalar"],
+      ["zhChs", "dictionaryTestScalar.error.invalid", "无效标量"],
+      ["ja", "dictionaryTestScalar.error.invalid", "無効なスカラー"],
+      ["ko", "dictionaryTestService.error.unavailable", "서비스를 사용할 수 없습니다"],
+      ["zhChs", "dictionaryTestService.error.unavailable", "服务不可用"],
+      ["ja", "dictionaryTestService.error.unavailable", "サービスを利用できません"],
+    ]);
+  });
+});
+
+describe("modelDictionary extension", () => {
+  test("an extending dictionary keeps the base dictionary's translate and error entries", () => {
+    const libDict = modelDictionary(languages)
+      .error({ notFound: ["Not found", "찾을 수 없습니다", "找不到", "見つかりません"] })
+      .translate({ updateSuccessMsg: ["Updated", "업데이트되었습니다", "已更新", "更新しました"] });
+    const appDict = modelDictionary(languages, libDict)
+      .of((t) => t(["App Item", "앱 항목", "应用项目", "アプリ項目"]))
+      .translate({});
+
+    expect(Object.keys(appDict.etcDictionary)).toEqual(["updateSuccessMsg"]);
+    expect(Object.keys(appDict.errorDictionary)).toEqual(["notFound"]);
   });
 });
 
@@ -475,5 +537,38 @@ describe("makeDictionary", () => {
       b: "B",
       nested: { right: true },
     });
+  });
+});
+
+describe("translate locale fallback", () => {
+  const twoLocaleTrans = makeTrans({
+    dictionaryTestNarrow: {
+      dict: serviceDictionary(["en", "ko"] as [string, string]).translate({
+        ready: ["Ready", "준비됨"],
+        greeting: ["Hello {name}", "안녕 {name}"],
+      }),
+    } as never,
+  });
+
+  test("resolves a locale the dictionary never declared through the default locale", () => {
+    expect(twoLocaleTrans.translate("zhChs", "dictionaryTestNarrow.ready" as never)).toBe("Ready");
+    expect(twoLocaleTrans.translate("ko", "dictionaryTestNarrow.ready" as never)).toBe("준비됨");
+  });
+
+  test("returns the key only when no locale carries it", () => {
+    expect(twoLocaleTrans.translate("zhChs", "dictionaryTestNarrow.missing" as never)).toBe(
+      "dictionaryTestNarrow.missing",
+    );
+    expect(twoLocaleTrans.translate("en", "dictionaryTestNarrow.missing" as never)).toBe(
+      "dictionaryTestNarrow.missing",
+    );
+  });
+
+  test("fills placeholders from the data argument", () => {
+    expect(twoLocaleTrans.translate("ko", "dictionaryTestNarrow.greeting" as never, { name: "민" })).toBe("안녕 민");
+    expect(twoLocaleTrans.translate("zhChs", "dictionaryTestNarrow.greeting" as never, { name: "Ada" })).toBe(
+      "Hello Ada",
+    );
+    expect(twoLocaleTrans.translate("en", "dictionaryTestNarrow.greeting" as never)).toBe("Hello {name}");
   });
 });

@@ -2,23 +2,22 @@ import { afterEach, describe, expect, mock, test } from "bun:test";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import { CommandContainer } from "@akanjs/devkit/commandDecorators";
+import { LibSource } from "@akanjs/devkit/libSource";
 import {
-  cleanupCliTempWorkspace,
   createCallRecorder,
   createFakeExecutor,
   createTempLib,
+  tempRoots,
   writeJson,
-} from "../testHelpers";
+} from "@akanjs/devkit/testHelpers";
 import { LibraryRunner } from "./library.runner";
 import { LibraryScript } from "./library.script";
 
-const tempRoots: string[] = [];
-
-afterEach(async () => {
+afterEach(() => {
   CommandContainer.clear();
   mock.restore();
-  await Promise.all(tempRoots.splice(0).map((root) => cleanupCliTempWorkspace(root)));
 });
+const track = tempRoots();
 
 describe("LibraryScript", () => {
   test("syncs and installs libraries through runner boundaries", async () => {
@@ -49,8 +48,7 @@ describe("LibraryScript", () => {
 
 describe("LibraryRunner", () => {
   test("merges library dependencies into the root package using newer versions", async () => {
-    const { root, workspace, lib } = await createTempLib("shared");
-    tempRoots.push(root);
+    const { root, workspace, lib } = track(await createTempLib("shared"));
     await writeJson(`${root}/package.json`, {
       name: "repo",
       version: "1.0.0",
@@ -80,20 +78,46 @@ describe("LibraryRunner", () => {
     expect(workspace.commit).toHaveBeenCalledWith("Merge shared library dependencies");
   });
 
-  test("installs a library from the local akanjs package before falling back to git", async () => {
-    const { root, workspace } = await createTempLib("shared");
-    tempRoots.push(root);
-    await mkdir(`${root}/node_modules/akanjs/libs/shared/env`, { recursive: true });
-    await Bun.write(`${root}/node_modules/akanjs/libs/shared/package.json`, "{}\n");
-    await Bun.write(`${root}/node_modules/akanjs/libs/shared/env/env.server.example.ts`, "export default {};\n");
+  // `installLibrary` commits and hashes the copy via `git ls-files`, so the fixture is a real repo, `commit` mocked.
+  const createInstallableLib = async (libName: string) => {
+    const { root, workspace } = track(await createTempLib(libName));
+    await mkdir(`${root}/node_modules/akanjs/libs/${libName}/env`, { recursive: true });
+    await Bun.write(`${root}/node_modules/akanjs/libs/${libName}/package.json`, `{ "name": "@${libName}" }\n`);
+    await Bun.write(`${root}/node_modules/akanjs/package.json`, '{ "version": "3.0.0" }\n');
+    await Bun.write(`${root}/node_modules/akanjs/libs/${libName}/env/env.server.example.ts`, "export default {};\n");
+    await Bun.write(`${root}/.gitignore`, "node_modules\n");
+    await workspace.spawn("git", ["init", "--quiet"]);
     workspace.exec = mock(async () => "") as never;
     workspace.commit = mock(async () => undefined) as never;
+    return { root, workspace };
+  };
+
+  test("installs a library from the local akanjs package before falling back to git", async () => {
+    const { root, workspace } = await createInstallableLib("shared");
 
     await new LibraryRunner().installLibrary(workspace, "shared");
 
     expect(await Bun.file(path.join(root, "libs/shared/package.json")).exists()).toBe(true);
     expect(await Bun.file(path.join(root, "libs/shared/env/env.server.testing.ts")).exists()).toBe(true);
     expect(workspace.exec).not.toHaveBeenCalledWith(expect.stringContaining("git clone"));
-    expect(workspace.commit).toHaveBeenCalledWith("Add shared library");
+    expect(workspace.commit).toHaveBeenCalledWith("Install shared library from akanjs");
+  });
+
+  test("stamps the installed source and stays re-runnable", async () => {
+    const { root, workspace } = await createInstallableLib("stamped");
+    const testingEnv = path.join(root, "libs/stamped/env/env.server.testing.ts");
+    const runner = new LibraryRunner();
+
+    const lib = await runner.installLibrary(workspace, "stamped");
+    const stamp = await new LibSource(lib).read();
+    expect(stamp?.origin).toBe("akanjs");
+    expect(stamp?.sha).toBe("3.0.0");
+    expect((await new LibSource(lib).status()).drift).toBe("clean");
+
+    await Bun.write(testingEnv, "export default { key: 1 };\n");
+    await runner.installLibrary(workspace, "stamped");
+
+    expect(await Bun.file(testingEnv).text()).toBe("export default { key: 1 };\n");
+    expect((await new LibSource(lib).status()).drift).toBe("clean");
   });
 });

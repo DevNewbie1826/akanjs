@@ -3,13 +3,6 @@ import { getTargetCommandNames, getTargetMetas } from "@akanjs/devkit/commandDec
 import { CommandManifest } from "./commandManifest";
 import { type CommandModuleId, commandModuleIds, commandModules } from "./commandModules";
 
-/**
- * `akan start` holds its process for the whole dev session, so this guards the property that keeps it
- * cheap: the entry resolves a command to exactly one module instead of importing all 17. The sibling
- * property — that no entry pulls a heavy dependency eagerly — moved to `entryModuleGraph.test.ts`,
- * which walks the chunk closure; the version that lived here only grepped the entry file and so could
- * not see a dependency reached through a shared chunk.
- */
 describe("CommandManifest", () => {
   test("covers every command name declared by every command module", async () => {
     const manifest = await CommandManifest.generate();
@@ -21,15 +14,30 @@ describe("CommandManifest", () => {
         }
       }
     }
-    // Sanity-check the hot path specifically: `start`/`s` must resolve, and to the app module.
     expect(manifest.byCommand.start).toBe("application" satisfies CommandModuleId);
     expect(manifest.byCommand.s).toBe("application" satisfies CommandModuleId);
   });
 
+  // commander refuses a duplicate name at registration, killing every invocation; `short: true` aliases derive from
+  // initials, so two unrelated modules can claim the same letter without either file mentioning it.
+  test("no two targets claim the same command name or short alias", async () => {
+    const owners = new Map<string, string>();
+    const collisions: string[] = [];
+    for (const id of commandModuleIds) {
+      const command = await commandModules[id]();
+      for (const targetMeta of getTargetMetas(command)) {
+        for (const name of getTargetCommandNames(targetMeta)) {
+          const owner = owners.get(name);
+          if (owner) collisions.push(`"${name}" is claimed by both ${owner} and ${id}`);
+          else owners.set(name, `${id}.${targetMeta.key}`);
+        }
+      }
+    }
+    expect(collisions).toEqual([]);
+  });
+
   test("falls back to loading every module when it cannot narrow argv", async () => {
     const manifest = await CommandManifest.generate();
-    // Global help and unknown commands must load everything so commander can render full help and
-    // its did-you-mean suggestions.
     expect(CommandManifest.resolve(manifest, ["bun", "akan"])).toBeNull();
     expect(CommandManifest.resolve(manifest, ["bun", "akan", "--help"])).toBeNull();
     expect(CommandManifest.resolve(manifest, ["bun", "akan", "no-such-command"])).toBeNull();

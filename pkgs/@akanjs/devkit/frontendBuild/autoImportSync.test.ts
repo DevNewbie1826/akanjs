@@ -1,20 +1,17 @@
-import { afterEach, describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import os from "node:os";
+import { describe, expect, test } from "bun:test";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { tempDirs } from "../testHelpers";
 import { AutoImportSync, transformSource } from "./autoImportSync";
 
-const tempRoots: string[] = [];
+const makeTempRoot = tempDirs("akan-auto-import-");
 
-const makeTempRoot = async () => {
-  const root = await mkdtemp(path.join(os.tmpdir(), "akan-auto-import-"));
-  tempRoots.push(root);
-  return root;
+const seed = async (root: string, rel: string, content: string) => {
+  const abs = path.join(root, rel);
+  await mkdir(path.dirname(abs), { recursive: true });
+  await writeFile(abs, content);
+  return abs;
 };
-
-afterEach(async () => {
-  await Promise.all(tempRoots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
-});
 
 const constantCtx = { role: "constant", scope: "libs", project: "shared" } as const;
 const documentCtx = { role: "document", scope: "libs", project: "shared" } as const;
@@ -161,6 +158,19 @@ describe("transformSource — client role (package client entry)", () => {
     );
   });
 
+  test("never claims fetch from a file that calls the platform fetch", () => {
+    const globalOnly = `"use client";\n\nexport const toBlob = async (url: string) => await (await fetch(url)).blob();\n`;
+    const mixed = `"use client";\n\nexport const C = async (url: string) => (await fetch(url)).ok && fetch.me() && st.foo;\n`;
+    const passed = `"use client";\n\nexport const load = (get = fetch) => get("/a");\n`;
+
+    expect(transformSource(globalOnly, "CropImage.tsx", clientLibCtx)).toBeNull();
+    expect(transformSource(mixed, "C.Zone.tsx", clientLibCtx)).toBe(
+      `"use client";\nimport { st } from "@libs/shared/client";\n\nexport const C = async (url: string) => (await fetch(url)).ok && fetch.me() && st.foo;\n`,
+    );
+    expect(transformSource(passed, "load.ts", clientLibCtx)).toBeNull();
+    expect(transformSource(globalOnly, "x.store.ts", storeCtx)).toBeNull();
+  });
+
   test("handles webkit .ts files (no jsx) the same as tsx", () => {
     const source = `import { getEnv } from "akanjs/base";\n\nexport const load = () => fetch.me();\n`;
     const out = transformSource(source, "cookie.ts", clientLibCtx);
@@ -171,13 +181,6 @@ describe("transformSource — client role (package client entry)", () => {
 });
 
 describe("AutoImportSync.syncForBatch", () => {
-  const seed = async (root: string, rel: string, content: string) => {
-    const abs = path.join(root, rel);
-    await mkdir(path.dirname(abs), { recursive: true });
-    await writeFile(abs, content);
-    return abs;
-  };
-
   test("writes the fix once, then is idempotent", async () => {
     const root = await makeTempRoot();
     const abs = await seed(
@@ -296,9 +299,7 @@ describe("AutoImportSync.syncForBatch", () => {
 
   test("leaves JS globals and ambiguous domain names alone", async () => {
     const root = await makeTempRoot();
-    // `Map` is a real model here but must not shadow the JS global.
     await seed(root, "libs/x/lib/map/map.constant.ts", `export class Map extends via {}\n`);
-    // `Dup` is exported by two files → ambiguous → skipped.
     await seed(root, "libs/x/lib/a/a.constant.ts", `export class Dup {}\n`);
     await seed(root, "libs/x/lib/b/b.constant.ts", `export class Dup {}\n`);
     const consumer = await seed(
@@ -335,7 +336,7 @@ describe("AutoImportSync.syncForBatch", () => {
 
   test("srvkit: does not import a barrel whose file is absent", async () => {
     const root = await makeTempRoot();
-    await seed(root, "libs/x/lib/dict.ts", `export const x = 1;\n`); // no lib/srv.ts
+    await seed(root, "libs/x/lib/dict.ts", `export const x = 1;\n`);
     const file = await seed(root, "libs/x/srvkit/api.ts", `export const f = () => Err.of(srv.user);\n`);
     const sync = new AutoImportSync({ workspaceRoot: root });
 
@@ -353,5 +354,51 @@ describe("AutoImportSync.syncForBatch", () => {
     const result = await sync.syncForBatch([indexFile]);
     expect(result.changedFiles).toEqual([]);
     expect(await readFile(indexFile, "utf8")).not.toContain("@libs/shared/client");
+  });
+});
+
+describe("AutoImportSync — scope", () => {
+  test("leaves the generated lib/__lib stubs alone and still syncs lib/__scalar", async () => {
+    const root = await makeTempRoot();
+    const needsImport = "export class A {\n  count = field(Int);\n}\n";
+    const generated = await seed(root, "libs/shared/lib/__lib/lib.constant.ts", needsImport);
+    const scalar = await seed(root, "libs/shared/lib/__scalar/money/money.constant.ts", needsImport);
+
+    const result = await new AutoImportSync({ workspaceRoot: root }).syncForBatch([generated, scalar]);
+
+    expect(result.errors).toEqual([]);
+    expect(result.changedFiles).toEqual([scalar]);
+    expect(await readFile(generated, "utf8")).toBe(needsImport);
+    expect(await readFile(scalar, "utf8")).toContain('import { Int } from "akanjs/base";');
+  });
+
+  test("a second pass over its own output changes nothing", async () => {
+    const root = await makeTempRoot();
+    const file = await seed(
+      root,
+      "libs/shared/lib/task/task.constant.ts",
+      "export class A {\n  count = field(Int);\n}\n",
+    );
+    const sync = new AutoImportSync({ workspaceRoot: root });
+
+    expect((await sync.syncForBatch([file])).changedFiles).toEqual([file]);
+    const afterFirst = await readFile(file, "utf8");
+    expect((await sync.syncForBatch([file])).changedFiles).toEqual([]);
+    expect(await readFile(file, "utf8")).toBe(afterFirst);
+  });
+
+  test("a failing file is reported without abandoning the batch", async () => {
+    const root = await makeTempRoot();
+    const missing = path.join(root, "libs/shared/lib/task/gone.constant.ts");
+    const good = await seed(
+      root,
+      "libs/shared/lib/task/task.constant.ts",
+      "export class A {\n  count = field(Int);\n}\n",
+    );
+
+    const result = await new AutoImportSync({ workspaceRoot: root }).syncForBatch([missing, good]);
+
+    expect(result.changedFiles).toEqual([good]);
+    expect(result.errors).toEqual([]);
   });
 });

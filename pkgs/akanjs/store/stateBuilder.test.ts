@@ -8,6 +8,7 @@ import {
   resolveDerivedState,
   resolveWritableState,
 } from "./stateBuilder";
+import { setTestEnv } from "./store.fixture";
 
 class StateBuilderTestMode extends enumOf("StateBuilderTestMode", ["list", "grid"] as const) {}
 const StateBuilderTestAddress = via((f) => ({
@@ -16,12 +17,7 @@ const StateBuilderTestAddress = via((f) => ({
 }));
 ConstantRegistry.buildScalar("stateBuilderTestAddress", StateBuilderTestAddress, { StateBuilderTestAddress });
 
-const setupEnv = () => {
-  process.env.AKAN_PUBLIC_APP_NAME = "storetest";
-  process.env.AKAN_PUBLIC_REPO_NAME = "storetest";
-  process.env.AKAN_PUBLIC_SERVE_DOMAIN = "localhost";
-  process.env.AKAN_PUBLIC_ENV = "testing";
-};
+const setupEnv = () => setTestEnv("storetest");
 
 describe("makeDefaultFactory", () => {
   test("preserves DataList instances when cloning default state", async () => {
@@ -29,7 +25,7 @@ describe("makeDefaultFactory", () => {
 
     const [{ DataList }, { makeDefaultFactory }] = await Promise.all([import("akanjs/base"), import("./stateBuilder")]);
     const original = new DataList([{ id: "project-1", name: "Project 1" }]);
-    const clone = makeDefaultFactory(original)();
+    const clone = makeDefaultFactory(original)() as typeof original;
 
     expect(clone).toBeInstanceOf(DataList);
     expect(clone).not.toBe(original);
@@ -48,7 +44,7 @@ describe("makeDefaultFactory", () => {
       }
     }
     const original = new BrowserResource();
-    const clone = makeDefaultFactory(original)();
+    const clone = makeDefaultFactory(original)() as BrowserResource;
 
     expect(clone).toBe(original);
     expect(clone.getTracks()).toEqual(["audio"]);
@@ -151,7 +147,12 @@ describe("state builder declarations", () => {
     expect(() =>
       resolveDerivedState({ broken: builder.computed(["missing" as never], () => "bad") }, new Set(["count"])),
     ).toThrow("Computed broken has invalid deps: missing");
-    expect(() => mergeDerivedMeta(resolved.meta, resolved.meta)).toThrow("Duplicate state metadata key: summary");
+    expect(mergeDerivedMeta(resolved.meta, resolved.meta).computed.summary).toBe(resolved.meta.computed.summary);
+    const rival = resolveDerivedState(
+      { summary: builder.computed(["count"], (count) => `${count}`) },
+      new Set(["count", "label"]),
+    );
+    expect(() => mergeDerivedMeta(resolved.meta, rival.meta)).toThrow("Duplicate state metadata key: summary");
   });
 
   test("rejects derived declarations that conflict with writable keys", () => {

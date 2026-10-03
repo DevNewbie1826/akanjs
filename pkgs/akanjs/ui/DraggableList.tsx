@@ -1,13 +1,17 @@
 "use client";
 import { config, useSprings } from "@react-spring/web";
 import { useGesture } from "@use-gesture/react";
-import { clsx } from "akanjs/client";
+import { cn } from "akanjs/client";
+import { clamp } from "akanjs/common";
+import { useFieldTool } from "akanjs/store";
 import { animated } from "akanjs/ui";
-import { createContext, type ReactElement, type ReactNode, useContext, useRef } from "react";
+import { type ReactElement, type ReactNode, useContext, useRef } from "react";
 import { BiTrash } from "react-icons/bi";
 import { MdDragIndicator } from "react-icons/md";
-
-const clamp = (value: number, min: number, max: number) => Math.min(Math.max(value, min), max);
+import { sharedContext } from "../client/sharedContext";
+import { agentAttrs } from "./agentAttrs";
+import { buttonRecipe } from "./Button";
+import { useUiRecipe } from "./UiOverride";
 
 const swap = (arr: number[], from: number, to: number): number[] => {
   const result = [...arr];
@@ -20,7 +24,7 @@ interface DragListContextType<V> {
   bind: (...args: any[]) => any;
   onRemove: (value: V) => void;
 }
-const dragListContext = createContext<DragListContextType<any>>({} as unknown as DragListContextType<any>);
+const dragListContext = sharedContext<DragListContextType<any>>("dragList", {} as unknown as DragListContextType<any>);
 const useDragList = () => useContext(dragListContext);
 
 interface DragListProps<V> {
@@ -31,6 +35,9 @@ interface DragListProps<V> {
   onRemove: (value: V, idx: number) => void;
 }
 const DragList = <V,>({ className, mode = "vertical", children, onChange, onRemove }: DragListProps<V>) => {
+  // Publishes the setter like any form control, plus `move<Field>On<Model>`; a generated setter ignores the extra
+  // drag arguments.
+  useFieldTool(onChange, { sortable: true });
   const refs = useRef<(HTMLDivElement | null)[]>([]);
   const order = useRef(children.map((_, index) => index));
   const clientLengths = useRef(children.map((_, index) => 0));
@@ -43,7 +50,6 @@ const DragList = <V,>({ className, mode = "vertical", children, onChange, onRemo
     shadow: number;
   }>(
     children.length,
-    // eslint-disable-next-line @typescript-eslint/no-unsafe-argument
     fn(
       order.current,
       new Array(children.length).fill(0) as number[],
@@ -101,7 +107,7 @@ const DragList = <V,>({ className, mode = "vertical", children, onChange, onRemo
   });
 
   return (
-    <div className={clsx(`isolate flex gap-0`, { "flex-col": mode === "vertical" }, className)}>
+    <div {...agentAttrs(onChange)} className={cn("isolate flex gap-0", mode === "vertical" && "flex-col", className)}>
       {springs.map(({ zIndex, shadow, movement, scale }, i) => (
         <animated.div
           ref={(el: HTMLDivElement | null) => {
@@ -110,10 +116,10 @@ const DragList = <V,>({ className, mode = "vertical", children, onChange, onRemo
           key={i}
           style={{
             zIndex,
+            // A theme-neutral lift shadow computed per spring frame, so it cannot be a token.
             boxShadow: shadow.to((s) => `rgba(0, 0, 0, 0.15) 0px ${s}px ${2 * s}px 0px`),
             scale,
             ...(mode === "vertical" ? { y: movement } : { x: movement }),
-            // cursor: "grab",
           }}
         >
           <dragListContext.Provider
@@ -134,13 +140,13 @@ const DragList = <V,>({ className, mode = "vertical", children, onChange, onRemo
 
 interface Cursor {
   className?: string;
-  children: any;
+  children: ReactNode;
 }
 DragList.Cursor = ({ className, children }: Cursor) => {
   const { bind } = useDragList();
   return (
     <div
-      className={clsx("cursor-grab duration-200 hover:scale-[1.01] hover:opacity-70 hover:shadow-xl", className)}
+      className={cn("cursor-grab duration-200 hover:scale-[1.01] hover:opacity-70 hover:shadow-xl", className)}
       {...bind()}
     >
       {children}
@@ -167,8 +173,9 @@ const Item = ({
   removeClassName,
 }: ItemProps) => {
   const { onRemove } = useDragList();
+  const recipe = useUiRecipe("button") ?? buttonRecipe;
   return (
-    <div className={clsx("flex w-full items-center gap-2", className)}>
+    <div className={cn("flex w-full items-center gap-2", className)}>
       {cursor ? (
         <DraggableList.Cursor className={cursorClassName}>
           <MdDragIndicator className="text-xl" />
@@ -177,7 +184,10 @@ const Item = ({
       {children}
       {removable && (
         <button
-          className={clsx("btn btn-xs btn-error btn-square btn-outline", removeClassName)}
+          className={recipe({ variant: "outline", size: "xs" }, [
+            "size-6 border-destructive p-0 text-destructive hover:bg-destructive hover:text-destructive-foreground",
+            removeClassName,
+          ])}
           onClick={() => {
             onRemove(value);
           }}
@@ -207,7 +217,6 @@ const fn =
           movement,
           scale: 1.01,
           zIndex: total + 1,
-          // shadow: 15,
           immediate: (key: string) => key === "zIndex",
           config: (key: string) => (key === "y" ? config.stiff : config.default),
         }

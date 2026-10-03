@@ -1,38 +1,60 @@
 import { type Lib, runner, type Workspace } from "@akanjs/devkit/commandDecorators";
 import { LibExecutor } from "@akanjs/devkit/executors";
-import { compareSemver } from "../semver";
+import { LibSource } from "@akanjs/devkit/libSource";
+import { compareSemver } from "@akanjs/devkit/semver";
 
 export class LibraryRunner extends runner("library") {
+  static readonly libraryRepository = "https://github.com/akan-team/akanjs.git";
   async createLibrary(libName: string, workspace: Workspace) {
-    await workspace.exec(`mkdir -p libs/${libName}`);
+    await workspace.mkdir(`libs/${libName}`);
     await workspace.applyTemplate({ basePath: `libs/${libName}`, template: "libRoot", dict: { libName } });
-    const lib = LibExecutor.from(workspace, libName);
-    return lib;
+    return LibExecutor.from(workspace, libName);
   }
   async removeLibrary(lib: Lib) {
-    await lib.workspace.exec(`rm -rf libs/${lib.name}`);
+    await lib.workspace.removeDir(`libs/${lib.name}`);
   }
 
   async #copyInstalledLibrary(workspace: Workspace, libName: string) {
     const installedPackageJson = `node_modules/akanjs/libs/${libName}/package.json`;
-    if (!(await workspace.exists(installedPackageJson))) return false;
+    if (!(await workspace.exists(installedPackageJson))) return null;
     await workspace.cp(`node_modules/akanjs/libs/${libName}`, `libs/${libName}`);
-    return true;
+    return { origin: "akanjs", sha: await this.#installedAkanVersion(workspace) };
+  }
+
+  async #installedAkanVersion(workspace: Workspace) {
+    const manifestPath = "node_modules/akanjs/package.json";
+    if (!(await workspace.exists(manifestPath))) return "unknown";
+    const { version } = (await workspace.readJson(manifestPath)) as { version?: string };
+    return version ?? "unknown";
   }
 
   async #copyLibraryFromRepository(workspace: Workspace, libName: string) {
     await workspace.mkdir("node_modules/.akan");
     if (await workspace.exists("node_modules/.akan/akanjs")) await workspace.removeDir("node_modules/.akan/akanjs");
-    await workspace.exec(`cd node_modules/.akan && git clone https://github.com/akan-team/akanjs.git`);
+    await workspace.exec(`cd node_modules/.akan && git clone ${LibraryRunner.libraryRepository}`);
     await workspace.cp(`node_modules/.akan/akanjs/libs/${libName}`, `libs/${libName}`);
+    const sha = await workspace.spawn("git", ["-C", "node_modules/.akan/akanjs", "rev-parse", "HEAD"]);
+    return { origin: LibraryRunner.libraryRepository, sha: sha.trim().slice(0, 12) };
   }
 
+  // Re-runnable: the source is overwritten, the testing env (the installer's own values) is kept, and an empty
+  // index skips the commit.
   async installLibrary(workspace: Workspace, libName: string) {
-    const copiedFromInstalledPackage = await this.#copyInstalledLibrary(workspace, libName);
-    if (!copiedFromInstalledPackage) await this.#copyLibraryFromRepository(workspace, libName);
-    await workspace.cp(`libs/${libName}/env/env.server.example.ts`, `libs/${libName}/env/env.server.testing.ts`);
-    await workspace.commit(`Add ${libName} library`);
-    return LibExecutor.from(workspace, libName);
+    const source =
+      (await this.#copyInstalledLibrary(workspace, libName)) ??
+      (await this.#copyLibraryFromRepository(workspace, libName));
+    const testingEnv = `libs/${libName}/env/env.server.testing.ts`;
+    if (!(await workspace.exists(testingEnv)))
+      await workspace.cp(`libs/${libName}/env/env.server.example.ts`, testingEnv);
+    const lib = LibExecutor.from(workspace, libName);
+    const stamp = await new LibSource(lib).write(source);
+    if (await workspace.hasChanges()) await workspace.commit(`Install ${libName} library from ${stamp.origin}`);
+    return lib;
+  }
+
+  async libraryStatuses(workspace: Workspace) {
+    const libNames = await workspace.getLibs();
+    return await Promise.all(libNames.map((libName) => new LibSource(LibExecutor.from(workspace, libName)).status()));
   }
   async mergeLibraryDependencies(lib: Lib) {
     const libPackageJson = await lib.getPackageJson();
@@ -52,7 +74,7 @@ export class LibraryRunner extends runner("library") {
     Object.keys(allDependencies)
       .sort()
       .forEach((dep) => {
-        if (!!libPackageJson.dependencies?.[dep] || !!rootPackageJson.dependencies?.[dep])
+        if (libPackageJson.dependencies?.[dep] || rootPackageJson.dependencies?.[dep])
           dependencies[dep] = allDependencies[dep];
         else devDependencies[dep] = allDependencies[dep];
       });
@@ -60,21 +82,5 @@ export class LibraryRunner extends runner("library") {
     await lib.workspace.setPackageJson(newRootPackageJson);
     await lib.workspace.spawn("bun", ["install"]);
     await lib.workspace.commit(`Merge ${lib.name} library dependencies`);
-  }
-
-  async testLibrary(lib: Lib) {
-    // await lib.workspace.spawn(
-    //   "node",
-    //   ["node_modules/jest/bin/jest.js", `libs/${lib.name}`, "-c", `libs/${lib.name}/jest.config.ts`],
-    //   {
-    //     env: {
-    //       ...this.#getEnv(lib),
-    //       AKAN_PUBLIC_ENV: "testing",
-    //       AKAN_PUBLIC_OPERATION_MODE: "local",
-    //       AKAN_PUBLIC_APP_NAME: lib.name,
-    //       NODE_TLS_REJECT_UNAUTHORIZED: "0",
-    //     },
-    //   }
-    // );
   }
 }

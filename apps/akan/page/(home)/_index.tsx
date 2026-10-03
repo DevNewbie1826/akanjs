@@ -1,117 +1,256 @@
 import { usePage } from "@apps/akan/client";
-import { Link } from "akanjs/ui";
-import { BsArrowRight, BsCheckCircle, BsCloud, BsCodeSlash, BsTerminal } from "react-icons/bs";
+import {
+  Code,
+  Duet,
+  Friend,
+  JellyCast,
+  JellyKicker,
+  jellyButtonRecipe,
+  Orrery,
+  panelRecipe,
+  SkyBuild,
+  Start,
+  StudioStar,
+} from "@apps/akan/ui";
+import { cn, page } from "akanjs/client";
+import { Clipboard, Image, Link } from "akanjs/ui";
+import { BsArrowDown, BsArrowRight, BsArrowUpRight } from "react-icons/bs";
 
-const highlightCode = (code: string) => {
-  const tokenPattern =
-    /("(?:[^"\\]|\\.)*"|\b(?:export|class|extends|const|type|interface)\b|\b(?:via|field|String|Number|Boolean)\b|\bbunx\b|create-akan-workspace@latest)/g;
-  return code.split(tokenPattern).map((token, index) => {
-    if (!token) return null;
-    if (/^"/.test(token)) {
-      return (
-        <span key={`${token}-${index}`} className="text-emerald-300">
-          {token}
-        </span>
-      );
-    }
-    if (/^(export|class|extends|const|type|interface)$/.test(token)) {
-      return (
-        <span key={`${token}-${index}`} className="text-pink-300">
-          {token}
-        </span>
-      );
-    }
-    if (/^(via|field|String|Number|Boolean)$/.test(token)) {
-      return (
-        <span key={`${token}-${index}`} className="text-sky-300">
-          {token}
-        </span>
-      );
-    }
-    if (token === "bunx") {
-      return (
-        <span key={`${token}-${index}`} className="text-violet-300">
-          {token}
-        </span>
-      );
-    }
-    if (token === "create-akan-workspace@latest") {
-      return (
-        <span key={`${token}-${index}`} className="text-sky-300">
-          {token}
-        </span>
-      );
-    }
-    return token;
-  });
-};
+const mcpUrl = "https://akanjs.com/mcp";
 
-const RawCode = ({ code, prompt, className = "" }: { code: string; prompt?: string; className?: string }) => {
-  return (
-    <pre
-      className={`w-full overflow-x-auto rounded-lg bg-slate-800 p-4 text-left font-mono text-sm ${className}`}
-      style={{ overflowWrap: "break-word", whiteSpace: "pre-wrap" }}
-    >
-      <code className="block text-slate-100">
-        {prompt && (
-          <span className="select-none text-slate-400" aria-hidden="true">
-            {prompt}{" "}
-          </span>
-        )}
-        {highlightCode(code)}
-      </code>
-    </pre>
-  );
-};
-
-export default function Page() {
+const screenCode = `export const Order = () => {
   const { l } = usePage();
-  const personaCards = [
+  const icecreamOrderForm = st.use.icecreamOrderForm();
+  const order = st.tool("createIcecreamOrder", { confirm: true }) // [!code highlight]
+    .desc("Place the order in the form.")
+    .exec(() => st.do.createIcecreamOrder());
+  return (
+    <>
+      <Field.MultiToggleSelect
+        label={l("icecreamOrder.toppings")}
+        items={cnst.Topping}
+        value={icecreamOrderForm.toppings}
+        onChange={st.do.setToppingsOnIcecreamOrder} // [!code highlight]
+      />
+      <Button onClick={order}>{l("icecreamOrder.createIcecreamOrder")}</Button>
+    </>
+  );
+};`;
+
+const serverCode = `serveIcecreamOrder: mutation(cnst.IcecreamOrder, {
+  guards: [Admin], // [!code highlight]
+})
+  .param("icecreamOrderId", ID)
+  .exec(async function (icecreamOrderId) {
+    return await this.icecreamOrderService.serve(icecreamOrderId);
+  }),
+refundIcecreamOrder: mutation(cnst.IcecreamOrder, {
+  guards: [Every, Person], // [!code highlight]
+})
+  .param("icecreamOrderId", ID)
+  .with(Self)
+  .exec(async function (icecreamOrderId, self) {
+    return await this.icecreamOrderService.refund(icecreamOrderId, self.id);
+  }),`;
+
+const factTints = ["tint-planet", "tint-rocket", "tint-moon", "tint-comet"] as const;
+const qualityFriends = ["cloud", "moon", "comet", "rocket"] as const;
+
+export default page().render(() => {
+  const { l } = usePage();
+  const stepTitle = "mt-2 font-black text-xl sm:text-3xl lg:mt-3";
+  const stepBody = "mt-2 max-w-xl text-[0.9375rem] text-foreground/65 leading-6 sm:text-lg sm:leading-8 lg:mt-3";
+  const tagline = l.trans({
+    en: "The TypeScript framework, agents included.",
+    ko: "에이전트까지 들어 있는 TypeScript 프레임워크.",
+  });
+  const dimensions = [
+    l.trans({ en: "1 line", ko: "한 줄" }),
+    l.trans({ en: "8 layers", ko: "8 레이어" }),
+    l.trans({ en: "6 platforms", ko: "6 플랫폼" }),
+    l.trans({ en: "people & agents", ko: "사람과 에이전트" }),
+  ];
+  const chapters = [
     {
-      audience: l.trans({ en: "Web devs", ko: "웹 개발자" }),
-      title: l.trans({ en: "Web's fine — but the app is blocking you?", ko: "웹은 되는데 앱이 발목을 잡나요?" }),
-      description: l.trans({
-        en: "The same business code becomes SEO-ready web and native-feeling iOS/Android screens.",
-        ko: "같은 비즈니스 코드가 SEO 웹과 네이티브 느낌의 iOS/Android 화면까지 그대로 갑니다.",
+      numeral: "1",
+      tag: l.trans({ en: "1 line", ko: "한 줄" }),
+      title: l.trans({ en: "The line you write.", ko: "당신이 쓰는 한 줄." }),
+      body: l.trans({
+        en: "Adding a field is one declaration — a name and a type. The database, API, screens and agent tools all come from that line, so there is nothing else to write by hand.",
+        ko: "필드를 더하는 일은 선언 한 줄, 이름과 타입이면 됩니다. DB, API, 화면, 에이전트 도구까지 모두 이 한 줄에서 나오니 손으로 더 쓸 것이 없습니다.",
       }),
     },
     {
-      audience: l.trans({ en: "App devs", ko: "앱 개발자" }),
-      title: l.trans({
-        en: "Shipping the app, but server and DB drag you down?",
-        ko: "앱은 만드는데 서버와 DB가 부담인가요?",
-      }),
-      description: l.trans({
-        en: "Bun server, SQLite, API contracts, and validation follow — no hand-wiring.",
-        ko: "Bun 서버, SQLite, API 계약, 검증까지 손으로 배선하지 않아도 따라옵니다.",
+      numeral: "×8",
+      tag: l.trans({ en: "8 layers", ko: "8 레이어" }),
+      title: l.trans({ en: "Through every layer.", ko: "모든 레이어를 관통하고," }),
+      body: l.trans({
+        en: "That one line drops through the schema, query, service, API, fetch, client type, state and UI prop — the eight places of the first project, now changing together. Nothing to chase, nothing to miss.",
+        ko: "그 한 줄이 스키마, 쿼리, 서비스, API, fetch, 클라이언트 타입, 상태, UI prop까지 뚫고 내려갑니다. 첫 번째 프로젝트의 8곳이 함께 바뀌니, 따라 고칠 곳도 빠뜨릴 곳도 없습니다.",
       }),
     },
     {
-      audience: l.trans({ en: "Solo / small teams", ko: "1인 창업가 / 소규모 팀" }),
-      title: l.trans({
-        en: "Doing it all alone, or with one teammate?",
-        ko: "혼자, 혹은 둘이 다 해야 하나요?",
+      numeral: "×6",
+      tag: l.trans({ en: "6 platforms", ko: "6 플랫폼" }),
+      title: l.trans({ en: "Onto every platform.", ko: "모든 플랫폼에 닿고," }),
+      body: l.trans({
+        en: "The same code ships as SEO-ready web, iOS and Android apps, and macOS, Windows and Linux desktop apps — with native-level screen transitions, not a wrapped website. One implementation to maintain, not six to keep in step.",
+        ko: "같은 코드가 SEO 웹, iOS·Android 앱, macOS·Windows·Linux 데스크톱 앱으로 배포됩니다. 감싼 웹사이트가 아니라 네이티브 수준의 화면 전환까지 갖춘 채로요. 보조를 맞출 코드베이스 여섯 개가 아니라 관리할 구현 하나뿐입니다.",
       }),
-      description: l.trans({
-        en: "One full-stack developer owns all five surfaces. One person, a quarter of the time.",
-        ko: "풀스택 1명이 5개 표현을 책임집니다. 사람 한 명, 시간 1/4.",
+    },
+    {
+      numeral: "×2",
+      tag: l.trans({ en: "people & agents", ko: "사람과 에이전트" }),
+      title: l.trans({ en: "For people and agents alike.", ko: "사람과 에이전트 모두에게." }),
+      body: l.trans({
+        en: "Every guarded endpoint becomes an MCP tool and every control on screen an in-page agent tool, behind the same guards people pass. The screens, servers and guards you saw above all start here — in code you already wrote.",
+        ko: "가드를 통과한 엔드포인트는 MCP 도구가, 화면의 컨트롤은 인페이지 에이전트 도구가 됩니다. 사람과 같은 가드를 거쳐서요. 앞에서 본 화면과 서버, 가드가 모두 여기서 시작하고, 이미 쓴 코드로 만들어집니다.",
       }),
     },
   ];
-  const workflowLayers = [
-    l.trans({ en: "Define the DB schema", ko: "DB 스키마 정의" }),
-    l.trans({ en: "Add the query field", ko: "쿼리 필드 추가" }),
-    l.trans({ en: "Add the service logic", ko: "서비스 로직 추가" }),
-    l.trans({ en: "Add the API field", ko: "API 필드 추가" }),
-    l.trans({ en: "Add the fetch field", ko: "fetch 필드 추가" }),
-    l.trans({ en: "Declare the client type", ko: "클라이언트 타입 선언" }),
-    l.trans({ en: "Declare the state management", ko: "상태관리 선언" }),
-    l.trans({ en: "Declare the UI prop", ko: "UI prop 선언" }),
+  const screenSteps = [
+    <>
+      <h3 className={stepTitle}>
+        {l.trans({ en: "Write the screen you were going to write.", ko: "원래 쓰려던 화면을 그대로 씁니다." })}
+      </h3>
+      <p className={stepBody}>
+        {l.trans({
+          en: "A field handed its setter publishes it. A button's handler becomes a tool with one st.tool line — the same function the button calls.",
+          ko: "setter를 넘겨받은 필드는 그 setter를 공개합니다. 버튼 핸들러는 st.tool 한 줄로 툴이 되고, 버튼이 부르는 바로 그 함수가 됩니다.",
+        })}
+      </p>
+      <Code.Snippet
+        className="mt-6 w-full max-lg:hidden"
+        title="IcecreamOrder.Zone.tsx"
+        language="tsx"
+        code={screenCode}
+        showLineNumbers={false}
+        copy={false}
+      />
+    </>,
+    <>
+      <h3 className={stepTitle}>
+        {l.trans({ en: "An agent sees tools, not pixels.", ko: "에이전트에게는 픽셀이 아니라 도구가 보입니다." })}
+      </h3>
+      <p className={stepBody}>
+        {l.trans({
+          en: "Every control you wired is published under its own name, with the arguments it takes. What isn't on the screen isn't on the list — no lever the user doesn't have.",
+          ko: "연결한 컨트롤마다 자기 이름과 받는 인자로 공개됩니다. 화면에 없는 것은 목록에도 없습니다. 사용자에게 없는 레버는 에이전트에게도 없습니다.",
+        })}
+      </p>
+    </>,
+    <>
+      <h3 className={stepTitle}>
+        {l.trans({ en: "Ask, and it works the screen.", ko: "부탁하면, 화면을 직접 다룹니다." })}
+      </h3>
+      <p className={stepBody}>
+        {l.trans({
+          en: "It runs in the customer's own tab, with their session — exactly like a click. You watch the pointer land on every control it uses.",
+          ko: "고객 자신의 탭에서, 고객의 세션으로 돕니다. 클릭과 똑같습니다. 포인터가 쓰는 컨트롤마다 내려앉는 모습이 그대로 보입니다.",
+        })}
+      </p>
+    </>,
+    <>
+      <h3 className={stepTitle}>
+        {l.trans({ en: "What matters waits for a yes.", ko: "중요한 일은 승인을 기다립니다." })}
+      </h3>
+      <p className={stepBody}>
+        {l.trans({
+          en: "A tool declared with confirm stops on an approval card. Approve, and the handler the button calls runs — through the same guards.",
+          ko: "confirm으로 선언한 툴은 승인 카드에서 멈춥니다. 승인하면 버튼이 부르는 핸들러가 같은 가드를 지나 실행됩니다.",
+        })}
+      </p>
+      <p className="mt-5 font-mono text-foreground/45 text-xs leading-6">
+        {l.trans({
+          en: "Setup: one <Agent.Chat /> in a layout, and your model's key.",
+          ko: "설정: 레이아웃에 <Agent.Chat /> 하나, 그리고 모델 키.",
+        })}
+      </p>
+    </>,
+  ];
+  const serverSteps = [
+    <>
+      <h3 className={stepTitle}>
+        {l.trans({ en: "Point any MCP client at your app.", ko: "MCP 클라이언트에 앱 주소만 넣습니다." })}
+      </h3>
+      <p className={stepBody}>
+        {l.trans({
+          en: "/mcp is on by default. Every endpoint whose guards admit the caller is a tool, described by the dictionary you already write.",
+          ko: "/mcp는 기본으로 켜져 있습니다. 가드가 허용하는 엔드포인트는 모두 툴이 되고, 설명은 이미 쓰는 사전에서 옵니다.",
+        })}
+      </p>
+      <Code.Snippet
+        className="mt-6 w-full max-lg:hidden"
+        title="icecreamOrder.signal.ts"
+        code={serverCode}
+        showLineNumbers={false}
+        copy={false}
+      />
+    </>,
+    <>
+      <h3 className={stepTitle}>
+        {l.trans({ en: "Sign-in and consent happen on your app.", ko: "로그인과 동의는 당신의 앱에서 합니다." })}
+      </h3>
+      <p className={stepBody}>
+        {l.trans({
+          en: "OAuth 2.1 ships with libs/shared. The AI gets a token for this one user — exactly their rights, revocable at any time.",
+          ko: "OAuth 2.1은 libs/shared에 들어 있습니다. AI는 이 사용자 한 명의 토큰을 받고, 권한도 딱 그 사용자만큼이며, 언제든 해지할 수 있습니다.",
+        })}
+      </p>
+    </>,
+    <>
+      <h3 className={stepTitle}>{l.trans({ en: "Then it just works.", ko: "그다음엔 그냥 됩니다." })}</h3>
+      <p className={stepBody}>
+        {l.trans({
+          en: "Ask in plain words. It calls your endpoints through the same guards and services as your screens — and the board that's open updates live.",
+          ko: "평범한 말로 부탁하면, 화면과 같은 가드와 서비스를 지나 엔드포인트를 부릅니다. 열려 있는 보드는 실시간으로 바뀝니다.",
+        })}
+      </p>
+    </>,
+    <>
+      <h3 className={stepTitle}>
+        {l.trans({ en: "And it can't do what it shouldn't.", ko: "해서는 안 되는 일은 못 합니다." })}
+      </h3>
+      <p className={stepBody}>
+        {l.trans({
+          en: "refundIcecreamOrder is guarded by Person, so it never reaches the shelf. To the AI it looks exactly like a tool that doesn't exist.",
+          ko: "refundIcecreamOrder에는 Person 가드가 걸려 있어 목록에 올라가지 않습니다. AI에게는 처음부터 없는 툴과 똑같아 보입니다.",
+        })}
+      </p>
+    </>,
+  ];
+  const facts = [
+    {
+      title: l.trans({ en: "Refusals give nothing away", ko: "거절은 아무것도 드러내지 않습니다" }),
+      body: l.trans({
+        en: "A tool an agent may not use answers exactly like one that doesn't exist, so the shelf leaks nothing.",
+        ko: "에이전트가 쓸 수 없는 툴은 처음부터 없는 툴과 똑같이 답하므로, 목록이 아무것도 흘리지 않습니다.",
+      }),
+    },
+    {
+      title: l.trans({ en: "Rate-limited per caller", ko: "호출자마다 속도 제한" }),
+      body: l.trans({
+        en: "MCP calls are capped at 120 a minute and 8 at once for each caller.",
+        ko: "MCP 호출은 호출자마다 분당 120번, 동시에 8개로 묶입니다.",
+      }),
+    },
+    {
+      title: l.trans({ en: "Secrets stay home", ko: "비밀은 밖으로 나가지 않습니다" }),
+      body: l.trans({
+        en: "Hidden and secret fields are stripped before anything reaches a model.",
+        ko: "hidden·secret 필드는 모델에 닿기 전에 빠집니다.",
+      }),
+    },
+    {
+      title: l.trans({ en: "Connections end when you say", ko: "연결은 언제든 끝낼 수 있습니다" }),
+      body: l.trans({
+        en: "Revoke a connection and its next call is refused. The chat relay keeps no session and no transcript.",
+        ko: "연결을 해지하면 다음 호출부터 거절됩니다. 채팅 릴레이는 세션도 대화도 남기지 않습니다.",
+      }),
+    },
   ];
   const qualityItems = [
     {
-      icon: <BsTerminal className="size-7" />,
-      iconClassName: "text-primary",
       title: l.trans({ en: "Config Hell Ends", ko: "config 파일 지옥은 그만" }),
       description: l.trans({
         en: "Configure everything in akan.config.ts. Even when you configure nothing, defaults keep the product moving.",
@@ -119,8 +258,6 @@ export default function Page() {
       }),
     },
     {
-      icon: <BsCodeSlash className="size-7" />,
-      iconClassName: "text-accent",
       title: l.trans({ en: "Strict Rules, Unified Style", ko: "엄격한 규칙, 통일된 스타일" }),
       description: l.trans({
         en: "File paths, names, structures, and declarations stay consistent. Code reads like one person wrote it.",
@@ -128,17 +265,13 @@ export default function Page() {
       }),
     },
     {
-      icon: <BsCloud className="size-7" />,
-      iconClassName: "text-secondary",
-      title: l.trans({ en: "Slice Removes Spaghetti State", ko: "슬라이스 하나로 스파게티 상태관리 제거" }),
+      title: l.trans({ en: "Rules Agents Can't Route Around", ko: "에이전트가 우회할 수 없는 규칙" }),
       description: l.trans({
-        en: "Declare a slice once and get list loading, pagination, statistics, state, and loading behavior together.",
-        ko: "슬라이스 하나로 리스트 조회, 페이지네이션, 통계조회, 상태관리, 로딩처리가 함께 생성됩니다.",
+        en: "Every workspace ships a plan-then-apply workflow MCP and akan code, so an agent edits through the rules, not around them.",
+        ko: "모든 워크스페이스에 계획 후 적용하는 워크플로 MCP와 akan code가 들어 있어 에이전트는 규칙을 우회하지 않고 규칙을 따라 고칩니다.",
       }),
     },
     {
-      icon: <BsCheckCircle className="size-7" />,
-      iconClassName: "text-success",
       title: l.trans({ en: "Agentic Full-Stack, Redefined", ko: "에이전틱 풀스택의 재정의" }),
       description: l.trans({
         en: "Fixed blocks for upload, login, admin, chat, boards, and alerts let agents produce consistent code.",
@@ -146,599 +279,507 @@ export default function Page() {
       }),
     },
   ];
-  const platformSurfaces = [
-    l.trans({ en: "SEO-ready server-side rendering", ko: "SEO 최적화 서버사이드 렌더링" }),
-    l.trans({ en: "iOS / Android client rendering", ko: "iOS / Android 클라이언트 렌더링" }),
-    l.trans({ en: "Bun HTTP / WebSocket server", ko: "Bun HTTP / WebSocket 서버" }),
-    l.trans({ en: "SQLite first, Postgres / Redis ready", ko: "SQLite 우선, Postgres / Redis 확장" }),
-    l.trans({ en: "Schema validation and secure middleware", ko: "스키마 검증과 보안 미들웨어" }),
-    l.trans({ en: "Type-safe from DB to UI", ko: "DB부터 UI까지 타입 안전" }),
-    l.trans({ en: "Built-in internationalization", ko: "다국어 지원 기본 탑재" }),
-    l.trans({ en: "Official plugin blocks", ko: "공식 플러그인 기능 블록" }),
+  const proofItems = [
+    { value: "26MB → 8.1MB", label: l.trans({ en: "Client build output in v3", ko: "v3 클라이언트 빌드 결과물" }) },
+    {
+      value: "3.5ms → 0.9ms",
+      label: l.trans({ en: "Hydrating 1,000 rows on the client", ko: "클라이언트 1,000행 하이드레이션" }),
+    },
+    { value: "−33%", label: l.trans({ en: "Time for a 50-row list query", ko: "50행 목록 쿼리 시간" }) },
   ];
-  const automationItems = [
+  const deploySteps = [
     {
-      title: l.trans({ en: "Schema becomes DB documentation", ko: "스키마를 짜면 DB 테이블 정의서가 나옵니다" }),
+      command: "akan login",
       description: l.trans({
-        en: "Business schema is not only runtime code. It becomes documentation your team can inspect together.",
-        ko: "비즈니스 스키마는 실행 코드에 그치지 않습니다. 팀이 함께 확인할 수 있는 정의서가 됩니다.",
+        en: "Sign in to Akan Cloud from your machine.",
+        ko: "이 컴퓨터에서 Akan Cloud에 로그인합니다.",
       }),
     },
     {
-      title: l.trans({ en: "Endpoint becomes live API docs", ko: "엔드포인트를 짜면 API 정의서가 실시간으로" }),
+      command: "akan tunnel <app>",
       description: l.trans({
-        en: "API contracts stay close to implementation, and the generated surface can be tested as you build.",
-        ko: "API 계약은 구현 가까이에 머물고, 생성된 표현은 개발 중 바로 테스트할 수 있습니다.",
+        en: "Share the app you are running on a public URL before you ship.",
+        ko: "배포 전에 실행 중인 앱을 공개 URL로 공유합니다.",
       }),
     },
     {
-      title: l.trans({ en: "Query condition expands into reads", ko: "쿼리조건 하나로 조회 기능 자동생성" }),
+      command: "akan build <app>",
       description: l.trans({
-        en: "One query condition can power list, detail, and statistics reads without repeating the same plumbing.",
-        ko: "쿼리조건 하나로 리스트, 단일조회, 통계조회가 이어집니다. 반복작업은 이제 그만.",
-      }),
-    },
-    {
-      title: l.trans({ en: "Slice removes spaghetti state", ko: "슬라이스 하나로 스파게티 상태관리 제거" }),
-      description: l.trans({
-        en: "Declare a slice once and get list loading, pagination, statistics, state, and loading behavior together.",
-        ko: "슬라이스 하나로 리스트 조회, 페이지네이션, 통계조회, 상태관리, 로딩처리가 함께 생성됩니다.",
-      }),
-    },
-  ];
-  const procedureItems = [
-    {
-      title: l.trans({ en: "Cross-Platform Development", ko: "크로스 플랫폼 개발" }),
-      description: l.trans({
-        en: "One page can become SEO-ready web and app-ready client screens with native-feeling transitions.",
-        ko: "하나의 페이지가 SEO 가능한 웹과 앱에 어울리는 클라이언트 화면으로 함께 배포됩니다.",
-      }),
-      src: "/cross_platform_dev_web.mp4",
-    },
-    {
-      title: l.trans({ en: "Database & API Integration", ko: "데이터베이스 & API 통합" }),
-      description: l.trans({
-        en: "Schema changes flow into database, validation, API contracts, and generated clients without hand wiring.",
-        ko: "스키마 변경이 데이터베이스, 검증, API 계약, 생성된 클라이언트까지 수작업 연결 없이 이어집니다.",
-      }),
-      src: "/database_api_en.mp4",
-    },
-    {
-      title: l.trans({ en: "Full-Stack Type Safety", ko: "전체 스택 타입 안전" }),
-      description: l.trans({
-        en: "Database schema changes automatically influence server, API, state management, and UI types.",
-        ko: "데이터베이스 스키마 설정이 서버, API, 상태관리, UI 타입까지 타입안전하게 반영됩니다.",
-      }),
-      src: "/fullstack_type_en.mp4",
-    },
-    {
-      title: l.trans({ en: "Domain-Driven State Management", ko: "도메인 기반 상태 관리" }),
-      description: l.trans({
-        en: "State, loading, pagination, and statistics follow the domain so UI code stays predictable.",
-        ko: "상태, 로딩, 페이지네이션, 통계가 도메인을 따라가므로 UI 코드가 예측 가능해집니다.",
-      }),
-      src: "/domain_based.mp4",
-    },
-    {
-      title: l.trans({ en: "Agent-Ready Code Generation", ko: "에이전트 친화적 코드 생성" }),
-      description: l.trans({
-        en: "Official patterns and plugins give agents predictable blocks for upload, login, admin, chat, boards, and alerts.",
-        ko: "업로드, 로그인, 관리자, 채팅, 게시판, 알림 같은 검증된 기능블록을 예측 가능한 구조로 조립합니다.",
-      }),
-      src: "/create_scalar.mp4",
-    },
-  ];
-  const transitionItems = [
-    {
-      title: "bottomup",
-      description: l.trans({
-        en: "Open focused flows from the bottom without leaving the CSR client.",
-        ko: "CSR 클라이언트를 벗어나지 않고 하단에서 집중 흐름을 열 수 있습니다.",
-      }),
-      src: l.trans({
-        en: "/csr/bottomup_en.mp4",
-        ko: "/csr/bottomup_ko.mp4",
-      }),
-    },
-    {
-      title: "fade",
-      description: l.trans({
-        en: "Change context calmly when the next screen is not a deeper page.",
-        ko: "다음 화면이 더 깊은 계층이 아닐 때 차분하게 맥락을 전환합니다.",
-      }),
-      src: l.trans({
-        en: "/csr/fade_en.mp4",
-        ko: "/csr/fade_ko.mp4",
-      }),
-    },
-    {
-      title: "scale",
-      description: l.trans({
-        en: "Guide attention into the next page with a light zoom transition.",
-        ko: "가벼운 확대 전환으로 다음 페이지에 시선을 자연스럽게 모읍니다.",
-      }),
-      src: l.trans({
-        en: "/csr/scale_en.mp4",
-        ko: "/csr/scale_ko.mp4",
-      }),
-    },
-    {
-      title: "stack",
-      description: l.trans({
-        en: "Push detail screens over lists with layered client navigation.",
-        ko: "목록 위로 상세 화면을 쌓아 올리는 클라이언트 내비게이션을 만듭니다.",
-      }),
-      src: l.trans({
-        en: "/csr/stack_en.mp4",
-        ko: "/csr/stack_ko.mp4",
+        en: "Build the production artifact Akan Cloud runs.",
+        ko: "Akan Cloud가 돌릴 프로덕션 결과물을 빌드합니다.",
       }),
     },
   ];
 
   return (
-    <main className="relative min-h-screen overflow-hidden bg-base-100 text-base-content">
-      <div className="absolute inset-x-0 top-20 h-px bg-linear-to-r from-transparent via-primary/60 to-transparent" />
-
-      <section className="relative mx-auto grid min-h-screen w-full max-w-7xl items-center gap-10 px-6 pt-32 pb-20 lg:grid-cols-[1.02fr_0.98fr] lg:px-8">
-        <div>
-          <div className="badge mb-6 border-primary/20 bg-primary/10 px-4 py-3 text-primary">
-            <BsCheckCircle />
-            {l.trans({ en: "One line, every platform", ko: "한 줄, 모든 플랫폼" })}
-          </div>
-          <h1 className="max-w-4xl font-black text-5xl text-base-content tracking-tight sm:text-5xl lg:text-6xl">
-            {l.trans({
-              en: "One line of business code ships web, iOS, Android, server, and database",
-              ko: "한 줄의 비즈니스 코드로 웹·iOS·Android·서버·DB를",
-            })}
-            <span className="text-primary">
-              {l.trans({
-                en: " together.",
-                ko: " 한 번에.",
-              })}
-            </span>
-          </h1>
-          <p className="mt-6 max-w-2xl text-base-content/70 text-lg leading-8">
-            {l.trans({
-              en: "No more framework assembly, duplicated declarations, or per-platform rewrites. Write business intent in one place, and five surfaces follow.",
-              ko: "프레임워크 조립, 중복 선언, 플랫폼별 재작성은 이제 그만. 비즈니스 코드 한 곳만 작성하면 5개 표현이 같이 따라옵니다.",
-            })}
-          </p>
-          <p className="mt-3 max-w-2xl text-base text-base-content/60 leading-7">
-            {l.trans({
-              en: "Akan starts with the result people feel first, then keeps the method explainable from database to UI.",
-              ko: "Akan은 먼저 체감되는 결과를 만들고, 그 방법론을 데이터베이스부터 UI까지 납득 가능하게 유지합니다.",
-            })}
-          </p>
-          <div className="mt-8 flex flex-wrap gap-3">
-            {["akan.config.ts", "Web", "iOS", "Android", "Server", "DB", "Type-safe", "Plugins"].map((surface) => (
-              <span
-                key={surface}
-                className="badge badge-lg border-base-content/10 bg-base-content/10 text-base-content"
+    <main className="relative min-h-screen overflow-x-clip break-keep text-foreground">
+      <div className="relative">
+        <section className="relative flex min-h-[100svh] flex-col justify-center pt-[var(--akanjs-header-offset)] pb-12">
+          <div className="mx-auto grid w-full max-w-7xl grid-cols-1 items-center gap-4 px-6 lg:grid-cols-[0.8fr_1.2fr] lg:px-8">
+            <div className="intro-rise mx-auto w-52 sm:w-72 lg:w-full lg:max-w-120">
+              <StudioStar className="w-full" priority />
+            </div>
+            <div className="flex flex-col items-center lg:items-start">
+              <p
+                aria-hidden="true"
+                className="intro-rise font-black text-[clamp(4.25rem,15vw,11.5rem)] leading-[0.82] tracking-[-0.065em] [--intro-delay:80ms]"
               >
-                {surface}
-              </span>
-            ))}
-          </div>
-          <div className="mt-10 flex flex-col gap-3 sm:flex-row">
-            <Link href="/docs/intro/quickstart">
-              <button className="btn border-none bg-primary text-base-100 hover:bg-primary/80">
-                {l.trans({ en: "Get Started", ko: "시작하기" })} <BsArrowRight className="ml-2" />
-              </button>
-            </Link>
-          </div>
-        </div>
-
-        <div className="relative">
-          <div className="absolute inset-0 rotate-3 rounded-4xl bg-primary/20 blur-2xl" />
-          <div className="relative overflow-hidden rounded-4xl border border-base-content/10 bg-base-content/6 p-5 shadow-2xl backdrop-blur">
-            <div className="mb-5 flex items-center justify-between rounded-2xl border border-base-content/10 bg-base-100/70 px-4 py-3">
-              <div>
-                <p className="text-base-content/40 text-xs tracking-[0.24em]">Akan.js</p>
-                <p className="font-semibold text-base-content text-lg">
-                  {l.trans({ en: "Business code becomes the whole product", ko: "비즈니스 코드가 제품 전체가 됩니다" })}
+                Akan.js
+              </p>
+              <div className="mt-5 flex flex-col items-center gap-1.5 lg:ml-2 lg:flex-row lg:gap-3">
+                <p className="intro-rise text-center font-bold text-base text-foreground/55 [--intro-delay:160ms] sm:text-lg lg:text-left">
+                  {tagline}
+                </p>
+                <p className="intro-rise text-center font-medium text-foreground/40 text-sm [--intro-delay:200ms] sm:text-base lg:text-left">
+                  {l.trans({ en: "Powered by Bun", ko: "Bun으로 구동" })}
                 </p>
               </div>
-              <div className="rounded-xl bg-primary/10 px-3 py-2 font-medium text-primary text-sm">1 → All</div>
-            </div>
-            <RawCode
-              code={`export class ProductInput extends via((field) => ({
-  name: field(String),
-})) {}`}
-            />
-            <div className="mt-5 grid gap-3 sm:grid-cols-2">
-              {[
-                {
-                  title: l.trans({ en: "Web / App", ko: "웹 / 앱" }),
-                  description: l.trans({
-                    en: "SEO web and native-feeling client transitions.",
-                    ko: "SEO 가능한 웹과 앱다운 페이지 전환.",
-                  }),
-                },
-                {
-                  title: l.trans({ en: "Server / Realtime", ko: "서버 / 실시간" }),
-                  description: l.trans({
-                    en: "Bun-powered HTTP and WebSocket surfaces.",
-                    ko: "Bun 기반 HTTP와 WebSocket 표현.",
-                  }),
-                },
-                {
-                  title: l.trans({ en: "Database / Validation", ko: "DB / 검증" }),
-                  description: l.trans({
-                    en: "SQLite first, scalable, and schema validated.",
-                    ko: "SQLite 우선, 확장 가능, 스키마 검증.",
-                  }),
-                },
-                {
-                  title: l.trans({ en: "Docs / Plugins", ko: "문서 / 플러그인" }),
-                  description: l.trans({
-                    en: "Live docs and official feature blocks.",
-                    ko: "실시간 문서와 공식 기능 블록.",
-                  }),
-                },
-              ].map((item) => (
-                <div key={item.title} className="rounded-2xl border border-base-content/10 bg-base-100/80 p-4">
-                  <p className="font-bold text-base-content">{item.title}</p>
-                  <p className="mt-1 text-base-content/60 text-sm leading-6">{item.description}</p>
-                </div>
-              ))}
+              <JellyCast
+                className="intro-rise mt-8 [--intro-delay:240ms] lg:ml-2"
+                friendClassName="size-14 sm:size-18 lg:size-22"
+              />
             </div>
           </div>
-        </div>
-      </section>
+        </section>
 
-      <section className="relative mx-auto w-full max-w-7xl px-6 pb-20 lg:px-8">
-        <div className="mb-10 text-center">
-          <div className="badge mb-4 border-base-content/10 bg-base-content/10 text-base-content">
-            {l.trans({ en: "Built for the pain you already feel", ko: "이미 느끼고 있는 문제를 위해" })}
-          </div>
-          <h2 className="font-black text-3xl tracking-tight md:text-5xl">
-            {l.trans({ en: "Built for the pain you already feel.", ko: "각자의 페인포인트를 먼저 해결합니다." })}
-          </h2>
-          <p className="mx-auto mt-4 max-w-4xl text-base-content/60 leading-7">
-            {l.trans({
-              en: "Web, app, server, database, and team size all hurt in different ways. Akan lets each developer recognize their own bottleneck first.",
-              ko: "웹, 앱, 서버, DB, 팀 규모는 저마다 다른 방식으로 발목을 잡습니다. Akan은 각 개발자가 자기 병목을 먼저 알아보게 합니다.",
-            })}
-          </p>
-        </div>
-        <div className="grid gap-4 lg:grid-cols-3">
-          {personaCards.map((card, index) => (
-            <div
-              key={card.title}
-              className="rounded-3xl border border-base-content/10 bg-base-content/4 p-6 backdrop-blur"
-            >
-              <div className="mb-5 flex items-center justify-between gap-4">
-                <span className="badge border-primary/20 bg-primary/10 text-primary">{card.audience}</span>
-                <span className="font-black text-4xl text-base-content/20">{index + 1}</span>
-              </div>
-              <h3 className="font-bold text-2xl text-base-content">{card.title}</h3>
-              <p className="mt-4 text-base-content/65 leading-7">{card.description}</p>
-            </div>
-          ))}
-        </div>
-      </section>
-
-      <section className="relative mx-auto w-full max-w-7xl px-6 py-20 lg:px-8">
-        <div className="mb-8 text-center md:mb-12">
-          <div className="badge mb-4 border-primary/20 bg-primary/10 text-primary">
-            {l.trans({ en: "8 in 1", ko: "8 in 1" })}
-          </div>
-          <h2 className="font-black text-3xl tracking-tight md:text-5xl">
-            {l.trans({ en: "One field. Eight layers follow.", ko: "필드 하나. 8개 레이어가 따라옵니다." })}
-          </h2>
-          <p className="mx-auto mt-4 max-w-4xl text-base-content/60 leading-7">
-            {l.trans({
-              en: "This is why one developer can own web, app, server, and database at once: the scattered wiring compresses into a single business declaration.",
-              ko: "1명이 웹, 앱, 서버, DB를 함께 책임질 수 있는 이유입니다. 흩어진 배선이 하나의 비즈니스 선언으로 압축됩니다.",
-            })}
-          </p>
-        </div>
-        <div className="relative overflow-hidden rounded-4xl border border-primary/20 bg-base-content/5 p-5 shadow-2xl backdrop-blur md:p-8">
-          <div className="absolute inset-x-0 top-0 h-px bg-linear-to-r from-transparent via-primary/70 to-transparent" />
-          <div className="grid gap-6 lg:grid-cols-[0.95fr_1.05fr]">
-            <div className="rounded-3xl border border-base-content/10 bg-base-100/80 p-6">
-              <div className="badge mb-4 border-error/20 bg-error/10 text-error">
-                {l.trans({ en: "Before", ko: "Before" })}
-              </div>
-              <h3 className="font-bold text-2xl">
-                {l.trans({
-                  en: "Adding one field the traditional way",
-                  ko: "기존 풀스택에서 필드 하나 추가하려면",
-                })}
-              </h3>
-              <p className="mt-3 text-base-content/60 text-sm leading-6">
-                {l.trans({
-                  en: "Adding a single business field usually means wiring all of this by hand.",
-                  ko: "비즈니스 필드 하나를 추가하려면 보통 이만큼을 직접 손으로 해야 합니다.",
-                })}
-              </p>
-              <div className="mt-5 grid gap-2">
-                {workflowLayers.map((layer, index) => (
-                  <div key={layer} className="flex items-center gap-3 rounded-2xl bg-base-content/5 px-4 py-3">
-                    <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-error/10 font-bold text-error text-xs">
-                      {index + 1}
-                    </span>
-                    <span className="font-medium text-base-content text-sm">{layer}</span>
-                  </div>
-                ))}
-              </div>
-              <p className="mt-5 text-base-content/60 text-sm leading-6">
-                {l.trans({
-                  en: "Change one place, chase eight. Miss one, and types break — or it blows up at runtime.",
-                  ko: "한 곳만 바뀌어도 8곳을 따라 고쳐야 하고, 한 곳을 빠뜨리면 타입이 깨지거나 런타임에서 터집니다.",
-                })}
-              </p>
-            </div>
-            <div className="rounded-3xl border border-primary/20 bg-base-100/80 p-6">
-              <div className="badge mb-4 border-primary/20 bg-primary/10 text-primary">
-                {l.trans({ en: "After — Akan.js", ko: "After — Akan.js" })}
-              </div>
-              <h3 className="font-bold text-2xl">
-                {l.trans({
-                  en: "One declaration becomes every layer",
-                  ko: "선언 하나가 모든 레이어가 됩니다",
-                })}
-              </h3>
-              <div className="mt-5">
-                <RawCode
-                  code={`export class ProductInput extends via((field) => ({
-  name: field(String),
-})) {}`}
-                />
-              </div>
-              <p className="mt-5 text-base-content/65 leading-7">
-                {l.trans({
-                  en: "One field declaration — schema and type defined at once. All eight layers above are generated automatically.",
-                  ko: "필드 선언 한 줄로 스키마와 타입이 동시에 정의됩니다. 위 8개 레이어는 전부 자동 생성됩니다.",
-                })}
-              </p>
-              <div className="mt-6 grid gap-3 sm:grid-cols-2">
-                {workflowLayers.map((layer) => (
-                  <div key={layer} className="rounded-2xl border border-primary/10 bg-primary/5 px-4 py-3">
-                    <p className="font-medium text-primary text-sm">{layer}</p>
-                  </div>
-                ))}
-              </div>
-              <p className="mt-5 text-base-content/50 text-xs leading-5">
-                {l.trans({
-                  en: "Diagram: field(String) on the left, eight generated layers branching out on the right.",
-                  ko: "다이어그램: 왼쪽의 field(String) 한 줄에서 오른쪽 8개 생성 레이어가 분기됩니다.",
-                })}
-              </p>
-            </div>
-          </div>
-        </div>
-      </section>
-
-      <section className="relative mx-auto w-full max-w-7xl px-6 py-20 lg:px-8">
-        <div className="mb-10 max-w-4xl">
-          <div className="badge mb-4 border-accent/20 bg-accent/10 text-accent">
-            {l.trans({ en: "Rules Create Quality", ko: "규칙이 품질을 만듭니다" })}
-          </div>
-          <h2 className="font-black text-3xl tracking-tight md:text-5xl">
-            {l.trans({
-              en: "AI coding turns to spaghetti past a certain size.",
-              ko: "AI 코딩은 일정 규모를 넘으면 스파게티가 됩니다.",
-            })}
-          </h2>
-          <p className="mt-5 max-w-3xl text-base-content/65 leading-7">
-            {l.trans({
-              en: "The faster an agent writes code, the more file paths, names, structures, and declaration styles drift apart — until review and maintenance fall over. Akan stops this at the source with strict rules.",
-              ko: "에이전트가 코드를 빨리 뽑을수록 파일 위치, 이름, 구조, 선언 방식이 제각각이 되어 리뷰와 유지보수가 무너집니다. Akan은 엄격한 규칙으로 이 문제를 원천 차단합니다.",
-            })}
-          </p>
-        </div>
-        <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-          {qualityItems.map((item) => (
-            <div
-              key={item.title}
-              className="rounded-3xl border border-base-content/10 bg-base-content/4 p-6 backdrop-blur"
-            >
-              <div
-                className={`mb-5 flex h-12 w-12 items-center justify-center rounded-2xl bg-base-100/80 ${item.iconClassName}`}
+        <section className="relative pt-16 pb-20">
+          <div className="mx-auto grid w-full max-w-7xl items-center gap-14 px-6 lg:grid-cols-[1.08fr_0.92fr] lg:px-8">
+            <div className="reveal-rise flex flex-col items-start">
+              <Link
+                href="/blog/v3release"
+                className="jelly-glass tint-accent inline-flex items-center gap-2.5 rounded-full px-4 py-2 font-bold text-sm transition hover:scale-[1.02]"
               >
-                {item.icon}
+                <span className="jelly tint-accent size-2.5 rounded-full" />
+                {l.trans({
+                  en: "New · Akan.js v3 — agents join the full stack",
+                  ko: "New · Akan.js v3 — 풀스택에 에이전트까지",
+                })}
+                <BsArrowRight />
+              </Link>
+              <h1 className="mt-7 font-black text-[2.5rem] leading-[1.04] sm:text-6xl">
+                <span className="block">{l.trans({ en: "Build a screen.", ko: "화면을 만들면," })}</span>
+                <span className="block text-primary">
+                  {l.trans({ en: "Agents can use it.", ko: "에이전트가 씁니다." })}
+                </span>
+                <span className="mt-3 block">{l.trans({ en: "Build a server.", ko: "서버를 만들면," })}</span>
+                <span className="block text-primary">
+                  {l.trans({ en: "Any AI can run it.", ko: "AI가 다룹니다." })}
+                  <span className="seed-caret ml-2" />
+                </span>
+              </h1>
+              <p className="mt-7 max-w-xl text-foreground/65 text-lg leading-8">
+                {l.trans({
+                  en: "No tool schemas, no MCP server to write, no second permission model. The app you build for people is already the one AI can use — on the model you choose.",
+                  ko: "툴 스키마도, 따로 쓰는 MCP 서버도, 에이전트용 권한 모델도 없습니다. 사람을 위해 만든 앱이 그대로 AI가 쓰는 앱이 됩니다. 모델은 원하는 것을 고르면 됩니다.",
+                })}
+              </p>
+              <div className="mt-9 flex w-full flex-col gap-3 sm:w-auto sm:flex-row sm:items-center">
+                <Link href="/docs/intro/quickstart" className={jellyButtonRecipe({ size: "lg" })}>
+                  {l.trans({ en: "Get started", ko: "시작하기" })} <BsArrowRight />
+                </Link>
+                <Start.Copy />
               </div>
-              <h3 className="font-bold text-base-content text-lg">{item.title}</h3>
-              <p className="mt-2 text-base-content/60 text-sm leading-6">{item.description}</p>
+              <p className="mt-4 text-foreground/50 text-sm leading-6">
+                {l.trans({
+                  en: "Paste it into Claude Code or Codex, and it sets up the workspace and starts your app.",
+                  ko: "Claude Code나 Codex에 붙여 넣으면 워크스페이스를 만들고 앱까지 띄워 줍니다.",
+                })}{" "}
+                <a href="#start" className="font-bold text-foreground/70 hover:text-foreground">
+                  {l.trans({ en: "See the prompt or the terminal command", ko: "프롬프트와 터미널 명령 보기" })} ↓
+                </a>
+              </p>
+              <a
+                href="#how"
+                className="group mt-9 flex flex-wrap items-center gap-x-2 gap-y-2 font-bold text-foreground/55 text-xs transition hover:text-foreground"
+              >
+                {dimensions.map((dimension, idx) => (
+                  <span className="flex items-center gap-2" key={dimension}>
+                    {idx > 0 ? <span className="text-foreground/30">×</span> : null}
+                    <span className="jelly-glass rounded-full px-3 py-1">{dimension}</span>
+                  </span>
+                ))}
+                <BsArrowDown className="ml-1 transition group-hover:translate-y-0.5" />
+              </a>
             </div>
-          ))}
+            <div className="reveal-rise flex flex-col items-center gap-6">
+              <Duet.Remote />
+              <Duet.Stage className="lg:[zoom:0.88] lg:short:[zoom:0.8]" />
+            </div>
+          </div>
+        </section>
+
+        <section className="relative px-6 py-24 lg:px-8">
+          <div className="mx-auto flex max-w-3xl flex-col items-center text-center">
+            <JellyKicker friend="moon">{l.trans({ en: "The usual way", ko: "보통은" })}</JellyKicker>
+            <h2 className="mt-6 text-balance font-black text-4xl sm:text-6xl">
+              {l.trans({ en: "Your next user doesn't click.", ko: "다음 사용자는 클릭하지 않습니다." })}
+            </h2>
+            <p className="mx-auto mt-6 max-w-2xl text-balance text-foreground/65 text-lg leading-8">
+              {l.trans({
+                en: "Agents already read screens and call APIs for the people they work for. Getting an app ready for them is usually a second project — stacked on the first one you already wire by hand.",
+                ko: "에이전트는 이미 사람을 대신해 화면을 읽고 API를 부릅니다. 앱을 여기에 맞추려면 보통 두 번째 프로젝트가 필요하고, 그 프로젝트는 이미 손으로 배선하고 있는 첫 번째 프로젝트 위에 또 쌓입니다.",
+              })}
+            </p>
+          </div>
+          <div className="reveal-cascade mx-auto mt-14 grid max-w-6xl gap-6 lg:grid-cols-2">
+            <Duet.Layers />
+            <Duet.Files
+              footer={l.trans({
+                en: "…for one app. Then kept in step with the first, by hand.",
+                ko: "…앱 하나에 이만큼. 그리고 첫 번째 프로젝트와 손으로 맞춰야 합니다.",
+              })}
+            />
+          </div>
+        </section>
+
+        <Duet.ScreenStory
+          header={
+            <>
+              <JellyKicker friend="comet">{l.trans({ en: "Screen → agent", ko: "화면 → 에이전트" })}</JellyKicker>
+              <h2 className="mt-5 text-balance font-black text-3xl sm:text-5xl">
+                {l.trans({
+                  en: "The screen you build is the agent's interface.",
+                  ko: "당신이 만든 화면이 곧 에이전트의 인터페이스입니다.",
+                })}
+              </h2>
+            </>
+          }
+          steps={screenSteps}
+        />
+        <div className="mx-auto max-w-2xl px-6 pb-16 lg:hidden">
+          <Code.Snippet
+            className="w-full"
+            title="IcecreamOrder.Zone.tsx"
+            language="tsx"
+            code={screenCode}
+            showLineNumbers={false}
+          />
         </div>
-        <div className="mt-6 rounded-4xl border border-primary/20 bg-primary/5 p-6 md:p-8">
-          <h3 className="font-bold text-2xl text-primary">
+        <Duet.ServerStory
+          header={
+            <>
+              <JellyKicker friend="moon">{l.trans({ en: "Server → AI", ko: "서버 → AI" })}</JellyKicker>
+              <h2 className="mt-5 text-balance font-black text-3xl sm:text-5xl">
+                {l.trans({ en: "Your server is already an MCP server.", ko: "당신의 서버는 이미 MCP 서버입니다." })}
+              </h2>
+            </>
+          }
+          steps={serverSteps}
+        />
+        <div className="mx-auto max-w-2xl px-6 pb-16 lg:hidden">
+          <Code.Snippet className="w-full" title="icecreamOrder.signal.ts" code={serverCode} showLineNumbers={false} />
+        </div>
+        <Duet.Dock />
+      </div>
+
+      <section className="relative mx-auto w-full max-w-7xl px-6 py-28 lg:px-8">
+        <div className="grid gap-12 lg:grid-cols-[5fr_7fr] lg:items-center lg:gap-16">
+          <div>
+            <JellyKicker>{l.trans({ en: "Guard → everyone", ko: "가드 → 모두" })}</JellyKicker>
+            <h2 className="mt-6 text-balance font-black text-4xl sm:text-6xl">
+              {l.trans({ en: "One rule. Three kinds of users.", ko: "규칙은 하나, 사용자는 셋." })}
+            </h2>
+            <p className="mt-6 max-w-xl text-foreground/65 text-lg leading-8">
+              {l.trans({
+                en: "You write a guard once per endpoint. It decides for a person on the screen, for the agent in their tab, and for an AI calling over MCP.",
+                ko: "가드는 엔드포인트마다 한 번 씁니다. 화면 앞의 사람, 그 사람 탭 안의 에이전트, MCP로 부르는 AI 모두를 같은 가드가 판단합니다.",
+              })}
+            </p>
+          </div>
+          <div>
+            <Duet.Matrix className="reveal-rise" />
+            <p className="mt-4 font-mono text-[11px] text-foreground/45 leading-5">
+              {l.trans({
+                en: "asks first — the in-page tool waits on an approval card · not on the shelf — the endpoint never reaches MCP",
+                ko: "먼저 묻기 — 인페이지 툴이 승인 카드에서 기다립니다 · 목록에 없음 — 엔드포인트가 MCP에 올라가지 않습니다",
+              })}
+            </p>
+          </div>
+        </div>
+        <ul className="reveal-cascade mt-16 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+          {facts.map(({ title, body }, idx) => (
+            <li key={title} className={panelRecipe({ tone: "jelly", radius: "3xl" }, factTints[idx])}>
+              <span className={cn("jelly block size-3 rounded-full", factTints[idx])} />
+              <p className="mt-4 font-bold">{title}</p>
+              <p className="mt-2 text-foreground/60 text-sm leading-6">{body}</p>
+            </li>
+          ))}
+        </ul>
+      </section>
+
+      <section
+        id="how"
+        className="relative flex min-h-[100svh] scroll-mt-[var(--akanjs-header-offset)] flex-col items-center justify-center px-6 py-28 text-center"
+      >
+        <JellyKicker>{l.trans({ en: "How it works", ko: "작동 원리" })}</JellyKicker>
+        <h2 className="mt-6 text-balance font-black text-4xl sm:text-6xl">
+          {l.trans({ en: "All of it is one line.", ko: "이 모든 게 한 줄입니다." })}
+        </h2>
+        <p className="mx-auto mt-6 max-w-2xl text-balance text-foreground/65 text-lg leading-8">
+          {l.trans({
+            en: "The screen an agent drives, the server any AI calls, the guard that judges them all — none of it is a second project. It all grows from a line like this.",
+            ko: "에이전트가 다루는 화면, AI가 부르는 서버, 모두를 판단하는 가드. 어느 것도 두 번째 프로젝트가 아닙니다. 모두 이런 한 줄에서 자랍니다.",
+          })}
+        </p>
+        <p className="jelly-glass mt-16 whitespace-nowrap rounded-full px-7 py-4 font-mono text-xl sm:px-10 sm:py-6 sm:text-4xl lg:text-5xl">
+          <span className="mr-4 select-none text-foreground/20 sm:mr-6">1</span>
+          <span className="duet-agent:hidden">
+            <span className="seed-scrub [--seed-chars:19]">
+              <span className="text-foreground">name</span>
+              <span className="text-foreground/40">: </span>
+              <span className="text-primary">field</span>
+              <span className="text-foreground/40">(</span>
+              <span className="text-foreground/80">String</span>
+              <span className="text-foreground/40">)</span>
+            </span>
+          </span>
+          <span className="duet-agent:inline hidden max-sm:text-[0.72em]">
+            <span className="seed-scrub [--seed-chars:26]">
+              <span className="text-foreground">{'"name"'}</span>
+              <span className="text-foreground/40">{": {"}</span>
+              <span className="text-primary">{'"type"'}</span>
+              <span className="text-foreground/40">{": "}</span>
+              <span className="text-foreground/80">{'"string"'}</span>
+              <span className="text-foreground/40">{"}"}</span>
+            </span>
+          </span>
+          <span className="seed-caret ml-1" />
+        </p>
+        <p className="mt-16 flex items-center gap-2 font-bold text-foreground/45 text-sm">
+          {l.trans({ en: "Scroll and watch it grow", ko: "스크롤하면 한 줄이 자랍니다" })} <BsArrowDown />
+        </p>
+      </section>
+
+      <SkyBuild chapters={chapters} />
+
+      <section className="relative flex flex-col items-center px-6 pt-20 pb-28 text-center lg:px-8">
+        <Orrery className="w-[min(78vw,40rem)]" />
+        <p className="reveal-rise mt-4 text-balance font-bold text-primary text-sm uppercase tracking-[0.16em]">
+          {l.trans({
+            en: "1 line × 8 layers × 6 platforms × people & agents",
+            ko: "한 줄 × 8 레이어 × 6 플랫폼 × 사람과 에이전트",
+          })}
+        </p>
+        <h2 className="reveal-rise mt-4 text-balance font-black text-4xl sm:text-6xl lg:text-7xl">
+          {l.trans({ en: "One star. The whole sky.", ko: "별 하나로, 하늘 전체를." })}
+        </h2>
+        <p className="reveal-rise mx-auto mt-5 max-w-2xl text-balance text-foreground/65 text-lg leading-8">
+          {l.trans({
+            en: "One line runs through every layer, lands on every platform and reaches everyone who uses it — people and agents. Type-safe from the database to the screen, and all you wrote was the line.",
+            ko: "한 줄이 모든 레이어를 지나 모든 플랫폼에 닿고, 쓰는 모두에게 이릅니다. 사람에게도, 에이전트에게도요. DB부터 화면까지 타입 안전하고, 당신이 쓴 건 그 한 줄뿐입니다.",
+          })}
+        </p>
+      </section>
+
+      <section className="relative mx-auto w-full max-w-7xl px-6 py-24 lg:px-8">
+        <div className="grid grid-cols-1 gap-10 lg:grid-cols-[0.85fr_1.15fr]">
+          <div className="reveal-rise">
+            <JellyKicker friend="rocket">
+              {l.trans({ en: "Agents build it, too", ko: "만드는 일도 에이전트가" })}
+            </JellyKicker>
+            <h2 className="mt-6 font-black text-3xl md:text-5xl">
+              {l.trans({
+                en: "AI coding turns to spaghetti past a certain size.",
+                ko: "AI 코딩은 일정 규모를 넘으면 스파게티가 됩니다.",
+              })}
+            </h2>
+            <p className="mt-5 text-foreground/65 leading-7">
+              {l.trans({
+                en: "The faster an agent writes code, the more file paths, names, structures, and declaration styles drift apart — until review and maintenance fall over. Akan stops this at the source with strict rules.",
+                ko: "에이전트가 코드를 빨리 뽑을수록 파일 위치, 이름, 구조, 선언 방식이 제각각이 되어 리뷰와 유지보수가 무너집니다. Akan은 엄격한 규칙으로 이 문제를 원천 차단합니다.",
+              })}
+            </p>
+          </div>
+          <ol className="reveal-cascade grid grid-cols-1 gap-3 sm:grid-cols-2">
+            {qualityItems.map((item, idx) => (
+              <li key={item.title} className={panelRecipe({ tone: "jelly", radius: "3xl" }, "flex gap-4")}>
+                <Friend className="size-12 shrink-0" name={qualityFriends[idx] ?? "planet"} />
+                <div>
+                  <p className="font-bold text-lg">{item.title}</p>
+                  <p className="mt-1 text-foreground/60 text-sm leading-6">{item.description}</p>
+                </div>
+              </li>
+            ))}
+          </ol>
+        </div>
+        <div className="reveal-rise jelly tint-primary mt-10 rounded-4xl p-8 text-primary-foreground sm:p-10">
+          <h3 className="font-black text-2xl sm:text-3xl">
             {l.trans({
               en: "This is what we mean by agentic full-stack.",
               ko: "이것이 우리가 말하는 에이전틱 풀스택입니다.",
             })}
           </h3>
-          <p className="mt-3 max-w-3xl text-base-content/65 leading-7">
+          <p className="mt-3 max-w-3xl text-primary-foreground/85 leading-7">
             {l.trans({
-              en: "Strict rules suit AI agents best. On top of fixed blocks — upload, login, admin, chat, boards, alerts — agents produce nothing but consistent code. It is not an abstract idea, but quality that rules make.",
-              ko: "엄격한 규칙은 AI 에이전트에게 가장 잘 맞습니다. 업로드, 로그인, 관리자, 채팅, 게시판, 알림 같은 정해진 블록 위에서 에이전트는 일관된 코드만 생산합니다. 추상적인 개념이 아니라, 규칙이 만든 품질입니다.",
+              en: "It runs in both directions. Agents use the app through the same guards people pass. And agents build it on strict rules and fixed blocks — upload, login, admin, chat, boards, alerts — so they produce nothing but consistent code. Not an abstract idea, but quality that rules make.",
+              ko: "에이전틱 풀스택은 양방향입니다. 에이전트는 사람과 같은 가드를 거쳐 앱을 씁니다. 그리고 엄격한 규칙과 업로드, 로그인, 관리자, 채팅, 게시판, 알림 같은 정해진 블록 위에서 앱을 만들기에 일관된 코드만 생산합니다. 추상적인 개념이 아니라, 규칙이 만든 품질입니다.",
             })}
           </p>
         </div>
       </section>
 
-      <section className="relative mx-auto w-full max-w-7xl px-6 py-20 lg:px-8">
-        <div className="mb-8 rounded-4xl border border-base-content/10 bg-base-content/4 p-6 backdrop-blur md:p-8">
-          <div className="grid gap-8 lg:grid-cols-[0.9fr_1.1fr] lg:items-center">
-            <div>
-              <div className="badge mb-4 border-primary/20 bg-primary/10 text-primary">
-                {l.trans({ en: "Platform Surfaces", ko: "플랫폼 표현" })}
-              </div>
-              <h2 className="font-black text-3xl tracking-tight md:text-5xl">
-                {l.trans({
-                  en: "Everything a business app needs, connected",
-                  ko: "비즈니스 앱에 필요한 모든 것을 연결합니다",
-                })}
-              </h2>
-              <p className="mt-4 text-base-content/60 leading-7">
-                {l.trans({
-                  en: "Akan supports web, iOS, Android, server, database, validation, internationalization, and official plugins as one coherent stack.",
-                  ko: "Akan은 웹, iOS, Android, 서버, 데이터베이스, 검증, 다국어, 공식 플러그인을 하나의 일관된 스택으로 지원합니다.",
-                })}
-              </p>
-            </div>
-            <div className="grid gap-3 sm:grid-cols-2">
-              {platformSurfaces.map((surface) => (
-                <div key={surface} className="rounded-2xl border border-base-content/10 bg-base-100/80 px-4 py-3">
-                  <p className="font-medium text-base-content text-sm">{surface}</p>
-                </div>
-              ))}
-            </div>
-          </div>
-        </div>
-
-        <div className="mb-10 rounded-4xl border border-base-content/10 bg-base-content/4 p-5 backdrop-blur md:p-8">
-          <div className="mb-8 text-center">
-            <div className="badge mb-4 border-primary/20 bg-primary/10 text-primary">
-              {l.trans({ en: "Generated From Intent", ko: "의도에서 자동 생성" })}
-            </div>
-            <h2 className="font-black text-3xl tracking-tight md:text-5xl">
-              {l.trans({ en: "Stop repeating the same plumbing", ko: "반복작업은 이제 그만" })}
-            </h2>
-            <p className="mx-auto mt-4 max-w-4xl text-base-content/60 leading-7">
+      <section className="relative mx-auto w-full max-w-7xl px-6 py-24 lg:px-8">
+        <JellyKicker friend="planet">{l.trans({ en: "This site", ko: "이 사이트" })}</JellyKicker>
+        <h2 className="mt-6 text-balance font-black text-4xl sm:text-5xl">
+          {l.trans({ en: "These docs run on it, too.", ko: "이 문서도 같은 방식으로 돕니다." })}
+        </h2>
+        <div className="reveal-cascade mt-12 grid gap-6 lg:grid-cols-2">
+          <div className={panelRecipe({ tone: "jelly", radius: "4xl", padding: "lg" }, "relative flex flex-col")}>
+            <Friend className="absolute -top-8 right-8 size-20" name="comet" />
+            <p className="font-black text-2xl">{l.trans({ en: "Ask the docs", ko: "문서에게 물어보기" })}</p>
+            <p className="mt-3 text-foreground/65 leading-7">
               {l.trans({
-                en: "Akan turns business declarations into docs, APIs, queries, state, and loading behavior so repetitive work disappears.",
-                ko: "Akan은 비즈니스 선언을 문서, API, 쿼리, 상태, 로딩 처리로 확장해 반복작업을 줄입니다.",
+                en: "Every docs page carries the in-page agent. Ask about a topic; it searches the docs and opens the page for you.",
+                ko: "모든 문서 페이지에 인페이지 에이전트가 있습니다. 주제를 물으면 문서를 검색해 해당 페이지를 열어 줍니다.",
               })}
             </p>
+            <Link href="/docs/intro/quickstart" className={jellyButtonRecipe({ tone: "ink" }, "mt-8 w-fit self-start")}>
+              {l.trans({ en: "Open the docs", ko: "문서 열기" })}
+              <BsArrowRight />
+            </Link>
           </div>
-          <div className="grid gap-4 md:grid-cols-2">
-            {automationItems.map((item, index) => (
-              <div key={item.title} className="rounded-3xl border border-base-content/10 bg-base-100/80 p-6">
-                <div className="mb-4 flex h-11 w-11 items-center justify-center rounded-2xl bg-primary/10 font-black text-primary">
-                  {index + 1}
-                </div>
-                <h3 className="font-bold text-lg">{item.title}</h3>
-                <p className="mt-2 text-base-content/60 text-sm leading-6">{item.description}</p>
-              </div>
-            ))}
+          <div className={panelRecipe({ tone: "jelly", radius: "4xl", padding: "lg" }, "relative flex flex-col")}>
+            <Friend className="absolute -top-8 right-8 size-20" name="moon" />
+            <p className="font-black text-2xl">{l.trans({ en: "Connect your AI", ko: "내 AI 연결하기" })}</p>
+            <p className="mt-3 text-foreground/65 leading-7">
+              {l.trans({
+                en: "akanjs.com answers MCP. Point Claude Code or Cursor at it, and your AI reads these docs while it writes your code.",
+                ko: "akanjs.com은 MCP에 응답합니다. Claude Code나 Cursor에 연결하면 AI가 코드를 쓰면서 이 문서를 읽습니다.",
+              })}
+            </p>
+            <div className="mt-8 inline-flex w-fit max-w-full items-center gap-3 rounded-full bg-foreground/6 py-1.5 pr-1.5 pl-5 font-mono text-sm">
+              <span className="select-none font-bold text-primary">MCP</span>
+              <span className="truncate text-foreground/80">{mcpUrl}</span>
+              <Clipboard className="relative shrink-0" text={mcpUrl} />
+            </div>
+            <p className="mt-4 duet-agent:hidden font-mono text-[11px] text-foreground/45">
+              listDocPages · searchDocPages · readDocPage
+            </p>
+            <pre className="mt-4 duet-agent:block hidden overflow-x-auto rounded-2xl bg-primary/5 p-3 font-mono text-[10px] text-primary leading-5">
+              {
+                '{"tools":[\n  {"name":"listDocPages","title":"Documentation Index"},\n  {"name":"readDocPage","title":"Read Documentation Page"},\n  {"name":"searchDocPages","title":"Search Documentation"}\n]}'
+              }
+            </pre>
           </div>
         </div>
+      </section>
 
-        <div className="mb-10 rounded-4xl border border-base-content/10 bg-base-content/4 p-5 backdrop-blur md:p-8">
-          <div className="mb-6 max-w-3xl">
-            <div className="badge mb-4 border-primary/20 bg-primary/10 text-primary">
-              {l.trans({ en: "Native-Feeling App Packaging", ko: "네이티브스러운 앱 패키징" })}
+      <section className="relative mx-auto w-full max-w-7xl px-6 py-24 lg:px-8">
+        <div className="reveal-rise grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
+          {proofItems.map((item) => (
+            <div key={item.value} className={panelRecipe({ tone: "jelly", radius: "3xl" })}>
+              <p className="font-black font-mono text-2xl text-primary">{item.value}</p>
+              <p className="mt-1 text-foreground/60 text-sm">{item.label}</p>
             </div>
-            <h3 className="font-black text-2xl tracking-tight md:text-4xl">
-              {l.trans({
-                en: "Packaged web, native-level transitions",
-                ko: "앱 패키징된 웹, 네이티브 수준의 화면 전환",
-              })}
+          ))}
+          <Link
+            href="/blog/v3release#v3-performance"
+            className={panelRecipe({ tone: "jelly", radius: "3xl" }, "group squish flex flex-col justify-center")}
+          >
+            <p className="flex items-center gap-2 font-bold group-hover:text-primary">
+              {l.trans({ en: "v3 benchmark", ko: "v3 벤치마크" })} <BsArrowRight />
+            </p>
+            <p className="mt-1 text-foreground/60 text-sm">
+              {l.trans({ en: "Startup 2× faster, a third less memory", ko: "시작 2배 빠르게, 메모리 3분의 1 절감" })}
+            </p>
+          </Link>
+        </div>
+        <div className="reveal-rise relative mt-20 grid grid-cols-1 gap-8 rounded-4xl bg-secondary p-8 text-secondary-foreground sm:p-10 lg:grid-cols-2 lg:items-center">
+          <Friend className="absolute -top-12 right-6 size-24" name="cloud" />
+          <div>
+            <h3 className="font-black text-3xl md:text-4xl">
+              {l.trans({ en: "From build to a live URL", ko: "빌드에서 라이브 URL까지" })}
             </h3>
-            <p className="mt-3 text-base-content/60 leading-7">
+            <p className="mt-4 text-secondary-foreground/65 leading-7">
               {l.trans({
-                en: "Akan web pages are compiled and packaged into apps. Unlike ordinary web packaging that often feels like a wrapped website, Akan ships built-in screen transitions for list-detail flows, overlays, and context changes, so the packaged web can deliver a native-level user experience without a separate UI rewrite.",
-                ko: "Akan에서 작성한 웹은 컴파일되어 앱으로 패키징됩니다. 일반적인 웹 앱 패키징이 감싼 웹사이트처럼 느껴지는 것과 달리, Akan은 목록-상세 흐름, 오버레이, 맥락 전환을 위한 빌트인 화면 전환 기능을 제공해 별도 UI 재작성 없이도 앱 패키징된 웹에서 네이티브 수준의 사용자 경험을 만들 수 있습니다.",
+                en: "Akan Cloud is the deploy platform built for Akan apps. Sign in from the CLI, share a preview, build, and ship it live.",
+                ko: "Akan Cloud는 Akan 앱을 위해 만든 배포 플랫폼입니다. CLI에서 로그인하고, 미리보기를 공유하고, 빌드해서 라이브로 내보내세요.",
               })}
             </p>
-          </div>
-          <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-            {transitionItems.map((item) => (
-              <div
-                key={item.title}
-                className="overflow-hidden rounded-3xl border border-base-content/10 bg-base-100/80"
-              >
-                <div className="p-4">
-                  <div className="font-bold font-mono text-primary">{item.title}</div>
-                  <p className="mt-2 text-base-content/60 text-sm leading-6">{item.description}</p>
-                </div>
-                <div className="border-base-content/10 border-t bg-base-content/5 p-3">
-                  <video
-                    src={item.src}
-                    autoPlay
-                    muted
-                    loop
-                    playsInline
-                    className="mx-auto aspect-9/16 max-h-[460px] w-full rounded-2xl object-contain"
-                  />
-                </div>
-              </div>
-            ))}
-          </div>
-        </div>
-
-        <div className="mx-auto mb-10 max-w-4xl text-center">
-          <h2 className="font-black text-3xl tracking-tight md:text-5xl">
-            {l.trans({ en: "See the business, not the system", ko: "시스템이 아니라 비즈니스를 보세요" })}
-          </h2>
-          <p className="mt-4 text-base-content/60 leading-7">
-            {l.trans({
-              en: "These demos show how one convention-driven workspace carries business intent through multiple surfaces.",
-              ko: "아래 데모는 하나의 컨벤션 기반 워크스페이스가 비즈니스 의도를 여러 표현으로 이어가는 방식을 보여줍니다.",
-            })}
-          </p>
-          <RawCode code="bunx create-akan-workspace@latest" prompt="$" className="mx-auto mt-3 max-w-full md:w-fit" />
-          <div className="mt-4">
-            <Link href="/docs/intro/quickstart">
-              <button className="btn btn-primary btn-lg">
-                {l.trans({ en: "Get Started", ko: "시작하기" })} <BsArrowRight className="ml-2" />
-              </button>
+            <Link href="https://cloud.akanjs.com" target="_blank" className={jellyButtonRecipe({ size: "lg" }, "mt-7")}>
+              {l.trans({ en: "Open Akan Cloud", ko: "Akan Cloud 열기" })} <BsArrowUpRight />
             </Link>
           </div>
-        </div>
-
-        <div className="rounded-4xl border border-base-content/10 bg-base-content/4 p-5 backdrop-blur md:p-8">
-          <h2 className="mb-8 text-center font-black text-3xl tracking-tight md:mb-12 md:text-5xl">
-            {l.trans({
-              en: "How Conventions Expand Your Business Definition",
-              ko: "컨벤션이 비즈니스 정의를 확장하는 방식",
-            })}
-          </h2>
-          <div className="space-y-6 md:space-y-8">
-            {procedureItems.map((item, index) => (
-              <div
-                key={item.title}
-                className="overflow-hidden rounded-3xl border border-base-content/10 bg-base-100/80 shadow-xl"
-              >
-                <div className="grid items-center gap-6 p-5 md:p-6 lg:grid-cols-[0.8fr_1.2fr]">
-                  <div className={index % 2 === 1 ? "lg:order-2" : ""}>
-                    <div className="badge mb-4 border-primary/20 bg-primary/10 text-primary">
-                      {String(index + 1).padStart(2, "0")}
-                    </div>
-                    <h3 className="font-bold text-2xl">{item.title}</h3>
-                    <p className="mt-3 text-base-content/65 text-sm leading-6">{item.description}</p>
-                  </div>
-                  <div className="overflow-hidden rounded-2xl border border-base-content/10 bg-base-content/5">
-                    <video src={item.src} autoPlay muted loop playsInline className="size-full object-cover" />
-                  </div>
+          <ol className="grid grid-cols-1 gap-2 font-mono text-sm">
+            {deploySteps.map((step, idx) => (
+              <li key={step.command} className="flex gap-4 rounded-2xl bg-secondary-foreground/6 px-5 py-4">
+                <span className="text-secondary-foreground/30">{String(idx + 1).padStart(2, "0")}</span>
+                <div>
+                  <p className="text-jelly">$ {step.command}</p>
+                  <p className="mt-1 font-sans text-secondary-foreground/60 text-xs leading-5">{step.description}</p>
                 </div>
-              </div>
+              </li>
             ))}
-          </div>
+          </ol>
         </div>
       </section>
 
-      <section className="relative mx-auto w-full max-w-7xl px-6 py-20 lg:px-8">
-        <div className="overflow-hidden rounded-4xl border border-base-content/10 bg-base-content/6 p-8 text-center shadow-2xl backdrop-blur md:p-12">
-          <div className="badge mb-5 border-primary/20 bg-primary/10 text-primary">
-            {l.trans({ en: "Built for developer happiness", ko: "개발자의 행복을 위해 설계" })}
-          </div>
-          <h2 className="font-black text-3xl tracking-tight md:text-5xl">
-            {l.trans({
-              en: "Run the business with one quarter of the code.",
-              ko: "기존 대비 1/4의 코드로 비즈니스를 운영하세요.",
-            })}
+      <section
+        id="start"
+        className="relative mx-auto grid w-full max-w-7xl scroll-mt-[var(--akanjs-header-offset)] grid-cols-1 items-center gap-12 px-6 pt-16 pb-28 lg:grid-cols-[1.05fr_0.95fr] lg:px-8"
+      >
+        <div className="reveal-rise">
+          <p className="font-bold text-primary text-sm uppercase tracking-[0.16em]">{tagline}</p>
+          <h2 className="mt-5 text-balance font-black text-4xl sm:text-7xl">
+            <span className="block">{l.trans({ en: "Start with one line.", ko: "한 줄로 시작하세요." })}</span>
+            <span className="block text-primary">
+              {l.trans({ en: "Agents included.", ko: "에이전트는 기본 포함." })}
+            </span>
           </h2>
-          <p className="mx-auto mt-5 max-w-2xl text-base-content/65 leading-7">
+          <p className="mt-6 max-w-xl text-foreground/65 text-lg leading-8">
             {l.trans({
-              en: "Less code means fewer tokens, clearer intent, easier reviews, and calmer updates. Akan is optimized for the happiness of developers who ship real products.",
-              ko: "적은 코드량은 적은 토큰소모, 선명한 의도, 쉬운 리뷰, 안정적인 업데이트로 이어집니다. Akan은 실제 제품을 출시하는 개발자의 행복에 최적화되어 있습니다.",
+              en: "Hand one prompt to your coding agent, or run one command yourself, and the workspace is ready. The next line you write ships to web, iOS, Android, desktop, your server and database — and to every agent your users talk to.",
+              ko: "코딩 에이전트에게 프롬프트 하나를 건네거나 명령어 한 줄을 직접 실행하면 워크스페이스가 준비됩니다. 그다음 당신이 쓰는 한 줄이 웹, iOS, Android, 데스크톱, 서버와 DB, 그리고 사용자가 쓰는 모든 에이전트에게 닿습니다.",
             })}
           </p>
-          <RawCode code="bunx create-akan-workspace@latest" prompt="$" className="mx-auto mt-3 max-w-full md:w-fit" />
-          <div className="mt-4">
-            <Link href="/docs/intro/quickstart">
-              <button className="btn btn-primary btn-lg">
-                {l.trans({ en: "Get Started", ko: "시작하기" })} <BsArrowRight className="ml-2" />
-              </button>
+          <Start.Tabs className="mt-9" />
+          <div className="mt-8 flex flex-wrap items-center gap-x-7 gap-y-4">
+            <Link href="/docs/intro/quickstart" className={jellyButtonRecipe({ size: "lg" })}>
+              {l.trans({ en: "Get started", ko: "시작하기" })} <BsArrowRight />
+            </Link>
+            <Link
+              href="/cheatsheet/interface/agent-chat"
+              className="flex items-center gap-2 font-bold text-foreground/70 text-sm hover:text-foreground"
+            >
+              {l.trans({ en: "In-page agent", ko: "인페이지 에이전트" })} <BsArrowRight />
+            </Link>
+            <Link
+              href="/cheatsheet/interface/mcp"
+              className="flex items-center gap-2 font-bold text-foreground/70 text-sm hover:text-foreground"
+            >
+              MCP <BsArrowRight />
+            </Link>
+            <Link
+              href="/cases"
+              className="flex items-center gap-2 font-bold text-foreground/70 text-sm hover:text-foreground"
+            >
+              {l.trans({ en: "Case Studies", ko: "적용사례" })} <BsArrowRight />
             </Link>
           </div>
+          <p className="mt-12 font-bold text-foreground/70">
+            {l.trans({ en: "Read for humans.", ko: "읽는 건 사람이," })}{" "}
+            <span className="text-primary">{l.trans({ en: "Write for agents.", ko: "쓰는 건 에이전트가." })}</span>
+          </p>
+        </div>
+        <div className="reveal-rise overflow-hidden rounded-4xl shadow-2xl shadow-black/10">
+          <video
+            autoPlay
+            className="aspect-3/2 w-full object-cover motion-reduce:hidden"
+            loop
+            muted
+            playsInline
+            poster="/jelly/cosmos-poster.webp"
+            src="/jelly/cosmos-loop.mp4"
+          />
+          <Image
+            alt=""
+            className="hidden aspect-3/2 w-full object-cover motion-reduce:block"
+            height={853}
+            src="/jelly/cosmos-poster.webp"
+            width={1280}
+          />
         </div>
       </section>
     </main>
   );
-}
+});

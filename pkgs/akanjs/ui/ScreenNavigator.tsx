@@ -1,9 +1,12 @@
 "use client";
 import { useDrag } from "@use-gesture/react";
-import { clsx } from "akanjs/client";
+import { cn } from "akanjs/client";
+import { capitalize } from "akanjs/common";
+import { st } from "akanjs/store";
 import { animated } from "akanjs/ui";
-import { createContext, type ReactNode, useContext, useEffect, useRef, useState } from "react";
+import { type ReactNode, useContext, useEffect, useRef, useState } from "react";
 import { SpringValue, useSpringValue } from "react-spring";
+import { sharedContext } from "../client/sharedContext";
 
 interface ScreenNavigatorContextType {
   bind: (...args: any[]) => any;
@@ -14,7 +17,7 @@ interface ScreenNavigatorContextType {
   onClickMenu: (menu: string) => void;
 }
 
-const ScreenNavigatorContext = createContext<ScreenNavigatorContextType>({
+const ScreenNavigatorContext = sharedContext<ScreenNavigatorContextType>("screenNavigator", {
   bind: () => ({}),
   xValue: new SpringValue(0),
   setMenu: null as unknown as (menu: string) => void,
@@ -24,19 +27,14 @@ const ScreenNavigatorContext = createContext<ScreenNavigatorContextType>({
 });
 
 interface ScreenNavigatorProps {
-  // currentMenu: string;
   children: React.ReactNode;
   setMenu?: (menu: string) => void;
   menus: string[];
+  /** Names this navigator for the in-page agent; without it it publishes nothing. */
+  namespace?: string;
 }
 
-export const ScreenNavigator = ({
-  children,
-  setMenu = () => {
-    //
-  },
-  menus,
-}: ScreenNavigatorProps) => {
+export const ScreenNavigator = ({ children, setMenu = () => {}, menus, namespace }: ScreenNavigatorProps) => {
   const [currentMenu, setCurrentMenu] = useState(menus[0]);
   const xValue = useSpringValue(0, { config: { clamp: true } });
   const ref = useRef<HTMLDivElement>(null);
@@ -51,7 +49,7 @@ export const ScreenNavigator = ({
   const bind = useDrag(
     ({ first, last, offset: [x], velocity: [vx], direction: [dx], movement: [mx], cancel }) => {
       if (!ref.current) return;
-      //! 메뉴가 3개 이상일 경우 고려해야함
+      // FIXME: the indicator geometry below assumes two menus; three or more mispositions it.
       const deviceWidth = ref.current.clientWidth / 2;
       if (x > 0 || x < -deviceWidth) return;
       if (dx < 1) {
@@ -96,11 +94,22 @@ export const ScreenNavigator = ({
     }
   };
 
+  const suffix = namespace ? capitalize(namespace) : "";
+  st.expose(namespace ? `screenIn${suffix}` : null, String)
+    .desc("The screen this navigator is showing.")
+    .value(currentMenu);
+  st.tool(namespace ? `goToScreenIn${suffix}` : null)
+    .desc(`Slide the ${namespace ?? ""} navigator to one screen.`)
+    .arg("screen", String, { oneOf: menus })
+    .exec(onClickMenu);
+
   return (
     <ScreenNavigatorContext.Provider value={{ bind, xValue, onClickMenu, menus, currentMenu, setMenu }}>
-      <animated.div {...bind()} className="flex h-full w-[200vw] overflow-x-scroll" style={{ x: xValue }} ref={ref}>
-        {children}
-      </animated.div>
+      <div className="h-full w-full overflow-hidden">
+        <animated.div {...bind()} className="flex h-full w-[200%]" style={{ x: xValue }} ref={ref}>
+          {children}
+        </animated.div>
+      </div>
     </ScreenNavigatorContext.Provider>
   );
 };
@@ -109,7 +118,7 @@ const NavbarItem = ({ menu, children, className }: { menu: string; children: Rea
   const { onClickMenu, currentMenu } = useContext(ScreenNavigatorContext);
   return (
     <div
-      className={clsx(className, currentMenu === menu ? "opacity-100" : "opacity-40")}
+      className={cn(className, currentMenu === menu ? "opacity-100" : "opacity-40")}
       onClick={() => {
         onClickMenu(menu);
       }}
@@ -122,7 +131,7 @@ ScreenNavigator.NavbarItem = NavbarItem;
 
 const Screen = ({ children }: { children: React.ReactNode }) => {
   return (
-    <div className="h-full w-screen overflow-scroll" style={{ touchAction: "pan-y" }}>
+    <div className="h-full w-1/2 overflow-scroll" style={{ touchAction: "pan-y" }}>
       {children}
     </div>
   );

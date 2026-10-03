@@ -1,5 +1,15 @@
-export type { AkanModalComponent, AkanUiOverrideName, AkanUiOverrides } from "./context";
-export { createOverridable } from "./createOverridable";
 export { override } from "./override";
-export { UiOverrideProvider, type UiOverrideProviderProps } from "./Provider";
-export { useUiOverride } from "./useUiOverride";
+export type {
+  AkanModalComponent,
+  AkanUiOverrideManifest,
+  AkanUiOverrideName,
+  AkanUiOverrides,
+  AkanUiRecipes,
+} from "./UiOverride";
+export {
+  createOverridable,
+  UiOverrideProvider,
+  type UiOverrideProviderProps,
+  useUiOverride,
+  useUiRecipe,
+} from "./UiOverride";

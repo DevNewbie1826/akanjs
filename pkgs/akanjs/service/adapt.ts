@@ -4,15 +4,11 @@ import { type ExtractInjectInfoObject, type InjectBuilder, type InjectInfo, inje
 
 export interface Adaptor {
   readonly logger: Logger;
-  onInit(): Promise<void>;
-  onDestroy(): Promise<void>;
+  onInit(): Promise<void> | void;
+  onDestroy(): Promise<void> | void;
 }
 
-export type AdaptorCls<
-  Methods = any,
-  // biome-ignore lint/complexity/noBannedTypes: `{}` keeps un-injected adaptor classes assignable.
-  InjectMap extends Record<string, InjectInfo> = {},
-> = Cls<
+export type AdaptorCls<Methods = any, InjectMap extends Record<string, InjectInfo> = Record<never, never>> = Cls<
   Methods & ExtractInjectInfoObject<InjectMap> & Adaptor,
   { readonly [INJECT_META]: InjectMap; readonly refName: string }
 >;
@@ -31,10 +27,10 @@ export function adapt(name: string, injectBuilder?: InjectBuilder) {
     readonly logger = new Logger(name);
     static readonly [INJECT_META] = injectInfoMap;
     static readonly refName = name;
-    async onInit() {
+    onInit(): Promise<void> | void {
       //
     }
-    async onDestroy() {
+    onDestroy(): Promise<void> | void {
       //
     }
   }

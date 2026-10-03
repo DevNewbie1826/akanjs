@@ -1,0 +1,110 @@
+import { beforeAll, describe, expect, test } from "bun:test";
+import { enumOf, Int } from "akanjs/base";
+import { Translator } from "akanjs/client/translator";
+import { ConstantRegistry, via } from "akanjs/constant";
+import type { SerializedSignal } from "akanjs/signal";
+import { store } from "../store";
+import { setTestEnv, stubSignal } from "../store.fixture";
+import { StoreInstance } from "../storeInstance";
+import { StoreRegistry } from "../storeRegistry";
+import { AgentBridge } from "./AgentBridge";
+
+class BridgeStatus extends enumOf("bridgeStatus", ["todo", "done"] as const) {}
+
+const NoteInput = via((f) => ({
+  title: f(String),
+  count: f(Int, { default: 0 }),
+  status: f(BridgeStatus, { default: "todo" }),
+  dueAt: f(Date).optional(),
+  secretMemo: f.secret(String).optional(),
+}));
+const NoteObject = via(NoteInput, () => ({}));
+const NoteLight = via(NoteObject, ["title"] as const, () => ({}));
+const NoteFull = via(NoteObject, NoteLight, () => ({}));
+const NoteInsight = via(NoteFull, (f) => ({ count: f(Int, { default: 0 }) }));
+const noteConstant = ConstantRegistry.buildModel(
+  "bridgeNote",
+  NoteInput,
+  NoteObject,
+  NoteFull,
+  NoteLight,
+  NoteInsight,
+  { NoteInput, NoteObject, NoteFull, NoteLight, NoteInsight, BridgeStatus },
+);
+
+const serializedSignal: SerializedSignal = {
+  prefix: "bridgeNote",
+  getGuards: ["SignedIn"],
+  cruGuards: ["SignedIn"],
+  endpoint: {},
+  slice: { "": { args: [] } },
+};
+
+let bridge: AgentBridge;
+let instance: StoreInstance;
+
+beforeAll(() => {
+  setTestEnv("bridgetest");
+  Translator.setActiveLocale("en");
+
+  class NoteStore extends store(stubSignal("bridgeNote", noteConstant, serializedSignal), () => ({
+    draft: "",
+    tally: { runs: 0 },
+  })) {
+    async submitDraft() {
+      await Promise.resolve();
+    }
+  }
+  StoreRegistry.register(NoteStore);
+  instance = new StoreInstance(StoreRegistry.merge("bridgeRoot", NoteStore));
+  bridge = new AgentBridge(instance);
+  // What a mounted component's subscription does: an unread key is not part of the screen's surface.
+  instance.retainLive("draft");
+  instance.retainLive("bridgeNoteForm");
+});
+
+describe("AgentBridge read", () => {
+  test("strips a secret field the user typed into the form", () => {
+    // `immerify` has already dropped the form's class, so the mask's model comes from the declaration.
+    const form = instance.get().bridgeNoteForm as Record<string, unknown>;
+    instance.set({ bridgeNoteForm: { ...form, title: "Ship it", secretMemo: "hunter2" } });
+    const read = bridge.read("bridgeNoteForm") as Record<string, unknown>;
+    expect(read.title).toBe("Ship it");
+    expect(read).not.toHaveProperty("secretMemo");
+  });
+
+  test("passes a primitive through and refuses an object no model claims", () => {
+    expect(bridge.read("draft")).toBe("");
+    instance.retainLive("tally");
+    expect(() => bridge.read("tally")).toThrow("belongs to no model");
+    instance.releaseLive("tally");
+    expect(() => bridge.read("nothingHere")).toThrow("Unknown state key");
+  });
+});
+
+describe("AgentBridge live keys", () => {
+  test("reads the keys the screen subscribes, not the rest of their store", () => {
+    expect(bridge.readableKeys()).toEqual(["bridgeNoteForm", "draft"]);
+    expect(() => bridge.read("pageOfBridgeNote")).toThrow('State key "pageOfBridgeNote" is not read by this screen');
+    instance.releaseLive("draft");
+    expect(bridge.readableKeys()).toEqual(["bridgeNoteForm"]);
+    expect(() => bridge.read("draft")).toThrow("not read by this screen");
+    instance.retainLive("draft");
+    expect(bridge.read("draft")).toBe("");
+  });
+
+  test("a zone view reads only what its own subtree subscribes", () => {
+    instance.retainLive("pageOfBridgeNote", "notes");
+    expect(bridge.readableKeys("notes")).toEqual(["pageOfBridgeNote"]);
+    expect(bridge.read("pageOfBridgeNote", "notes")).toBe(1);
+    expect(() => bridge.read("pageOfBridgeNote", "other")).toThrow("not read by this screen");
+    expect(bridge.readableKeys()).toContain("pageOfBridgeNote");
+    instance.releaseLive("pageOfBridgeNote", "notes");
+  });
+
+  test("a refusal names what this view can read instead, so a wrong key costs one call rather than the turn", () => {
+    expect(() => bridge.read("nothingHere")).toThrow("Readable here: bridgeNoteForm, draft.");
+    expect(() => bridge.read("pageOfBridgeNote")).toThrow("Readable here: bridgeNoteForm, draft.");
+    expect(() => bridge.read("bridgeNoteForm", "empty")).toThrow("This screen reads no state keys.");
+  });
+});

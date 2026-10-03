@@ -76,7 +76,7 @@ Now create the service layer to expose these operations:
 
 Connect Service
 
-Now comes the magic - connecting the inventory system to our existing ice cream order flow. When a customer places an order, the system should automatically deduct the used ingredients from inventory. This is like how a real POS system updates stock counts in real-time as sales are made.
+Now let's connect the inventory system to our existing ice cream order flow. When a customer places an order, the system should automatically deduct the used ingredients from inventory. This is like how a real POS system updates stock counts in real-time as sales are made.
 
 Inject the InventoryService into IcecreamOrderService and use the _preCreate hook to deduct stock:
 
@@ -84,7 +84,7 @@ Key aspects of this integration:
 
 Dependency injection allows IcecreamOrderService to access InventoryService methods
 
-A lifecycle hook that runs before creating a new order. Perfect for validation and side effects like inventory deduction.
+A lifecycle hook that runs before creating a new order. Used for validation and side effects like inventory deduction.
 
 Usage Calculation
 
@@ -102,13 +102,13 @@ Now create the frontend store to manage inventory state:
 
 Interact on UI
 
-Now let's bring everything together in the UI. The customer-facing order form needs to check inventory and disable options that are out of stock. Staff also need a dashboard to monitor inventory levels and refill when needed. This creates a complete inventory management system!
+Now let's bring everything together in the UI. The customer-facing order form needs to check inventory and disable options that are out of stock. Staff also need a dashboard to monitor inventory levels and refill when needed.
 
 First, update the order template to check inventory before displaying options:
 
 Key features of the inventory-aware template:
 
-Called in useEffect to load inventory data when the component mounts. Shows a loading spinner until data is ready.
+The form only reads the store, and shows a spinner until the value is there. Inventory.Zone.Today, which the route mounts below, is what calls loadTodaysInventory - a mount-time fetch inside a Template is what akan quality ssr reports as client-mount-load.
 
 Out of Stock Check
 
@@ -128,21 +128,7 @@ Create a Zone component for real-time inventory monitoring:
 
 Finally, put it all together in the main page with both inventory dashboard and order management:
 
-🎉 What You've Accomplished:
-
-Created a reusable Stock scalar for inventory items
-
-Built an Inventory module with daily records
-
-Implemented stock usage and refill business logic
-
-Connected inventory to order creation flow
-
-Created visual dashboard with real-time updates
-
-Disabled out-of-stock options in customer UI
-
-In the next tutorial, we'll explore Insight - a powerful feature for aggregating and analyzing data across your models. This will allow you to create analytics dashboards and gain business intelligence from your ice cream shop data.
+In the next tutorial, we'll explore Insight, which aggregates and analyzes data across your models. This will allow you to create analytics dashboards and gain business intelligence from your ice cream shop data.
 
 ## Code Examples
 
@@ -399,7 +385,8 @@ export class IcecreamOrderService extends serve(db.icecreamOrder, ({ use, servic
 ### apps/koyo/lib/inventory/inventory.signal.ts
 
 ```ts
-import { endpoint, internal, Public, slice } from "akanjs/signal"; // [!code collapse:17]
+import { Admin } from "@libs/shared/srvkit"; // [!code collapse:18]
+import { endpoint, internal, Public, slice } from "akanjs/signal";
 import * as cnst from "../cnst";
 import * as srv from "../srv";
 
@@ -407,7 +394,7 @@ export class InventoryInternal extends internal(srv.inventory, ({ interval }) =>
 
 export class InventorySlice extends slice(
   srv.inventory,
-  { guards: { root: Public, get: Public, cru: Public } },
+  { guards: { root: Admin, get: Public, cru: Admin } },
   (init) => ({
     inPublic: init().exec(function () {
       return this.inventoryService.queryAny();
@@ -499,11 +486,10 @@ export class InventoryStore extends store(sig.inventory, () => ({
 
 ```ts
 "use client"; // [!code collapse:4]
-import { clsx } from "akanjs/client";
+import { cn } from "akanjs/client";
 import { Field, Layout } from "akanjs/ui";
 import { cnst, st, usePage } from "@apps/koyo/client";
-import { Loading } from "akanjs/ui"; // [!code ++:2]
-import { useEffect } from "react";
+import { Loading } from "akanjs/ui"; // [!code ++]
 // [!code collapse:5]
 interface GeneralProps {
   className?: string;
@@ -513,17 +499,14 @@ interface GeneralProps {
 export const General = ({ className, showServeType = true }: GeneralProps) => {
   const { l } = usePage();
   const icecreamOrderForm = st.use.icecreamOrderForm();
-  const todaysInventory = st.use.todaysInventory(); // [!code ++:7]
-  useEffect(() => {
-    void st.do.loadTodaysInventory();
-  }, []);
+  const todaysInventory = st.use.todaysInventory(); // [!code ++:4]
   if (!todaysInventory) return <Loading.Area />;
   else if (!todaysInventory.isInStock("yogurtIcecream"))
     return <div className="flex size-full items-center justify-center text-xl">{l("inventory.outOfStock")}</div>;
   return (
-    <Layout.Template className={clsx("w-full space-y-6", className)}>
+    <Layout.Template className={cn("w-full space-y-6", className)}>
       {showServeType ? ( // [!code collapse:15]
-        <div className="rounded-2xl border border-base-300 bg-base-100 p-8 shadow-md backdrop-blur-sm">
+        <div className="rounded-2xl border border-border bg-background p-8 shadow-md backdrop-blur-sm">
           <div className="space-y-6">
             <div className="flex items-center gap-3">
               <span className="text-3xl">🍦</span>
@@ -537,7 +520,7 @@ export const General = ({ className, showServeType = true }: GeneralProps) => {
           </div>
         </div>
       ) : null}
-      <div className="rounded-2xl border border-base-300 bg-base-100 p-8 shadow-md backdrop-blur-sm">
+      <div className="rounded-2xl border border-border bg-background p-8 shadow-md backdrop-blur-sm">
         <div className="space-y-6">
           <div className="flex items-center gap-3"> // [!code collapse:4]
             <span className="text-3xl">📏</span>
@@ -554,7 +537,7 @@ export const General = ({ className, showServeType = true }: GeneralProps) => {
           />
         </div>
       </div>
-      <div className="rounded-2xl border border-base-300 bg-base-100 p-8 shadow-md backdrop-blur-sm">
+      <div className="rounded-2xl border border-border bg-background p-8 shadow-md backdrop-blur-sm">
         <div className="space-y-6">
           <div className="flex items-center gap-3"> // [!code collapse:4]
             <span className="text-3xl">🍓</span>
@@ -571,7 +554,7 @@ export const General = ({ className, showServeType = true }: GeneralProps) => {
           />
         </div>
       </div>
-      <div className="rounded-2xl border border-base-300 bg-base-100 p-8 shadow-md backdrop-blur-sm"> // [!code collapse:13]
+      <div className="rounded-2xl border border-border bg-background p-8 shadow-md backdrop-blur-sm"> // [!code collapse:13]
         <div className="space-y-6">
           <div className="flex items-center gap-3">
             <span className="text-3xl">📱</span>
@@ -623,8 +606,8 @@ export class InventoryInsight extends via(Inventory, (field) => ({})) {}
 
 ```ts
 "use client";
-import { clsx } from "akanjs/client";
 import { st, usePage } from "@apps/koyo/client";
+import { buttonRecipe } from "akanjs/ui";
 import { BiRefresh } from "react-icons/bi";
 
 interface RefillProps {
@@ -634,7 +617,7 @@ export const Refill = ({ className }: RefillProps) => {
   const { l } = usePage();
   return (
     <button
-      className={clsx("btn btn-primary", className)}
+      className={buttonRecipe({ variant: "primary" }, className)}
       onClick={() => {
         void st.do.refillTodaysInventory();
       }}
@@ -649,7 +632,7 @@ export const Refill = ({ className }: RefillProps) => {
 
 ```ts
 import { dayjs } from "akanjs/base";
-import { clsx } from "akanjs/client";
+import { cn } from "akanjs/client";
 import { cnst, usePage } from "@apps/koyo/client";
 
 interface GeneralProps {
@@ -660,7 +643,7 @@ interface GeneralProps {
 export const General = ({ className, inventory }: GeneralProps) => {
   const { l } = usePage();
   return (
-    <div className={clsx("w-full space-y-2 rounded-xl border border-base-300 bg-base-100 p-4", className)}>
+    <div className={cn("w-full space-y-2 rounded-xl border border-border bg-background p-4", className)}>
       <div className="text-lg font-bold text-primary">{dayjs(inventory.at).format("YYYY-MM-DD")}</div>
       <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5">
         {inventory.stocks.map((stock, index) => {
@@ -669,49 +652,54 @@ export const General = ({ className, inventory }: GeneralProps) => {
           return (
             <div
               key={`${stock.type}-${index}`}
-              className={clsx("space-y-3 rounded-xl border bg-base-100 px-6 py-4 shadow-md", {
-                "border-base-300": status === "empty",
-                "border-warning/40": status === "low",
-                "border-success/40": status === "normal",
-              })}
+              className={cn(
+                "space-y-3 rounded-xl border bg-background px-6 py-4 shadow-md",
+                status === "empty" && "border-border",
+                status === "low" && "border-warning/40",
+                status === "normal" && "border-success/40",
+              )}
             >
               <div className="flex items-center justify-between">
                 <div
-                  className={clsx("rounded px-2 py-1 text-xs font-bold", {
-                    "border border-base-300 bg-base-100 text-base-content/70": status === "empty",
-                    "border border-warning/40 bg-base-100 text-warning": status === "low",
-                    "border border-success/40 bg-base-100 text-success": status === "normal",
-                  })}
+                  className={cn(
+                    "rounded px-2 py-1 text-xs font-bold",
+                    status === "empty" && "border border-border bg-background text-foreground/70",
+                    status === "low" && "border border-warning/40 bg-background text-warning",
+                    status === "normal" && "border border-success/40 bg-background text-success",
+                  )}
                 >
                   {l(`stockType.${stock.type}`)}
                 </div>
                 <div
-                  className={clsx("text-2xl font-bold", {
-                    "text-primary": status === "empty",
-                    "text-warning": status === "low",
-                    "text-success": status === "normal",
-                  })}
+                  className={cn(
+                    "text-2xl font-bold",
+                    status === "empty" && "text-primary",
+                    status === "low" && "text-warning",
+                    status === "normal" && "text-success",
+                  )}
                 >
                   {stock.currentQty} / {stock.totalQty}
                 </div>
               </div>
               <div className="flex items-center justify-between gap-4">
-                <div className="h-2 w-full overflow-hidden rounded-full bg-base-200">
+                <div className="h-2 w-full overflow-hidden rounded-full bg-muted">
                   <div
-                    className={clsx("h-full", {
-                      "bg-base-300": status === "empty",
-                      "bg-warning": status === "low",
-                      "bg-success": status === "normal",
-                    })}
+                    className={cn(
+                      "h-full",
+                      status === "empty" && "bg-border",
+                      status === "low" && "bg-warning",
+                      status === "normal" && "bg-success",
+                    )}
                     style={{ width: `${Math.min(percentage, 100)}%` }}
                   />
                 </div>
                 <div
-                  className={clsx("text-right text-xs font-bold", {
-                    "text-primary": status === "empty",
-                    "text-warning": status === "low",
-                    "text-success": status === "normal",
-                  })}
+                  className={cn(
+                    "text-right text-xs font-bold",
+                    status === "empty" && "text-primary",
+                    status === "low" && "text-warning",
+                    status === "normal" && "text-success",
+                  )}
                 >
                   {Math.round(percentage)}%
                 </div>
@@ -804,13 +792,14 @@ export const Today = ({ className }: TodayProps) => {
 ### apps/koyo/page/_index.tsx
 
 ```ts
-import { Load, Model } from "akanjs/ui"; // [!code collapse:2]
+import { Model, buttonRecipe } from "akanjs/ui"; // [!code collapse:3]
 import { cnst, fetch, IcecreamOrder, usePage } from "@apps/koyo/client";
+import { page } from "akanjs/client";
 import { Inventory } from "@apps/koyo/client"; // [!code ++]
 
-export default async function Page() {
+export default page().render(() => {
   const { l } = usePage();
-  const { icecreamOrderInitInPublic } = await fetch.initIcecreamOrderInPublic();
+  const { icecreamOrderInitInPublic } = fetch.initIcecreamOrderInPublic();
   const icecreamOrderForm: Partial<cnst.IcecreamOrderInput> = {};
         
   return (
@@ -823,7 +812,7 @@ export default async function Page() {
       <div className="flex items-center gap-4 text-5xl font-black"> // [!code collapse:16]
         <div className="text-5xl font-bold">{l("icecreamOrder.modelName")}</div>
         <Model.New
-          className="btn btn-primary"
+          trigger={<button className={buttonRecipe({ variant: "primary" })}>{l("base.new")}</button>}
           slice={fetch.slice.icecreamOrderInPublic}
           renderTitle="name"
           partial={icecreamOrderForm}
@@ -838,7 +827,7 @@ export default async function Page() {
       />
     </div>
   );
-}
+});
 ```
 
 ## Agent Notes

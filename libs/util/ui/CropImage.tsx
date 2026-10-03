@@ -1,10 +1,11 @@
 "use client";
 import { dayjs } from "akanjs/base";
 import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from "react";
-import type { Area, MediaSize, Point, Size } from "react-easy-crop";
+import type { Area, Point } from "react-easy-crop";
 import Cropper from "react-easy-crop";
 import type { CropRef } from "./cropImage.type";
 import { createImage } from "./cropImage.util";
+import { buttonRecipe } from "./Recipe";
 
 export type { CropRef } from "./cropImage.type";
 
@@ -35,22 +36,16 @@ export const CropImage = forwardRef<CropRef, CropImageProps>(
       setCroppedAreaPixels(croppedAreaPixels);
     };
 
-    const clientHeight = window.document.body.clientHeight;
     const divRef = useRef<HTMLDivElement | null>(null);
     const cropperRef = useRef<Cropper | null>(null);
-    const [maxCrop, setMaxCrop] = useState<Size | undefined>();
-    const [mediaSize, setMediaSize] = useState<MediaSize | undefined>();
     const [maxZoom, setMaxZoom] = useState<number>(1);
-    const [maxWidth, setMaxWidth] = useState<number>(0);
-    const [maxHeight, setMaxHeight] = useState<number>(0);
     const aspect = aspectRatio[0] / aspectRatio[1];
-    const height = clientHeight * 0.6;
 
     const getCropImage = async () => {
       if (!croppedAreaPixels) return;
       const image = await createImage(src);
       // if (!image) return null;
-      //! TODO:회전 처리인데 IOS에서 4096 넘어가는 것 때매 안됨
+      // FIXME: 회전 처리인데 IOS에서 4096 넘어가는 것 때매 안됨
 
       // const canvas = document.createElement("canvas");
       // const ctx = canvas.getContext("2d");
@@ -137,25 +132,12 @@ export const CropImage = forwardRef<CropRef, CropImageProps>(
       getFileStream: getFileStream,
       downloadCroppedImage: downloadCroppedImage,
     }));
-    function limitSize({ width, height }: { width: number; height: number }, maximumPixels: number) {
-      const requiredPixels = width * height;
-      if (requiredPixels <= maximumPixels) return { width, height };
-
-      const scalar = Math.sqrt(maximumPixels) / Math.sqrt(requiredPixels);
-      return {
-        width: Math.floor(width * scalar),
-        height: Math.floor(height * scalar),
-      };
-    }
 
     useEffect(() => {
       if (!src) return;
       void (async () => {
         const image = await createImage(src);
-        if (image.width * image.height < 4096 * 4096) {
-          setMaxCrop(undefined);
-          return;
-        }
+        if (image.width * image.height < 4096 * 4096) return;
 
         if (cropperRef.current) {
           const cropData = cropperRef.current.getCropData();
@@ -169,35 +151,27 @@ export const CropImage = forwardRef<CropRef, CropImageProps>(
       })();
     }, [src]);
 
-    if (!src) return <></>;
+    if (!src) return null;
     return (
-      <>
-        <div
-          ref={divRef}
-          className="relative flex w-full items-center justify-center bg-black"
-          style={{
-            height,
-          }}
-        >
-          <Cropper
-            ref={cropperRef}
-            image={src}
-            minZoom={maxZoom}
-            crop={crop}
-            zoom={zoom}
-            aspect={aspect}
-            onCropChange={setCrop}
-            onCropComplete={onCropComplete}
-            onZoomChange={setZoom}
-          />
+      <div ref={divRef} className="relative flex h-[60vh] w-full items-center justify-center bg-black">
+        <Cropper
+          ref={cropperRef}
+          image={src}
+          minZoom={maxZoom}
+          crop={crop}
+          zoom={zoom}
+          aspect={aspect}
+          onCropChange={setCrop}
+          onCropComplete={onCropComplete}
+          onZoomChange={setZoom}
+        />
 
-          {download && (
-            <button className="btn" onClick={() => void downloadCroppedImage()}>
-              download crop Image
-            </button>
-          )}
-        </div>
-      </>
+        {download && (
+          <button className={buttonRecipe({ variant: "default" })} onClick={() => void downloadCroppedImage()}>
+            download crop Image
+          </button>
+        )}
+      </div>
     );
   },
 );

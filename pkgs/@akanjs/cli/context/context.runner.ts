@@ -4,6 +4,7 @@ import {
   type AkanMcpInstallTarget,
   type AkanMcpMode,
   akanMcpInstallConfigPaths,
+  buildResourceList,
   type CursorMcpConfig,
   codexMcpConfigPath,
   createAkanCodexMcpServerBlock,
@@ -11,7 +12,6 @@ import {
   type JsonRpcRequest,
   type McpFraming,
   renderDoctorText,
-  resourceList,
   upsertCodexMcpServerBlock,
 } from "@akanjs/devkit/akanContext";
 import {
@@ -25,44 +25,36 @@ import {
   workflowInputsArg,
   workspacePath,
 } from "@akanjs/devkit/akanMcpContract";
-import { isPlaceholderAppId } from "@akanjs/devkit/capacitorApp";
 import { runner, type Workspace } from "@akanjs/devkit/commandDecorators";
 import { AppExecutor } from "@akanjs/devkit/executors";
-import { getMobileTargets } from "@akanjs/devkit/mobile";
+import { appIdsOf, getMobileTargets, isPlaceholderAppId, NativeApp } from "@akanjs/devkit/mobile";
 import { Prompter } from "@akanjs/devkit/prompter";
-import { createWorkflowBaselineSummary, jsonText, type WorkflowDiagnostic } from "@akanjs/devkit/workflow";
+import { createWorkflowBaselineSummary, jsonText } from "@akanjs/devkit/workflow";
 import { RepairRunner } from "../repair/repair.runner";
 import { WorkflowRunner } from "../workflow/workflow.runner";
-import { createCliWorkflowStepRegistry } from "./context.workflowRegistry";
 
-const workflowDiagnosticFromContext = (diagnostic: {
-  severity: "warning" | "error";
-  code: string;
-  message: string;
-  scope?: "baseline" | "workflow" | "unknown";
-  context?: WorkflowDiagnostic["context"];
-}): WorkflowDiagnostic => ({
-  severity: diagnostic.severity,
-  code: diagnostic.code,
-  message: diagnostic.message,
-  scope: diagnostic.scope,
-  context: diagnostic.context,
-});
+// Host paths fold to `<workspace>/`: they name a filesystem the model driving the agent has no business enumerating.
+const toolErrorText = (error: unknown): string => {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.replace(/\/(?:[^\s"'/]+\/)*(?=(?:pkgs|apps|libs|infra)\/)/g, "<workspace>/");
+};
 
 const compactDoctorWorkspaceResult = (
   result: Awaited<ReturnType<typeof AkanContextAnalyzer.doctor>>,
   includeBaselineDetails: boolean,
 ) => {
   const baselineDiagnostics = result.baselineDiagnostics ?? [];
-  if (baselineDiagnostics.length === 0) {
-    return {
-      ...result,
-      baselineSummary: createWorkflowBaselineSummary([], { detailsIncluded: includeBaselineDetails }),
-    };
-  }
-  const baselineSummary = createWorkflowBaselineSummary(baselineDiagnostics.map(workflowDiagnosticFromContext), {
-    detailsIncluded: includeBaselineDetails,
-  });
+  const baselineSummary = createWorkflowBaselineSummary(
+    baselineDiagnostics.map(({ severity, code, message, scope, context }) => ({
+      severity,
+      code,
+      message,
+      scope,
+      context,
+    })),
+    { detailsIncluded: includeBaselineDetails },
+  );
+  if (baselineDiagnostics.length === 0) return { ...result, baselineSummary };
   return {
     ...result,
     baselineSummary,
@@ -82,11 +74,7 @@ export class ContextRunner extends runner("context") {
       module = null,
     }: { format?: AkanContextFormat; app?: string | null; module?: string | null } = {},
   ) {
-    const context = await AkanContextAnalyzer.analyze(workspace, {
-      app,
-      module,
-      includeAbstractContent: !!module,
-    });
+    const context = await AkanContextAnalyzer.analyze(workspace, { app, module, includeAbstractContent: !!module });
     return format === "json" ? jsonText(context) : AkanContextAnalyzer.renderMarkdown(context, { module });
   }
 
@@ -103,29 +91,41 @@ export class ContextRunner extends runner("context") {
     return format === "json" ? jsonText(result) : renderDoctorText(result);
   }
 
-  // `akan doctor --ios`: proactively flag mobile-config problems that otherwise only surface as an
-  // opaque device-signing failure — chiefly placeholder bundle ids that Apple's portal already claims.
+  // Placeholder bundle ids otherwise surface only as an opaque device-signing failure.
   async #doctorIos(workspace: Workspace, format: "text" | "json") {
     const appNames = await workspace.getApps();
     const diagnostics: { severity: "warning" | "error"; code: string; path: string; message: string }[] = [];
+    let toolchainChecked = false;
     for (const appName of appNames) {
       const app = AppExecutor.from(workspace, appName);
       const config = await app.getConfig();
-      if (!config.hasMobileConfig) continue;
+      if (!config.hasNativeConfig) continue;
+      if (!toolchainChecked) {
+        toolchainChecked = true;
+        const report = await NativeApp.doctor(app.cwdPath, ["ios"]);
+        for (const check of report.checks.filter((check) => !check.ok || check.warn))
+          diagnostics.push({
+            severity: check.ok ? "warning" : "error",
+            code: "native-toolchain",
+            path: `${check.group} › ${check.name}`,
+            message: [check.detail, check.hint].filter(Boolean).join(" "),
+          });
+      }
       for (const { name, config: target } of await getMobileTargets(app)) {
-        if (!isPlaceholderAppId(target.appId)) continue;
+        const placeholder = appIdsOf(target.appId).find(isPlaceholderAppId);
+        if (!placeholder) continue;
         diagnostics.push({
           severity: "warning",
           code: "mobile-appid-placeholder",
           path: `apps/${appName}/akan.config.ts`,
-          message: `Mobile target '${name}' uses placeholder bundle id '${target.appId}'. Apple's developer portal almost always already claims it, so signing to a physical device fails with "cannot be registered to your development team". Set a unique mobile.appId (reverse-DNS of your org).`,
+          message: `Native target '${name}' uses placeholder bundle id '${placeholder}'. Apple's developer portal almost always already claims it, so signing to a physical device fails with "cannot be registered to your development team". Set a unique native.appId (reverse-DNS of your org).`,
         });
       }
     }
     const status = diagnostics.some((diagnostic) => diagnostic.severity === "error") ? "failed" : "passed";
     if (format === "json") return jsonText({ schemaVersion: 1, kind: "ios", status, diagnostics });
     const lines = [`Akan iOS diagnostics for ${workspace.repoName}`];
-    if (diagnostics.length === 0) lines.push("  No mobile configuration issues found.");
+    if (diagnostics.length === 0) lines.push("  No native configuration issues found.");
     else
       for (const diagnostic of diagnostics) {
         lines.push(`  [${diagnostic.severity}] ${diagnostic.code}: ${diagnostic.message}`);
@@ -147,8 +147,7 @@ export class ContextRunner extends runner("context") {
     return await this.#installJsonMcp(workspace, target, { force, mode });
   }
 
-  // Cursor (.cursor/mcp.json) and Claude Code (.mcp.json) share a JSON `mcpServers` map, so the merge
-  // logic is identical: keep every existing server and upsert only the "akan" entry.
+  // Cursor (.cursor/mcp.json) and Claude Code (.mcp.json) share a JSON `mcpServers` map.
   async #installJsonMcp(
     workspace: Workspace,
     target: "cursor" | "claude",
@@ -164,18 +163,12 @@ export class ContextRunner extends runner("context") {
     if (currentAkanServer && !force && JSON.stringify(currentAkanServer) !== JSON.stringify(nextAkanServer)) {
       throw new Error(`${configPath} already has an "akan" MCP server. Re-run with --force to overwrite it.`);
     }
-    const nextConfig: CursorMcpConfig = {
-      ...existing,
-      mcpServers: {
-        ...mcpServers,
-        akan: nextAkanServer,
-      },
-    };
+    const nextConfig: CursorMcpConfig = { ...existing, mcpServers: { ...mcpServers, akan: nextAkanServer } };
     await workspace.writeFile(configPath, `${JSON.stringify(nextConfig, null, 2)}\n`);
     return configPath;
   }
 
-  // Codex (.codex/config.toml) is TOML; we upsert only the [mcp_servers.akan] table as text.
+  // Codex (.codex/config.toml) is TOML, so only the [mcp_servers.akan] table is upserted, as text.
   async #installCodexMcp(workspace: Workspace, { force, mode }: { force: boolean; mode: AkanMcpMode }) {
     const existing = (await workspace.exists(codexMcpConfigPath)) ? await workspace.readFile(codexMcpConfigPath) : "";
     const merged = upsertCodexMcpServerBlock(existing, createAkanCodexMcpServerBlock(mode), { force });
@@ -183,8 +176,8 @@ export class ContextRunner extends runner("context") {
     return codexMcpConfigPath;
   }
 
-  listMcpTools(mode: AkanMcpMode = "readonly") {
-    return listAkanMcpTools(mode);
+  listMcpTools(mode: AkanMcpMode = "readonly", { guidelineNames = [] }: { guidelineNames?: readonly string[] } = {}) {
+    return listAkanMcpTools(mode, { guidelineNames });
   }
 
   async callMcpTool(
@@ -283,7 +276,7 @@ export class ContextRunner extends runner("context") {
           format: "json",
           dryRun: !!args.dryRun,
           workspace,
-          registry: createCliWorkflowStepRegistry(workspace),
+          registry: WorkflowRunner.stepRegistry(workspace),
         }),
       ) as Record<string, unknown>;
       const validationTarget =
@@ -342,18 +335,21 @@ export class ContextRunner extends runner("context") {
       if (framing === "newline") process.stdout.write(`${payload}\n`);
       else process.stdout.write(`Content-Length: ${Buffer.byteLength(payload)}\r\n\r\n${payload}`);
     };
+    // `id ?? null`: JSON-RPC 2.0 §5 requires the member, and `JSON.stringify` silently drops an undefined one.
     const respond = (id: JsonRpcRequest["id"], result: unknown, framing: McpFraming) => {
-      writeMessage({ jsonrpc: "2.0", id, result }, framing);
+      writeMessage({ jsonrpc: "2.0", id: id ?? null, result }, framing);
     };
     const respondError = (id: JsonRpcRequest["id"], code: number, message: string, framing: McpFraming) => {
-      writeMessage({ jsonrpc: "2.0", id, error: { code, message } }, framing);
+      writeMessage({ jsonrpc: "2.0", id: id ?? null, error: { code, message } }, framing);
     };
+    const guidelineNames = await Prompter.listGuidelines();
+    const resources = buildResourceList(guidelineNames);
     const readResource = async (uri: string) => {
-      const context = await AkanContextAnalyzer.analyze(workspace);
-      if (uri === "akan://docs/framework" || uri === "akan://guidelines/framework")
+      if (uri === "akan://docs/framework")
         return { uri, mimeType: "text/markdown", text: await Prompter.getInstruction("framework") };
-      if (uri === "akan://guidelines/modelSignal")
-        return { uri, mimeType: "text/markdown", text: await Prompter.getInstruction("modelSignal") };
+      const guideline = /^akan:\/\/guidelines\/(.+)$/.exec(uri)?.[1];
+      if (guideline) return { uri, mimeType: "text/markdown", text: await Prompter.getInstruction(guideline) };
+      const context = await AkanContextAnalyzer.analyze(workspace);
       if (uri === "akan://workspace/summary")
         return { uri, mimeType: "application/json", text: jsonText(context, { trailingNewline: false }) };
       if (uri === "akan://workspace/apps")
@@ -375,7 +371,8 @@ export class ContextRunner extends runner("context") {
       }
       throw new Error(`Unknown resource: ${uri}`);
     };
-    const handle = async (request: JsonRpcRequest, framing: McpFraming) => {
+    // Every throw becomes a JSON-RPC error: an escaping rejection killed the server, printed to stdout (the protocol).
+    const handleRequest = async (request: JsonRpcRequest, framing: McpFraming) => {
       const params = request.params ?? {};
       if (request.method === "initialize") {
         respond(
@@ -388,40 +385,49 @@ export class ContextRunner extends runner("context") {
           framing,
         );
       } else if (request.method === "tools/list") {
-        respond(
-          request.id,
-          {
-            tools: this.listMcpTools(mode),
-          },
-          framing,
-        );
+        respond(request.id, { tools: this.listMcpTools(mode, { guidelineNames }) }, framing);
       } else if (request.method === "tools/call") {
         const name = params.name as string;
         const args = (params.arguments ?? {}) as Record<string, unknown>;
         try {
           const result = await this.callMcpTool(workspace, name, args, { mode });
-          respond(
-            request.id,
-            {
-              content: [
-                {
-                  type: "text",
-                  text: typeof result === "string" ? result : jsonText(result, { trailingNewline: false }),
-                },
-              ],
-            },
-            framing,
-          );
+          const text = typeof result === "string" ? result : jsonText(result, { trailingNewline: false });
+          respond(request.id, { content: [{ type: "text", text }] }, framing);
         } catch (error) {
-          respondError(request.id, -32602, error instanceof Error ? error.message : String(error), framing);
+          // `isError` in the result, not a JSON-RPC error: a protocol error never reaches the model, which then retries.
+          respond(request.id, { content: [{ type: "text", text: toolErrorText(error) }], isError: true }, framing);
         }
       } else if (request.method === "resources/list") {
-        respond(request.id, { resources: resourceList }, framing);
+        respond(request.id, { resources }, framing);
       } else if (request.method === "resources/read") {
         respond(request.id, { contents: [await readResource(params.uri as string)] }, framing);
-      } else if (!request.method.endsWith("/initialized")) {
+      } else {
         respondError(request.id, -32601, `Unknown method: ${request.method}`, framing);
       }
+    };
+    // No `id` is a notification (e.g. `notifications/cancelled`), which JSON-RPC 2.0 §4.1 forbids answering.
+    const handle = async (request: JsonRpcRequest, framing: McpFraming) => {
+      if (request.id === undefined || request.id === null) return;
+      try {
+        await handleRequest(request, framing);
+      } catch (error) {
+        respondError(request.id, -32603, error instanceof Error ? error.message : String(error), framing);
+      }
+    };
+    // Undecodable input is answered with a `null` id (§5), never thrown: a half-written frame must not end the session.
+    const handleFrame = async (payload: string, framing: McpFraming) => {
+      let request: JsonRpcRequest;
+      try {
+        request = JSON.parse(payload) as JsonRpcRequest;
+      } catch (error) {
+        respondError(null, -32700, error instanceof Error ? error.message : String(error), framing);
+        return;
+      }
+      if (!request || typeof request !== "object" || typeof request.method !== "string") {
+        respondError(null, -32600, "Invalid Request: expected a JSON-RPC 2.0 object with a method", framing);
+        return;
+      }
+      await handle(request, framing);
     };
     const parseContentLengthMessage = async () => {
       const headerEnd = buffer.indexOf("\r\n\r\n");
@@ -438,7 +444,7 @@ export class ContextRunner extends runner("context") {
       if (buffer.length < bodyEnd) return false;
       const body = buffer.slice(bodyStart, bodyEnd);
       buffer = buffer.slice(bodyEnd);
-      await handle(JSON.parse(body) as JsonRpcRequest, "content-length");
+      await handleFrame(body, "content-length");
       return true;
     };
     const parseLineMessage = async () => {
@@ -447,7 +453,7 @@ export class ContextRunner extends runner("context") {
       const line = buffer.slice(0, lineEnd).trim();
       buffer = buffer.slice(lineEnd + 1);
       if (!line) return true;
-      await handle(JSON.parse(line) as JsonRpcRequest, "newline");
+      await handleFrame(line, "newline");
       return true;
     };
     const parse = async () => {
@@ -490,7 +496,7 @@ export class ContextRunner extends runner("context") {
       build: "`akan build <app-name>` creates a production build after preparing generated files.",
       doctor:
         "`akan doctor --strict --format json` reports agent-readable workspace convention diagnostics and validation hints.",
-      "guideline show": "`akan guideline show <name>` prints an Akan codegen guideline instruction.",
+      "guideline show": "`akan guideline show <name>` prints an Akan guideline instruction.",
       workflow:
         "`akan workflow list|explain|plan|apply|validate|report` lists, plans, applies, validates, and reports agent-readable Akan workflows.",
       "workflow list": "`akan workflow list` lists parseable read-only workflow specs.",

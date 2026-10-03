@@ -1,8 +1,9 @@
 import { usePage } from "@apps/akan/client";
 import { Code, Docs } from "@apps/akan/ui";
 import { Scroll } from "@libs/util/ui";
+import { page } from "akanjs/client";
 
-export default function Page() {
+export default page().render(() => {
   const { l } = usePage();
   return (
     <Scroll>
@@ -23,7 +24,7 @@ export default function Page() {
           </div>
         </Docs.Description>
       </Scroll.Slide>
-      <div className="divider" />
+      <div className="my-4 h-px w-full bg-border" />
 
       <Scroll.Slide id="declare-adapter" title={l.trans({ en: "Declare Adapter", ko: "어댑터 선언하기" })}>
         <Docs.Title>{l.trans({ en: "Declare Adapter", ko: "어댑터 선언하기" })}</Docs.Title>
@@ -100,7 +101,7 @@ export * from "./alarmApi";`}
           </Docs.Alert>
         </Docs.Description>
       </Scroll.Slide>
-      <div className="divider" />
+      <div className="my-4 h-px w-full bg-border" />
 
       <Scroll.Slide id="use-external-api" title={l.trans({ en: "Use External API", ko: "외부 API 사용하기" })}>
         <Docs.Title>{l.trans({ en: "Use External API", ko: "외부 API 사용하기" })}</Docs.Title>
@@ -175,7 +176,7 @@ export class IcecreamOrderService extends serve(db.icecreamOrder, ({ use, servic
 }`}
         />
       </Scroll.Slide>
-      <div className="divider" />
+      <div className="my-4 h-px w-full bg-border" />
 
       <Scroll.Slide
         id="query-in-document"
@@ -304,7 +305,7 @@ export class IcecreamOrderMiddleware extends beyond(IcecreamOrderModel, Icecream
         </Docs.Description>
       </Scroll.Slide>
 
-      <div className="divider" />
+      <div className="my-4 h-px w-full bg-border" />
 
       <Scroll.Slide id="use-interval" title={l.trans({ en: "Use Interval", ko: "인터벌 사용하기" })}>
         <Docs.Title>{l.trans({ en: "Use Interval", ko: "인터벌 사용하기" })}</Docs.Title>
@@ -390,8 +391,8 @@ export class IcecreamOrderEndpoint extends endpoint(srv.icecreamOrder, ({ query,
           </Docs.Alert>
         </Docs.Description>
       </Scroll.Slide>
-      <div className="divider" />
-      <Scroll.TitleNavigator className="fixed top-32 right-0 hidden w-[250px] flex-col gap-2 lg:flex" />
+      <div className="my-4 h-px w-full bg-border" />
+      <Scroll.TitleNavigator className="fixed top-32 right-0 hidden w-[250px] flex-col gap-2 xl:flex" />
     </Scroll>
   );
-}
+});

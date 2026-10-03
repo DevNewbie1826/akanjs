@@ -12,7 +12,7 @@ import {
   into,
 } from "akanjs/document";
 import { type AkanSqlClient, type AkanSqlStatement, SqlDocumentStore } from "./database.adaptor";
-import { DEFAULT_TOKENIZER, parseSearchEnabled, SearchIndex, toMatchExpression } from "./searchIndex";
+import { DEFAULT_TOKENIZER, Fts5SearchEngine, parseSearchEnabled, SearchIndex } from "./searchIndex";
 
 class SearchHistory extends via((f) => ({
   action: f(String, { text: "tag" }),
@@ -53,7 +53,7 @@ const searchTestDatabase = DatabaseRegistry.buildModel(
   SearchTestDoc,
   SearchTestModel,
   SearchTestObject,
-  SearchTestInsight,
+  SearchTestInsight as unknown as Parameters<typeof DatabaseRegistry.buildModel>[5],
   SearchTestFilter,
 );
 
@@ -201,27 +201,29 @@ describe("parseSearchEnabled", () => {
   });
 });
 
-describe("toMatchExpression", () => {
+describe("Fts5SearchEngine.matchExpression", () => {
   test("quotes every term so fts5 syntax in user input stays literal", () => {
-    expect(toMatchExpression("hello world")).toBe('"hello" "world"');
-    expect(toMatchExpression('he"llo')).toBe('"he""llo"');
-    expect(toMatchExpression("-foo AND")).toBe('"-foo" "AND"');
-    expect(toMatchExpression("  ")).toBe(null);
+    expect(Fts5SearchEngine.matchExpression("hello world")).toBe('"hello" "world"');
+    expect(Fts5SearchEngine.matchExpression('he"llo')).toBe('"he""llo"');
+    expect(Fts5SearchEngine.matchExpression("-foo AND")).toBe('"-foo" "AND"');
+    expect(Fts5SearchEngine.matchExpression("  ")).toBe(null);
   });
 
   test("marks only the last term as a prefix", () => {
-    expect(toMatchExpression("ken par", { prefix: true })).toBe('"ken" "par"*');
+    expect(Fts5SearchEngine.matchExpression("ken par", { prefix: true })).toBe('"ken" "par"*');
   });
 
   test("parenthesises the term list so a column filter covers all of it", () => {
-    expect(toMatchExpression("ken par", { columns: ["title", "desc"] })).toBe('{title desc} : ("ken" "par")');
+    expect(Fts5SearchEngine.matchExpression("ken par", { columns: ["title", "desc"] })).toBe(
+      '{title desc} : ("ken" "par")',
+    );
   });
 
   test("produces expressions sqlite accepts for input that would otherwise raise", async () => {
     await build();
     insert("a1", { headline: "Kenny Park" });
     for (const raw of ['hello"', "a AND", "*", "NEAR(", "-hello", "foo:bar"]) {
-      const expression = toMatchExpression(raw);
+      const expression = Fts5SearchEngine.matchExpression(raw);
       expect(() => (expression ? matchIds(expression) : [])).not.toThrow();
     }
   });
@@ -365,8 +367,7 @@ describe("SearchIndex reconcile", () => {
   });
 
   test("widens a mirror created before a column existed, and re-reads every ref", async () => {
-    // A database from a release whose mirror had no `thumb`. Recreating only the fts table would leave `rebuild`
-    // reading a column `search_doc` does not have, which fails the boot outright.
+    // A mirror from a release without `thumb`: `rebuild` would read the missing column and fail the boot.
     db.run(
       `CREATE TABLE "search_doc" ("fid" INTEGER PRIMARY KEY AUTOINCREMENT, "ref" TEXT NOT NULL,
         "refId" TEXT NOT NULL, "title" TEXT NOT NULL DEFAULT '', "desc" TEXT NOT NULL DEFAULT '',
@@ -431,8 +432,7 @@ describe("SearchIndex reconcile", () => {
     let stole = false;
     client.execute = async (sql: string, params?: unknown[] | Record<string, unknown>) => {
       const result = await execute(sql, params);
-      // Only the backfill statement — the trigger DDL embeds the same INSERT, and matching that would steal the
-      // claim before it is even taken, which is a different case entirely.
+      // Only the backfill statement: the trigger DDL embeds the same INSERT and would steal the claim too early.
       if (!stole && sql.includes(`FROM "${TABLE}" AS NEW`)) {
         stole = true;
         await owner.setMeta(`search:lock:${TABLE}`, stolen);
@@ -462,8 +462,7 @@ describe("SearchIndex reconcile", () => {
     await second.ensureRef(searchTestConstant as never, searchTestDatabase as never);
     client.execute = execute;
 
-    // A write landing between the drop and the create misses the mirror, and a matching hash means no reconcile
-    // ever comes back for it.
+    // A write between drop and create would miss the mirror, and a matching hash never reconciles it.
     expect(drops.filter((sql) => sql.includes(`${TABLE}_search`))).toEqual([]);
   });
 
@@ -481,8 +480,7 @@ describe("SearchIndex reconcile", () => {
     await second.ensureSchema();
     client.execute = execute;
 
-    // Worse than the model triggers: a mirror row written without `search_doc_au` leaves fts5 on the old text,
-    // which stops matching, returns a ghost hit for the old value, and still passes integrity-check.
+    // Without `search_doc_au` fts5 keeps the old text: ghost hits that still pass integrity-check.
     expect(drops.filter((sql) => sql.includes("search_doc"))).toEqual([]);
   });
 
@@ -628,8 +626,7 @@ describe("search query", () => {
     ...extra,
   });
 
-  // The title hit is created in the middle so that neither insertion order nor either createdAt direction would
-  // put it first — only the bm25 score does.
+  // The title hit is created in the middle, so only the bm25 score can put it first.
   const seedRanked = async (store: SqlDocumentStore) => ({
     firstDesc: await store.create(doc("Alpha Person", { summary: "reviewed by Kenny" })),
     inTitle: await store.create(doc("Kenny Park")),
@@ -742,10 +739,10 @@ describe("search query", () => {
   test("rejects weights that do not line up with the index columns", async () => {
     const store = await openStore();
 
-    await expect(store.find(q.search("Kenny", { weights: [1, 2] }))).rejects.toThrow("must be 4 finite numbers");
-    await expect(store.find(q.search("Kenny", { weights: [1, 2, 3, Number.NaN] }))).rejects.toThrow(
-      "must be 4 finite numbers",
-    );
+    await expect(store.find(q.search("Kenny", { weights: [1, 2] }))).rejects.toThrow("must be 4 finite");
+    await expect(store.find(q.search("Kenny", { weights: [1, 2, 3, Number.NaN] }))).rejects.toThrow("must be 4 finite");
+    // Postgres ranks by weight class and has no reading for a negative one, so no engine takes it.
+    await expect(store.find(q.search("Kenny", { weights: [1, -2, 3, 0] }))).rejects.toThrow("non-negative");
   });
 
   test("names the model and the env var when the index is switched off", async () => {
@@ -832,8 +829,7 @@ describe("SearchIndex optimize", () => {
   test("lets only one of two overlapping runs take the claim", async () => {
     const index = await build();
 
-    // The claim is one conditional upsert, so it holds without `transaction()` — which would collide with any
-    // unrelated transaction already open on this connection.
+    // One conditional upsert, so it holds without `transaction()`, which would collide with an open one.
     const results = await Promise.all([index.optimize(), index.optimize()]);
 
     expect(results.filter(Boolean)).toHaveLength(1);
@@ -875,8 +871,7 @@ describe("SearchIndex schema failure", () => {
 
     await expect(bad.ensureSchema()).rejects.toThrow("no_such_tokenizer");
 
-    // Mirror triggers left over the dropped table would raise "no such table" on every write to an indexed
-    // model — on every process using this database, not just the one that failed to boot.
+    // Triggers left over the dropped table would fail every indexed write, on every process using the database.
     expect(ftsExists()).toBe(false);
     expect(() => insert("a1", { headline: "Kenny" })).not.toThrow();
   });

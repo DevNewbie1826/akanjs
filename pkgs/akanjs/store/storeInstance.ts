@@ -1,29 +1,30 @@
-import { ACTION_META, STATE_DERIVED_META, STATE_INIT_META } from "akanjs/base";
+import { ACTION_META, ACTION_OWNER_META, STATE_DERIVED_META, STATE_INIT_META } from "akanjs/base";
 import { Translator } from "akanjs/client";
-import { capitalize, Logger, parseAkanI18nEnv } from "akanjs/common";
-import { produce } from "immer";
+import { appState, isNativeApp } from "akanjs/client/native";
+import { capitalize, type DynamicRecord, isRecord, Logger, parseAkanI18nEnv } from "akanjs/common";
+import { ConstantRegistry } from "akanjs/constant";
+import type { SerializedArg } from "akanjs/signal";
+import { enableMapSet, produce } from "immer";
 import type { RefObject } from "react";
+import { type AgentGate, useAgentGate, useScopePath } from "use-agentic";
+import { type ActionOwner, actionTagOf, tagAction } from "./actionTag";
+import { useFormTools } from "./agentic/useFormTools";
+import { DraftStore } from "./draftStore";
 import { useEffect, useRef, useSyncExternalStore } from "./hooks";
 import type { RootStoreCls } from "./rootStore";
-import type { SliceStateKey } from "./state";
+import { sliceKeysOf } from "./sliceKeys";
+import type { SliceActionKey, SliceActionRole, SliceStateRole } from "./sliceRole";
+import type { DraftState, SliceStateKey } from "./state";
 import { evaluateInitializers, type SearchParamsState, type StateDerivedMeta } from "./stateBuilder";
+import type { StoreUseOptions } from "./types";
+
+enableMapSet();
 
 type StoreStateRecord = Record<string, unknown>;
+
+const DRAFT_DEBOUNCE_MS = 400;
 type StoreAction = (...args: unknown[]) => unknown;
 type TranslationParam = Record<string, string | number>;
-
-type SliceActionKey =
-  | "initModel"
-  | "refreshModel"
-  | "selectModel"
-  | "setPageOfModel"
-  | "addPageOfModel"
-  | "setLimitOfModel"
-  | "setQueryArgsOfModel"
-  | "setSortOfModel";
-
-const isRecord = (value: unknown): value is Record<string, unknown> =>
-  Boolean(value && typeof value === "object" && !Array.isArray(value));
 
 const getActionErrorKey = (error: unknown) => {
   if (typeof error === "string") return error;
@@ -55,8 +56,12 @@ export type ReactAPI = {
 
 export class StoreInstance {
   #state: StoreStateRecord = {};
+  // What the server rendered: initializers only, since nothing on the server ever calls `set`.
+  #serverState: StoreStateRecord = {};
   #listeners = new Set<() => void>();
-  #derivedMeta: StateDerivedMeta = { persistSession: {}, search: {}, computed: {}, derivedKeys: new Set() };
+  #derivedMeta: StateDerivedMeta = { drafts: {}, persistSession: {}, search: {}, computed: {}, derivedKeys: new Set() };
+  #draftTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  #draftFlushBound = false;
 
   get = (): StoreStateRecord => this.#state;
 
@@ -70,6 +75,7 @@ export class StoreInstance {
     this.#assertNoDerivedMutation(stateOrUpdater);
     this.#state = this.#materializeDerived(this.#state, prev);
     this.#syncPersistSession(prev, this.#state);
+    this.#syncDrafts(prev, this.#state);
     this.#notify();
   };
 
@@ -136,7 +142,13 @@ export class StoreInstance {
   }) as any;
 
   sel = <U>(selector: (state: StoreStateRecord) => U, equals?: (a: U, b: U) => boolean) => {
+    this.#useLiveSelector(selector);
+    return this.#sel(selector, equals);
+  };
+
+  #sel = <U>(selector: (state: StoreStateRecord) => U, equals?: (a: U, b: U) => boolean) => {
     const eq = equals ?? Object.is;
+    let serverSnapshot: { value: U } | null = null;
     return useSyncExternalStore(
       (onStoreChange: () => void) => {
         let prev = selector(this.#state);
@@ -150,11 +162,79 @@ export class StoreInstance {
         return this.subscribe(listener);
       },
       () => selector(this.#state),
-      () => selector(this.#state),
+      // React hydrates each Suspense boundary in its own pass, after earlier boundaries' effects already wrote the store.
+      () => {
+        serverSnapshot ??= { value: selector(this.#serverState) };
+        return serverSnapshot.value;
+      },
     );
   };
 
+  retainLive = (key: string, scopeKey = "", gate: AgentGate | null = null) => {
+    const scopes = this.#liveKeys.get(key) ?? new Map<string, Map<AgentGate | null, number>>();
+    const gates = scopes.get(scopeKey) ?? new Map<AgentGate | null, number>();
+    gates.set(gate, (gates.get(gate) ?? 0) + 1);
+    scopes.set(scopeKey, gates);
+    this.#liveKeys.set(key, scopes);
+  };
+
+  releaseLive = (key: string, scopeKey = "", gate: AgentGate | null = null) => {
+    const gates = this.#liveKeys.get(key)?.get(scopeKey);
+    if (!gates) return;
+    const count = gates.get(gate) ?? 0;
+    if (count <= 1) gates.delete(gate);
+    else gates.set(gate, count - 1);
+    if (gates.size) return;
+    const scopes = this.#liveKeys.get(key);
+    scopes?.delete(scopeKey);
+    if (!scopes?.size) this.#liveKeys.delete(key);
+  };
+
+  #useLive(key: string, count = true) {
+    // Retention is tagged with the ambient agent scope, so a zone session sees only the keys its own subtree reads,
+    // and with its gate, so a page kept mounted under the current one stops lending the screen its keys.
+    const scopeKey = useScopePath().join(".");
+    const gate = useAgentGate();
+    useEffect(() => {
+      if (!count) return;
+      this.retainLive(key, scopeKey, gate);
+      return () => {
+        this.releaseLive(key, scopeKey, gate);
+      };
+    }, [key, count, scopeKey, gate]);
+  }
+
+  // Keys are learned by running the selector over a recording proxy, once at mount: retained must equal released.
+  #useLiveSelector(selector: (state: StoreStateRecord) => unknown) {
+    const scopeKey = useScopePath().join(".");
+    const gate = useAgentGate();
+    useEffect(() => {
+      const keys = [...this.#touched(selector)];
+      for (const key of keys) this.retainLive(key, scopeKey, gate);
+      return () => {
+        for (const key of keys) this.releaseLive(key, scopeKey, gate);
+      };
+    }, [scopeKey, gate]);
+  }
+
+  #touched(selector: (state: StoreStateRecord) => unknown) {
+    const touched = new Set<string>();
+    const proxy = new Proxy(this.#state, {
+      get: (target, key) => {
+        if (typeof key === "string") touched.add(key);
+        return Reflect.get(target, key);
+      },
+    });
+    try {
+      selector(proxy as StoreStateRecord);
+    } catch {
+      // A selector that throws on the current state still counted every key it reached first.
+    }
+    return touched;
+  }
+
   ref = <U>(selector: (state: StoreStateRecord) => U): RefObject<U> => {
+    this.#useLiveSelector(selector);
     const ref = useRef(selector(this.get()));
     useEffect(
       () =>
@@ -166,9 +246,62 @@ export class StoreInstance {
     return ref as RefObject<U>;
   };
 
-  use: { [key: string]: () => unknown } = {};
+  use: { [key: string]: (options?: StoreUseOptions) => unknown } = {};
   do: { [key: string]: StoreAction } = {};
   slice: { [key: string]: unknown } = {};
+
+  readonly #sliceActionRoles = new Map<string, SliceActionRole>();
+  readonly #sliceStateRoles = new Map<string, SliceStateRole>();
+  readonly #actionArity = new Map<string, number>();
+  readonly #actionOwners = new Map<string, ActionOwner>();
+  readonly #liveKeys = new Map<string, Map<string, Map<AgentGate | null, number>>>();
+  readonly #generatedSetters = new Set<string>();
+
+  /** How many mounted components read each state key right now. */
+  get liveKeys(): ReadonlyMap<string, number> {
+    return this.liveKeysIn("");
+  }
+
+  /** Live keys retained at `viewKey`'s scope or below, behind no gate or an active one; `""` is the whole screen. */
+  liveKeysIn(viewKey: string): ReadonlyMap<string, number> {
+    const keys = new Map<string, number>();
+    for (const [key, scopes] of this.#liveKeys) {
+      let total = 0;
+      for (const [scopeKey, gates] of scopes) {
+        if (viewKey && scopeKey !== viewKey && !scopeKey.startsWith(`${viewKey}.`)) continue;
+        for (const [gate, count] of gates) if (gate?.active ?? true) total += count;
+      }
+      if (total > 0) keys.set(key, total);
+    }
+    return keys;
+  }
+
+  get actionOwners(): ReadonlyMap<string, ActionOwner> {
+    return this.#actionOwners;
+  }
+
+  /** Each method's own `length`: `do[key]` is a rest-argument wrapper whose `length` is 0. */
+  get actionArity(): ReadonlyMap<string, number> {
+    return this.#actionArity;
+  }
+
+  get sliceActionRoles(): ReadonlyMap<string, SliceActionRole> {
+    return this.#sliceActionRoles;
+  }
+
+  get sliceStateRoles(): ReadonlyMap<string, SliceStateRole> {
+    return this.#sliceStateRoles;
+  }
+
+  /** `search()` and `computed()` keys; `set` throws on them. */
+  get derivedKeys(): ReadonlySet<string> {
+    return this.#derivedMeta.derivedKeys;
+  }
+
+  /** The generated `set<Key>` setters for plain state keys; their value is untyped. */
+  get generatedSetters(): ReadonlySet<string> {
+    return this.#generatedSetters;
+  }
 
   constructor(store?: RootStoreCls) {
     if (store) this.addStore(store);
@@ -177,16 +310,16 @@ export class StoreInstance {
   addStore(store: RootStoreCls) {
     this.#mergeDerivedMeta(store[STATE_DERIVED_META]);
     const newState = evaluateInitializers(store[STATE_INIT_META] ?? {});
+    this.#serverState = this.#withNewKeys(
+      this.#serverState,
+      this.#materializeDerived({ ...this.#serverState, ...newState }, this.#serverState, true),
+    );
     const hydratedState = this.#hydratePersistSession(newState);
     const derivedState = this.#materializeDerived({ ...this.#state, ...hydratedState }, this.#state);
-    let hasNewStateKey = false;
-    const nextState = { ...this.#state };
-    for (const [key, value] of Object.entries(derivedState)) {
-      if (key in nextState) continue;
-      nextState[key] = value;
-      hasNewStateKey = true;
-    }
-    if (hasNewStateKey) this.#state = nextState;
+    const nextState = this.#withNewKeys(this.#state, derivedState);
+    const hasNewStateKey = nextState !== this.#state;
+    this.#state = nextState;
+    for (const [key, owner] of Object.entries(store[ACTION_OWNER_META] ?? {})) this.#actionOwners.set(key, owner);
     this.#mergeActions(store[ACTION_META]);
     this.#extendAccessors(derivedState, store[ACTION_META]);
     this.#buildSlices(store);
@@ -194,35 +327,67 @@ export class StoreInstance {
     return this;
   }
 
+  #withNewKeys(state: StoreStateRecord, additions: StoreStateRecord) {
+    const newKeys = Object.keys(additions).filter((key) => !(key in state));
+    if (!newKeys.length) return state;
+    return { ...state, ...Object.fromEntries(newKeys.map((key) => [key, additions[key]])) };
+  }
+
+  static #formRefNameOf(key: string) {
+    if (!key.endsWith("Form")) return null;
+    const refName = key.slice(0, -"Form".length);
+    return ConstantRegistry.database.has(refName) ? refName : null;
+  }
+
   #mergeActions(actions: { [key: string]: StoreAction }) {
     for (const [k, method] of Object.entries(actions)) {
       this.#ctx[k] = (...args: unknown[]) => method.call(this.#ctx, ...args);
+      this.#actionArity.set(k, method.length);
     }
   }
 
   #extendAccessors(state: StoreStateRecord, actions: { [key: string]: StoreAction }) {
     for (const k of Object.keys(state)) {
       if (typeof state[k] !== "function") {
-        this.use[k] = () => this.sel((s) => s[k]);
+        // Subscribing a `<model>Form` publishes its fill tool: the component that shows the form opts it in.
+        const formRefName = StoreInstance.#formRefNameOf(k);
+        this.use[k] = formRefName
+          ? (options?: StoreUseOptions) => {
+              const publish = options?.agent !== false;
+              this.#useLive(k, publish);
+              useFormTools(publish ? formRefName : null, (action, value) => {
+                void (this.do[action] as ((value: unknown) => unknown) | undefined)?.(value);
+              });
+              return this.#sel((s) => s[k]);
+            }
+          : (options?: StoreUseOptions) => {
+              this.#useLive(k, options?.agent !== false);
+              return this.#sel((s) => s[k]);
+            };
         if (this.#derivedMeta.derivedKeys.has(k)) continue;
         const setKey = `set${capitalize(k)}`;
-        this.do[setKey] = (value: unknown) => this.set({ [k]: value });
+        // A declared action of the same name (`setPageOfX` is a slice action) wins the key; no convenience setter.
+        if (setKey in actions) continue;
+        this.do[setKey] = tagAction((value: unknown) => this.set({ [k]: value }), { action: setKey, state: k });
+        this.#actionArity.set(setKey, 1);
+        this.#generatedSetters.add(setKey);
       }
     }
     for (const k of Object.keys(actions)) {
-      this.do[k] = async (...args: unknown[]) => {
+      const dispatch = async (...args: unknown[]) => {
         Logger.verbose(`${k} action loading...`);
         const start = Date.now();
         try {
-          const result = await (this.#ctx[k] as StoreAction)(...args);
+          await (this.#ctx[k] as StoreAction)(...args);
           Logger.verbose(`=> ${k} action dispatched (${Date.now() - start}ms)`);
-          return result;
         } catch (error) {
           this.#showActionErrorMessage(k, error);
           Logger.error(`${k} action error return: ${error instanceof Error ? error.message : String(error)}`);
           throw error;
         }
       };
+      // Carried over, not rebuilt: a generated setter's tag holds the state path this wrapper cannot know.
+      this.do[k] = tagAction(dispatch, actionTagOf(actions[k]) ?? { action: k });
     }
   }
 
@@ -246,66 +411,15 @@ export class StoreInstance {
   #buildSlices(store: RootStoreCls) {
     Object.entries(store.slice).forEach(([refName, sliceObj]) => {
       Object.entries(sliceObj).forEach(([suffix, serializedSlice]) => {
-        const sliceName = `${refName}${capitalize(suffix)}`;
-        this.#buildSlice(refName, sliceName, serializedSlice);
+        this.#buildSlice(refName, suffix, serializedSlice);
       });
     });
   }
 
-  #buildSlice(refName: string, sliceName: string, serializedSlice: { args?: any[] }) {
-    const [fieldName, className] = [refName, capitalize(refName)];
-    const names: { [key in SliceStateKey | SliceActionKey | "model" | "Model"]: string } = {
-      model: fieldName,
-      Model: className,
-      defaultModel: `default${className}`,
-      modelInsight: `${fieldName}Insight`,
-      modelList: `${fieldName}List`,
-      modelListLoading: `${fieldName}ListLoading`,
-      modelInitList: `${fieldName}InitList`,
-      modelInitAt: `${fieldName}InitAt`,
-      modelStaleAt: `${fieldName}StaleAt`,
-      pageOfModel: `pageOf${className}`,
-      limitOfModel: `limitOf${className}`,
-      queryArgsOfModel: `queryArgsOf${className}`,
-      sortOfModel: `sortOf${className}`,
-      modelSelection: `${fieldName}Selection`,
-      initModel: `init${className}`,
-      refreshModel: `refresh${className}`,
-      selectModel: `select${className}`,
-      setPageOfModel: `setPageOf${className}`,
-      addPageOfModel: `addPageOf${className}`,
-      setLimitOfModel: `setLimitOf${className}`,
-      setQueryArgsOfModel: `setQueryArgsOf${className}`,
-      setSortOfModel: `setSortOf${className}`,
-      lastPageOfModel: `lastPageOf${className}`,
-    };
-    const SliceName = capitalize(sliceName);
-    const namesOfSliceState: { [key in SliceStateKey]: string } = {
-      defaultModel: SliceName.replace(names.Model, names.defaultModel),
-      modelInitList: SliceName.replace(names.Model, names.modelInitList),
-      modelInsight: sliceName.replace(names.model, names.modelInsight),
-      modelList: sliceName.replace(names.model, names.modelList),
-      modelListLoading: sliceName.replace(names.model, names.modelListLoading),
-      modelInitAt: SliceName.replace(names.Model, names.modelInitAt),
-      modelStaleAt: SliceName.replace(names.Model, names.modelStaleAt),
-      lastPageOfModel: SliceName.replace(names.Model, names.lastPageOfModel),
-      pageOfModel: SliceName.replace(names.Model, names.pageOfModel),
-      limitOfModel: SliceName.replace(names.Model, names.limitOfModel),
-      queryArgsOfModel: SliceName.replace(names.Model, names.queryArgsOfModel),
-      sortOfModel: SliceName.replace(names.Model, names.sortOfModel),
-      modelSelection: SliceName.replace(names.Model, names.modelSelection),
-    };
-    const namesOfSliceAction: { [key in SliceActionKey]: string } = {
-      initModel: SliceName.replace(names.Model, names.initModel),
-      refreshModel: SliceName.replace(names.Model, names.refreshModel),
-      selectModel: SliceName.replace(names.Model, names.selectModel),
-      setPageOfModel: SliceName.replace(names.Model, names.setPageOfModel),
-      addPageOfModel: SliceName.replace(names.Model, names.addPageOfModel),
-      setLimitOfModel: SliceName.replace(names.Model, names.setLimitOfModel),
-      setQueryArgsOfModel: SliceName.replace(names.Model, names.setQueryArgsOfModel),
-      setSortOfModel: SliceName.replace(names.Model, names.setSortOfModel),
-    };
-
+  #buildSlice(refName: string, suffix: string, serializedSlice: { args?: SerializedArg[] }) {
+    const sliceName = `${refName}${capitalize(suffix)}`;
+    const names = sliceKeysOf(refName);
+    const { state: namesOfSliceState, action: namesOfSliceAction } = sliceKeysOf(refName, suffix);
     const targetSlice: {
       do: { [key: string]: (...args: any[]) => void };
       use: { [key: string]: () => any };
@@ -322,16 +436,22 @@ export class StoreInstance {
       argLength: serializedSlice.args?.length ?? 0,
     };
 
+    const args = serializedSlice.args ?? [];
     for (const key of Object.keys(namesOfSliceAction) as SliceActionKey[]) {
       const rootActionKey = namesOfSliceAction[key];
-      if (this.do[rootActionKey]) targetSlice.do[names[key]] = this.do[rootActionKey];
+      if (!this.do[rootActionKey]) continue;
+      targetSlice.do[names.action[key]] = this.do[rootActionKey];
+      this.#sliceActionRoles.set(rootActionKey, { role: key, refName, sliceName, args });
     }
 
     for (const key of Object.keys(namesOfSliceState) as SliceStateKey[]) {
       const rootStateKey = namesOfSliceState[key];
-      if (this.use[rootStateKey]) targetSlice.use[names[key]] = this.use[rootStateKey];
+      if (this.use[rootStateKey]) {
+        targetSlice.use[names.state[key]] = this.use[rootStateKey];
+        this.#sliceStateRoles.set(rootStateKey, { role: key, refName, sliceName });
+      }
       const setRootKey = `set${capitalize(rootStateKey)}`;
-      const setLocalKey = `set${capitalize(names[key])}`;
+      const setLocalKey = `set${capitalize(names.state[key])}`;
       if (this.do[setRootKey]) targetSlice.do[setLocalKey] = this.do[setRootKey];
     }
 
@@ -339,13 +459,13 @@ export class StoreInstance {
       const state = this.get();
       return Object.fromEntries(
         (Object.entries(namesOfSliceState) as [SliceStateKey, string][]).map(([key, value]) => [
-          names[key],
+          names.state[key],
           state[value],
         ]),
       );
     };
 
-    (this.slice as any)[sliceName] = targetSlice;
+    (this.slice as unknown as DynamicRecord)[sliceName] = targetSlice;
   }
 
   #notify() {
@@ -354,6 +474,7 @@ export class StoreInstance {
 
   #mergeDerivedMeta(meta?: StateDerivedMeta) {
     if (!meta) return;
+    Object.assign(this.#derivedMeta.drafts, meta.drafts);
     Object.assign(this.#derivedMeta.persistSession, meta.persistSession);
     Object.assign(this.#derivedMeta.search, meta.search);
     Object.assign(this.#derivedMeta.computed, meta.computed);
@@ -391,12 +512,91 @@ export class StoreInstance {
     }
   }
 
-  #materializeDerived(next: StoreStateRecord, prev: StoreStateRecord) {
+  // The debounce lives in the store, not a component, so an editor unmounting mid-window still lands its last write.
+  #syncDrafts(prev: StoreStateRecord, next: StoreStateRecord) {
+    if (typeof window === "undefined") return;
+    for (const meta of Object.values(this.#derivedMeta.drafts)) {
+      const draft = next[meta.draftKey] as DraftState | null;
+      if (!draft?.key) {
+        this.#cancelDraftTimer(meta.formKey);
+        continue;
+      }
+      if (Object.is(prev[meta.formKey], next[meta.formKey])) continue;
+      // A `set` that also moves the draft slot (open, apply, restore, discard) is not typing, so it schedules nothing.
+      if (!Object.is(prev[meta.draftKey], next[meta.draftKey])) continue;
+      this.#armDraftFlush();
+      this.#cancelDraftTimer(meta.formKey);
+      this.#draftTimers.set(
+        meta.formKey,
+        setTimeout(() => {
+          this.#draftTimers.delete(meta.formKey);
+          void this.#writeDraft(meta.refName, meta.formKey, meta.draftKey);
+        }, DRAFT_DEBOUNCE_MS),
+      );
+    }
+  }
+
+  #cancelDraftTimer(formKey: string) {
+    const timer = this.#draftTimers.get(formKey);
+    if (!timer) return;
+    clearTimeout(timer);
+    this.#draftTimers.delete(formKey);
+  }
+
+  async #writeDraft(refName: string, formKey: string, draftKey: string) {
+    const draft = this.#state[draftKey] as DraftState | null;
+    const form = this.#state[formKey] as object | null;
+    if (!draft?.key || !form) return;
+    try {
+      const hash = DraftStore.formHash(refName, form);
+      // Back at the opened value: a leftover record would offer to restore what is already on screen.
+      if (hash === draft.baseHash) {
+        await DraftStore.remove(draft.key);
+        return;
+      }
+      await DraftStore.write(draft.key, {
+        v: 1,
+        savedAt: new Date().toISOString(),
+        baseUpdatedAt: draft.baseUpdatedAt,
+        form: DraftStore.encodeForm(refName, form),
+      });
+    } catch (error) {
+      Logger.warn(`Failed to save the ${refName} form draft: ${String(error)}`);
+    }
+  }
+
+  /** Writes every pending draft now, cancelling its debounce. */
+  flushDrafts = () => {
+    for (const [formKey, timer] of this.#draftTimers) {
+      clearTimeout(timer);
+      const meta = this.#derivedMeta.drafts[formKey];
+      if (meta) void this.#writeDraft(meta.refName, meta.formKey, meta.draftKey);
+    }
+    this.#draftTimers.clear();
+  };
+
+  #armDraftFlush() {
+    if (this.#draftFlushBound || typeof window === "undefined") return;
+    this.#draftFlushBound = true;
+    const onHide = () => {
+      if (document.visibilityState === "hidden") this.flushDrafts();
+    };
+    // `pagehide` is the one a bfcache navigation and an iOS tab teardown both fire; `beforeunload` is not.
+    window.addEventListener("pagehide", this.flushDrafts);
+    document.addEventListener("visibilitychange", onHide);
+    // iOS can suspend a webview without ever firing a page event, so the native lifecycle is the only warning.
+    if (isNativeApp())
+      appState.listen("change", ({ state }) => {
+        if (state === "background") this.flushDrafts();
+      });
+  }
+
+  #materializeDerived(next: StoreStateRecord, prev: StoreStateRecord, server = typeof window === "undefined") {
     const materialized = { ...next };
     const changedKeys = new Set(Object.keys(materialized).filter((key) => !Object.is(materialized[key], prev[key])));
     const searchParams = (materialized.searchParams ?? {}) as SearchParamsState;
     for (const [key, meta] of Object.entries(this.#derivedMeta.search)) {
-      const value = typeof window === "undefined" ? meta.getDefault() : meta.parseSearch(searchParams);
+      const value = server ? meta.getDefault() : meta.parseSearch(searchParams);
       if (!Object.is(materialized[key], value)) {
         materialized[key] = value;
         changedKeys.add(key);

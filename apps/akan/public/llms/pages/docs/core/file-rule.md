@@ -13,7 +13,7 @@
 - Naming Rule (#naming-rule)
 - Facet Files And Barrels (#facet-files)
 - Module Differences (#module-differences)
-- Codegen And Choices (#workflow)
+- Common Choices (#workflow)
 
 ## Content
 
@@ -27,53 +27,45 @@ Business meaning
 
 A file suffix explains what kind of work the file does for the model.
 
-Scanner friendly
-
-Akan scans these suffixes and connects models, services, signals, and UI pieces.
-
 Start small
 
 You do not need every file. Add files only when the business feature needs them.
-
-You can start with only one or two files. For example, a simple read-only catalog may only need product.document.ts and Product.View.tsx at first.
 
 Module Files
 
 These files describe the data, server logic, API surface, and state around a business model. If you are building products, orders, users, invoices, or reservations, these are the files you will touch most often.
 
-For example, an order feature may keep order status values in order.constant.ts, saved order fields in order.document.ts, payment completion logic in order.service.ts, and page-callable actions in order.signal.ts.
-
 The abstract file is not only for LLMs. It keeps domain knowledge beside the code, so people and agents can understand business invariants before changing implementation files.
 
-Business intent, domain rules, workflows, and agent notes kept next to the module code. Example: order cancellation rules or status transition policy.
+The five UI suffixes are not five sizes of component either. Each one answers a different question: how the user edits one record, how one record looks in a list, how one record looks on its own page, how a page section is assembled, and what extra action the model offers. The first column of each row is which side of the client boundary the file lives on:
 
-Constants, status values, default options, and shared model types. Example: order status such as pending, paid, shipped.
+File
 
-Labels, field names, and text keys used by the model. Example: product name, price, stock labels.
+- model.abstract.md: Business intent, domain rules, workflows and agent notes beside the module code. — shared
 
-Stored data shape, filters, and document model definition. Example: what fields an invoice saves and how it can be queried.
+- model.constant.ts: Constants, status values, default options, and shared model types. — shared
 
-Server-side business logic. Example: create an order, apply a coupon, calculate shipping, or complete payment.
+- model.dictionary.ts: Labels, field names, and text keys the model uses, such as the price label. — shared
 
-Public actions, slices, endpoints, and internal jobs that pages can call. Example: load order list or request OCR.
+- model.document.ts: Stored data shape, filters, and document model definition. — server
 
-Client or model state used across screens. Example: selected filters, cart state, or temporary form state.
+- model.service.ts: Server-side business logic, such as creating an order or applying a coupon. — server
 
-UI Files
+- model.signal.ts: Public actions, slices, endpoints, and internal jobs that pages can call. — shared
 
-UI files describe how a model appears on screen. They use PascalCase because they export React components or UI groups.
+- model.store.ts: Client or model state used across screens, such as selected filters or a cart. — client
 
-A business model usually appears in several screen sizes: a small badge, a list row, a detail card, an admin panel, and sometimes a full dashboard section. UI files help you keep those screen pieces close to the model they represent.
+- Model.Template.tsx: The create and edit form: reads st.use.productForm(), writes through generated setters. — client
 
-Use it for display components, such as ProductCard, OrderSummary, UserProfile, or InvoicePreview.
+- Model.Unit.tsx: One item in a list or grid, such as a row or card; takes the trimmed LightProduct. — server
 
-Use it for small reusable units inside the model UI, such as status badges, price rows, or avatar blocks.
+- Model.Util.tsx: A domain UI helper named for the endpoint verb minus the model noun, like Refund. — client
 
-Use it for repeated screen templates or layout patterns, such as a standard admin detail layout.
+- Model.View.tsx: One record in full detail: the full model, with fields a list never loads. — server
 
-Use it for UI-level actions or helper components, such as remove buttons, edit modal triggers, or upload controls.
+- Model.Zone.tsx: A composed page section: feeds the store to Load.Units or Load.View; Unit and View draw it. — client
 
-Use it for larger areas, such as admin screens, list/detail zones, tab content, or dashboard sections.
+The client boundary follows the suffix, not your judgment. Template, Zone, and Util always carry "use client" on line 1; Unit and View never do, so they render on the server and ship no JavaScript.
 
 Naming Rule
 
@@ -86,8 +78,6 @@ Business files
 UI files
 
 Do not declare arbitrary files inside a module folder outside these rules. For example, product.helper.ts or ProductComponents.tsx should be moved into the closest allowed role such as product.service.ts, Product.Util.tsx, or Product.Unit.tsx.
-
-The suffix is not just style. Akan scans these suffixes to understand what files exist in each module.
 
 Facet Files And Barrels
 
@@ -103,11 +93,7 @@ Use this for reusable visual components. Example: ProductCard.tsx should export 
 
 Use this for browser/client hooks and helpers. Example: usePaymentStatus.tsx should export usePaymentStatus.
 
-A barrel file re-exports many files from one entry point. Akan can analyze configured barrel imports and rewrite imports to the exact source file, so importing from @apps/myapp/ui can stay convenient without always pulling the entire barrel into the bundle.
-
-In day-to-day product work, this means your page can import by business name instead of deep file path. You write a clean import, and Akan keeps the build focused on the exact files that are used.
-
-This is why one file, one main export is recommended. It helps the barrel analyzer map ProductCard to ui/ProductCard.tsx clearly.
+A page imports by business name from the package entry point instead of a deep file path.
 
 Module Differences
 
@@ -115,19 +101,47 @@ Not every folder type uses every file type. Database modules can have the full s
 
 Choose the file set by the business role of the folder. product is a thing you store, so it can have document and store files. _payment is something you do, so it usually focuses on service and signal files. money is a reusable value shape, so it stays small and definition-oriented.
 
-Can use abstract, constant, dictionary, document, service, signal, store, Template, Unit, Util, View, and Zone.
+- database: Database — lib/product/
 
-Can use abstract, dictionary, service, signal, store, Template, Unit, Util, View, and Zone. The abstract filename drops the folder underscore, such as payment.abstract.md in lib/_payment/.
+- service: Service — lib/_payment/
 
-Can use abstract, constant, dictionary, document, Template, Unit, Util, View, and Zone.
+- scalar: Scalar — lib/__scalar/money/
 
-Codegen And Choices
+- Business files — model
 
-Akan scans module files and generates helper indexes around them. This lets application code import model features through stable module exports instead of manually wiring every file.
+  - .abstract.md
 
-For a product team, this removes repeated wiring work. When a module grows from a document into views, units, and zones, Akan can keep the module entry organized as long as the file names follow the convention.
+  - .constant.ts
 
-This is why naming matters. If Product.View.tsx is renamed randomly, Akan cannot recognize it as the View file for the Product module.
+  - .dictionary.ts
+
+  - .document.ts
+
+  - .service.ts
+
+  - .signal.ts
+
+  - .store.ts
+
+- UI files — Model
+
+  - .Template.tsx
+
+  - .Unit.tsx
+
+  - .Util.tsx
+
+  - .View.tsx
+
+  - .Zone.tsx
+
+{num} files
+
+Allowed in this module kind
+
+Not allowed in this module kind
+
+The abstract file is the one whose name changes: a service module drops the folder's underscore, so lib/_payment/ holds payment.abstract.md.
 
 Common Choices
 
@@ -135,17 +149,23 @@ When you are not sure which file to create, start from the business question you
 
 For example, 'Can the customer see the order?' points to View. 'Can the customer cancel the order?' points to signal and service. 'What fields does an order save?' points to document.
 
-Do we store this data?
+Question
 
-Does the server process it?
+- Do we store this data? — model.document.ts
 
-Should a page call it?
+- Does the server process it? — model.service.ts
 
-Does it show data?
+- Should a page call it? — model.signal.ts
 
-Is it a small UI action?
+- Does one record get its own page? — Model.View.tsx
 
-Is it a large screen area?
+- Is it one item in a list? — Model.Unit.tsx
+
+- Does the user fill it in? — Model.Template.tsx
+
+- Is it a domain UI action? — Model.Util.tsx
+
+- Is it a large screen area? — Model.Zone.tsx
 
 ## Code Examples
 
@@ -165,16 +185,6 @@ lib/product/
 ├── Product.Util.tsx
 ├── Product.View.tsx
 └── Product.Zone.tsx
-```
-
-### lib/bizCard/
-
-```bash
-BizCard.View.tsx      # how a biz card is displayed
-BizCard.Unit.tsx      # small reusable UI pieces
-BizCard.Template.tsx  # repeated layout or template
-BizCard.Util.tsx      # UI actions or helpers
-BizCard.Zone.tsx      # large screen areas such as admin/list/detail
 ```
 
 ### Code
@@ -224,26 +234,10 @@ export const PriceText = () => {}
 // hard to know which import belongs to which file
 ```
 
-### barrel import
+### page/store/products.tsx
 
 ```ts
-// ui/index.ts
-export * from "./ProductCard";
-export * from "./OrderBadge";
-
-// page/store/products.tsx
 import { ProductCard } from "@apps/myapp/ui";
-```
-
-### Generated UI index idea
-
-```ts
-import * as Unit from "./Product.Unit";
-import * as Util from "./Product.Util";
-import * as View from "./Product.View";
-import * as Zone from "./Product.Zone";
-
-export const Product = { Unit, Util, View, Zone };
 ```
 
 ## Agent Notes

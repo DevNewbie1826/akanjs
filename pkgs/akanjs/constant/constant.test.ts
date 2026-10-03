@@ -1,6 +1,22 @@
 import { describe, expect, test } from "bun:test";
-import { dayjs, enumOf, FIELD_META, Float, ID, Int, type PrimitiveScalar } from "akanjs/base";
-import { immerable } from "immer";
+import {
+  Binary,
+  CLIENT_VALUE,
+  type Dayjs,
+  DEFAULT_VALUE,
+  dayjs,
+  type EnumInstance,
+  enumOf,
+  FIELD_META,
+  Float,
+  ID,
+  Int,
+  PrimitiveRegistry,
+  PrimitiveScalar,
+  SERVER_VALUE,
+} from "akanjs/base";
+import { deepObjectify } from "akanjs/common";
+import { immerable, produce } from "immer";
 import {
   type ConstantCls,
   ConstantField,
@@ -10,6 +26,7 @@ import {
   type ExtractFieldInfoObject,
   type FieldBuilder,
   type FieldInfoObjectToFieldObject,
+  getDefault,
   immerify,
   type NonFunctionalKeys,
   type PurifiedModel,
@@ -45,6 +62,14 @@ const BooleanState = via((f) => ({
   enabled: f(Boolean),
 }));
 ConstantRegistry.buildScalar("constantTestBooleanState", BooleanState, { BooleanState });
+
+// `isEnum` recognises the `class X extends enumOf(...) {}` shape every model writes, not the bare factory result.
+class RoleKind extends enumOf("constantTestRoleKind", ["admin", "user"] as const) {}
+const RoleState = via((f) => ({
+  role: f(RoleKind),
+  roles: f([RoleKind]),
+}));
+ConstantRegistry.buildScalar("constantTestRoleState", RoleState, { RoleState });
 
 const UserInput = via((f) => ({
   name: f(String, { text: "title" }),
@@ -165,10 +190,24 @@ type _RelationMethodAssertions = [
   Assert<Equal<Extract<NonFunctionalKeys<InstanceType<typeof MethodUserLight>>, "hello">, never>>,
   Assert<Equal<Extract<NonFunctionalKeys<InstanceType<typeof MethodUserLight>>, "name">, "name">>,
 ];
+type _UnknownModelAssertions = [
+  Assert<Equal<PurifiedModel<unknown>, unknown>>,
+  Assert<Equal<DocumentModel<unknown>, unknown>>,
+];
 
 const validUserId = "1234567890abcdef12345678";
 const validChildId = "abcdefabcdefabcdefabcdef";
 const complexInput = (input: Record<string, unknown>) => input as never;
+const complexOf = (cube: number[][][][]) =>
+  new ComplexInput(
+    complexInput({
+      settings: { theme: "dark" },
+      cube,
+      addressCube: [[[{ city: "Seoul", coordinate: { lat: 37, lng: 127 } }]]],
+      primaryAddress: { city: "Jeju", coordinate: { lat: 33, lng: 126 } },
+      addressBook: { home: { city: "Seoul", coordinate: { lat: 37, lng: 127 } } },
+    }),
+  );
 
 const createUser = () =>
   new UserFull({
@@ -220,6 +259,23 @@ describe("via and ConstantField", () => {
     expect(UserFull.text.filter.has("role")).toBe(true);
   });
 
+  test("defers a default thunk to the first getDefault call and memoizes it", () => {
+    let calls = 0;
+    const LazyInput = via((f) => ({
+      token: f(String, {
+        default: () => {
+          calls += 1;
+          return `token-${calls}`;
+        },
+      }),
+    }));
+
+    expect(calls).toBe(0);
+    expect(LazyInput.getDefault().token).toBe("token-1");
+    expect(LazyInput.getDefault().token).toBe("token-1");
+    expect(calls).toBe(1);
+  });
+
   test("crystalizes constructor input into typed runtime values", () => {
     const user = createUser();
 
@@ -234,6 +290,26 @@ describe("via and ConstantField", () => {
     const address = new AddressInput({ city: "Seoul" } as never);
     expect(address.city).toBe("Seoul");
     expect(address.zip).toBe(10000);
+  });
+
+  test("keeps map entries when re-crystalizing an already crystalized value", () => {
+    const user = createUser();
+    const copiedUser = new UserFull(user as never);
+
+    expect(copiedUser.metadata).toBeInstanceOf(Map);
+    expect(copiedUser.metadata.get("locale")).toBe("ko");
+
+    const complex = new ComplexInput(
+      complexInput({
+        settings: { theme: "dark" },
+        addressBook: { home: { city: "Seoul", zip: 12345, coordinate: { lat: 37, lng: 127 } } },
+      }),
+    ) as { settings: Map<string, string>; addressBook: Map<string, InstanceType<typeof AddressInput>> };
+    const copiedComplex = new ComplexInput(complex as never) as typeof complex;
+
+    expect(copiedComplex.settings.get("theme")).toBe("dark");
+    expect(copiedComplex.addressBook.get("home")).toBeInstanceOf(AddressInput);
+    expect(copiedComplex.addressBook.get("home")?.city).toBe("Seoul");
   });
 
   test("supports maps, deep nested objects, and high-dimensional arrays", () => {
@@ -336,6 +412,28 @@ describe("ConstantRegistry", () => {
     expect(deserialized.createdAt.toISOString()).toBe(user.createdAt.toISOString());
     expect(deserialized.metadata).toEqual({ locale: "ko" } as never);
   });
+
+  test("serializes a map through the value type it declares", () => {
+    const start = dayjs("2026-01-02T03:04:05.000Z");
+    const serialized = ConstantRegistry.serialize(Map, new Map([["start", start]]), false, Date) as unknown as {
+      start: Date;
+    };
+
+    expect(serialized.start).toBeInstanceOf(Date);
+    expect(serialized.start.toISOString()).toBe(start.toISOString());
+
+    const restored = ConstantRegistry.deserialize(Map, serialized, false, Date) as unknown as Map<string, Dayjs>;
+
+    expect(restored).toBeInstanceOf(Map);
+    expect(restored.get("start")?.toISOString()).toBe(start.toISOString());
+    expect(ConstantRegistry.deserialize(Map, { a: "1", b: "2" }, false, Int)).toEqual(
+      new Map([
+        ["a", 1],
+        ["b", 2],
+      ]) as never,
+    );
+    expect(() => ConstantRegistry.serialize(Map, new Map([["start", start]]))).toThrow("value type");
+  });
 });
 
 describe("serialize, deserialize, purify, and immerify", () => {
@@ -364,18 +462,34 @@ describe("serialize, deserialize, purify, and immerify", () => {
     expect(() => deserialize(String, 0, null, { key: "name" })).toThrow("Invalid Value (Nullable)");
   });
 
-  test("serializes and deserializes complex schema shapes", () => {
-    const complex = new ComplexInput(
-      complexInput({
-        settings: { theme: "dark" } as never,
-        cube: [[[[1, 2, 3]]]],
-        addressCube: [[[{ city: "Seoul", coordinate: { lat: 37, lng: 127 } }]]],
-        primaryAddress: { city: "Jeju", coordinate: { lat: 33, lng: 126 } },
-        addressBook: {
-          home: { city: "Seoul", coordinate: { lat: 37, lng: 127 } },
-        } as never,
-      }),
+  test("refuses a value outside its enum wherever the enum was declared", () => {
+    // `enumOf` erases to `String` in every argRef and modelRef, so without this the parser passed any string.
+    expect(deserialize(String, 0, "admin", { enum: RoleKind as EnumInstance })).toBe("admin" as never);
+    expect(deserialize(String, 1, ["admin", "user"], { enum: RoleKind as EnumInstance })).toEqual([
+      "admin",
+      "user",
+    ] as never);
+    expect(deserialize(String, 0, null, { nullable: true, enum: RoleKind as EnumInstance })).toBeNull();
+    expect(() => deserialize(String, 0, "root", { key: "role", enum: RoleKind as EnumInstance })).toThrow(
+      "not one of admin, user",
     );
+    expect(() => deserialize(String, 1, ["admin", "root"], { key: "roles", enum: RoleKind as EnumInstance })).toThrow(
+      "Invalid Enum Value",
+    );
+    // A field of a scalar carries its enum into the same check.
+    expect(deserialize(RoleState, 0, { role: "user", roles: ["admin"] }, {})).toEqual({
+      role: "user",
+      roles: ["admin"],
+    } as never);
+    expect(() => deserialize(RoleState, 0, { role: "root", roles: [] }, {})).toThrow("Invalid Enum Value in role");
+    // And the form path a store purifies before it sends, which answers an invalid form with `null`.
+    expect(RoleState.purify({ role: "admin", roles: ["user"] })).toEqual({ role: "admin", roles: ["user"] });
+    expect(RoleState.purify({ role: "root" as never, roles: [] })).toBeNull();
+    expect(RoleState.purify({ role: "admin", roles: ["root" as never] })).toBeNull();
+  });
+
+  test("serializes and deserializes complex schema shapes", () => {
+    const complex = complexOf([[[[1, 2, 3]]]]);
 
     const serialized = serialize(ComplexInput, 0, complex, "object", {});
 
@@ -428,6 +542,36 @@ describe("serialize, deserialize, purify, and immerify", () => {
     expect(inputSerialized.members).toEqual([validUserId]);
   });
 
+  test("builds a relation once per deserialize pass and shares it across every row naming it", () => {
+    const ownerObj = { id: validUserId, name: "Ada", age: 31, role: "admin", tags: [], addressLabel: "Seoul" };
+    const rows = [
+      { id: validChildId, title: "Core", owner: ownerObj, members: [ownerObj] },
+      { id: validChildId, title: "Platform", owner: { ...ownerObj }, members: [{ ...ownerObj }] },
+    ];
+
+    const teams = deserialize(TeamFull, 1, rows, {
+      convertFn: (value) => new TeamFull(value as never),
+    }) as unknown as { owner: object; members: object[] }[];
+
+    expect(teams[0].owner).toBeInstanceOf(UserLight);
+    expect(teams[0].owner).toBe(teams[0].members[0]);
+    expect(teams[0].owner).toBe(teams[1].owner);
+    expect(teams[1].members[0]).toBe(teams[0].owner);
+    // A second response is a second pass, so it does not reuse the first one's instances.
+    const later = deserialize(TeamFull, 1, rows, {
+      convertFn: (value) => new TeamFull(value as never),
+    }) as unknown as { owner: object }[];
+    expect(later[0].owner).not.toBe(teams[0].owner);
+  });
+
+  test("keeps an already-crystalized relation instead of copying it", () => {
+    const owner = new UserLight({ id: validUserId, name: "Ada" } as never);
+    const team = new TeamFull({ id: validChildId, title: "Core", owner, members: [owner] } as never);
+
+    expect(team.owner).toBe(owner);
+    expect(team.members[0]).toBe(owner);
+  });
+
   test("purifies valid input and rejects invalid values", () => {
     const user = createUser();
     const purified = UserFull.purify(user);
@@ -445,17 +589,7 @@ describe("serialize, deserialize, purify, and immerify", () => {
   });
 
   test("purifies complex schema shapes", () => {
-    const complex = new ComplexInput(
-      complexInput({
-        settings: { theme: "dark" } as never,
-        cube: [[[[1]]]],
-        addressCube: [[[{ city: "Seoul", coordinate: { lat: 37, lng: 127 } }]]],
-        primaryAddress: { city: "Jeju", coordinate: { lat: 33, lng: 126 } },
-        addressBook: {
-          home: { city: "Seoul", coordinate: { lat: 37, lng: 127 } },
-        } as never,
-      }),
-    );
+    const complex = complexOf([[[[1]]]]);
 
     expect(ComplexInput.purify(complex)).toMatchObject({
       settings: { theme: "dark" },
@@ -476,5 +610,109 @@ describe("serialize, deserialize, purify, and immerify", () => {
     expect((immered as unknown as Record<symbol, unknown>)[immerable]).toBe(true);
     const address = immerify(AddressInput as never, { city: "Seoul", zip: 12345 });
     expect((address as Record<symbol, unknown>)[immerable]).toBe(true);
+  });
+
+  test("keeps a Date field behind a prototype accessor that every field reader still reaches", () => {
+    const user = createUser();
+    const iso = "2026-01-01T00:00:00.000Z";
+
+    expect(dayjs.isDayjs(user.createdAt)).toBe(true);
+    expect(user.createdAt).toBe(user.createdAt);
+    expect("createdAt" in user).toBe(true);
+    expect(Object.keys(user)).not.toContain("createdAt");
+    expect((JSON.parse(JSON.stringify(user)) as { createdAt: string }).createdAt).toBe(iso);
+    expect(immerify(UserFull as never, user).createdAt.toISOString()).toBe(iso);
+    expect((deepObjectify(user) as { createdAt: Dayjs }).createdAt.toISOString()).toBe(iso);
+    expect(new UserFull().set(user as never).createdAt.toISOString()).toBe(iso);
+
+    user.set({ createdAt: "2027-01-01T00:00:00.000Z" as never });
+    expect(user.createdAt.toISOString()).toBe("2027-01-01T00:00:00.000Z");
+    user.createdAt = dayjs("2028-01-01T00:00:00.000Z");
+    expect(user.createdAt.toISOString()).toBe("2028-01-01T00:00:00.000Z");
+  });
+
+  test("writes a Date field on an immer draft copy-on-write and leaves a read-only draft as is", () => {
+    const user = createUser();
+    const untouched = produce(user, (draft) => {
+      void draft.createdAt.format();
+    });
+    expect(untouched).toBe(user);
+
+    const next = produce(user, (draft) => {
+      draft.createdAt = dayjs("2030-01-01T00:00:00.000Z");
+      draft.name = "Grace";
+    });
+    expect(next).toBeInstanceOf(UserFull);
+    expect(next.createdAt.toISOString()).toBe("2030-01-01T00:00:00.000Z");
+    expect(next.name).toBe("Grace");
+    expect(user.createdAt.toISOString()).toBe("2026-01-01T00:00:00.000Z");
+    expect(user.name).toBe("Ada");
+  });
+
+  test("evaluates a default thunk only for a field the source leaves out", () => {
+    let calls = 0;
+    const Stamp = via((f) => ({
+      at: f(Date, {
+        default: () => {
+          calls += 1;
+          return dayjs("2026-05-05T00:00:00.000Z");
+        },
+      }),
+      label: f(String, { default: "x" }),
+    }));
+
+    const given = new Stamp({ at: "2026-01-01T00:00:00.000Z" } as never);
+    expect(calls).toBe(0);
+    expect(given.at.toISOString()).toBe("2026-01-01T00:00:00.000Z");
+
+    const defaulted = new Stamp();
+    expect(calls).toBe(1);
+    expect(defaulted.at.toISOString()).toBe("2026-05-05T00:00:00.000Z");
+    expect(defaulted.label).toBe("x");
+  });
+});
+
+describe("Binary as a model field", () => {
+  test("fails the class build, naming the File model as the way to store bytes", () => {
+    expect(() => via((f) => ({ blob: f(Binary) }))).toThrow('Field "blob" is Binary, which is not storable');
+    expect(() => via((f) => ({ blobs: f([Binary]) }))).toThrow('Field "blobs" is Binary, which is not storable');
+    expect(() => via((f) => ({ blobs: f(Map, { of: Binary }) }))).toThrow("is Binary, which is not storable");
+  });
+});
+
+interface OutlineDoc {
+  root: { children: string[] };
+}
+class Outline extends PrimitiveScalar {
+  static override refName = "Outline";
+  static override [SERVER_VALUE]: OutlineDoc;
+  static override [CLIENT_VALUE]: OutlineDoc;
+  static override [DEFAULT_VALUE]: OutlineDoc = { root: { children: [] } };
+}
+PrimitiveRegistry.register(Outline);
+
+describe("a primitive with a structured default", () => {
+  const OutlinePage = via((f) => ({ title: f(String), outline: f(Outline) }));
+
+  test("hands every filled object its own copy, the way an array default is", () => {
+    const first = getDefault<{ outline: OutlineDoc }>(OutlinePage[FIELD_META]);
+    const second = getDefault<{ outline: OutlineDoc }>(OutlinePage[FIELD_META]);
+    first.outline.root.children.push("leaked");
+    expect(second.outline).toEqual({ root: { children: [] } });
+    expect(Outline[DEFAULT_VALUE]).toEqual({ root: { children: [] } });
+  });
+
+  test("a constructed instance does not share it either", () => {
+    const first = new OutlinePage() as unknown as { outline: OutlineDoc };
+    const second = new OutlinePage() as unknown as { outline: OutlineDoc };
+    expect(first.outline).toEqual({ root: { children: [] } });
+    expect(first.outline).not.toBe(second.outline);
+  });
+
+  test("an instance default such as a Dayjs is still shared, since only its own API changes it", () => {
+    const DatedPage = via((f) => ({ at: f(Date) }));
+    expect(getDefault<{ at: Dayjs }>(DatedPage[FIELD_META]).at).toBe(
+      getDefault<{ at: Dayjs }>(DatedPage[FIELD_META]).at,
+    );
   });
 });

@@ -1,90 +1,14 @@
-import { afterEach, describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
-import os from "node:os";
+import { describe, expect, test } from "bun:test";
+import { realpath } from "node:fs/promises";
 import path from "node:path";
 import { ApplicationBuildReporter } from "./applicationBuildReporter";
 import { resolveSignalTestPreloadPath } from "./applicationTestPreload";
 import { TypeScriptDependencyScanner } from "./dependencyScanner";
 import { AppExecutor, WorkspaceExecutor } from "./executors";
-import { extractDependencies } from "./extractDeps";
-import { getModelFileData } from "./getModelFileData";
+import { tempDirs, writeText as write } from "./testHelpers";
 import type { PackageJson, TsConfigJson } from "./types";
 
-const tempRoots: string[] = [];
-
-const makeTempRoot = async () => {
-  const root = await mkdtemp(path.join(os.tmpdir(), "akan-devkit-utils-"));
-  tempRoots.push(root);
-  return root;
-};
-
-const write = async (filePath: string, content: string) => {
-  await mkdir(path.dirname(filePath), { recursive: true });
-  await writeFile(filePath, content);
-};
-
-afterEach(async () => {
-  await Promise.all(tempRoots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
-});
-
-describe("extractDependencies", () => {
-  const packageJson: PackageJson = {
-    name: "fixture",
-    version: "1.0.0",
-    description: "fixture",
-    dependencies: {
-      react: "19.0.0",
-      "@scope/pkg": "1.0.0",
-      lodash: "4.0.0",
-    },
-    devDependencies: {
-      typescript: "6.0.0",
-      vite: "5.0.0",
-    },
-  };
-
-  test("extracts runtime package versions from imports and requires", () => {
-    const deps = extractDependencies(
-      [
-        {
-          path: "index.ts",
-          text: [
-            'import React from "react";',
-            'import { value } from "@scope/pkg/subpath";',
-            'import type { Type } from "typescript";',
-            'const lodash = require("lodash/fp");',
-            'const fs = require("node:fs");',
-            'const path = require("path");',
-            "",
-          ].join("\n"),
-        },
-        { path: "style.css", text: '@import "vite";' },
-      ],
-      packageJson,
-      ["vite"],
-    );
-
-    expect(deps).toEqual({
-      "@scope/pkg": "1.0.0",
-      lodash: "4.0.0",
-      react: "19.0.0",
-      typescript: "6.0.0",
-      vite: "5.0.0",
-    });
-  });
-
-  test("reports missing dependency sections and missing versions", () => {
-    expect(() =>
-      extractDependencies([{ path: "index.ts", text: 'import React from "react";' }], {
-        name: "broken",
-        version: "1.0.0",
-        description: "broken",
-      }),
-    ).toThrow("No dependencies found");
-
-    expect(() => extractDependencies([], packageJson, ["missing"])).toThrow("No version found for missing");
-  });
-});
+const makeTempRoot = tempDirs("akan-devkit-utils-");
 
 describe("resolveSignalTestPreloadPath", () => {
   test("resolves the preload file from an installed akanjs package", async () => {
@@ -101,7 +25,7 @@ describe("resolveSignalTestPreloadPath", () => {
     await write(path.join(root, "node_modules/akanjs/test/signalTest.preload.ts"), "export {};\n");
 
     await expect(resolveSignalTestPreloadPath({ cwdPath: libDir })).resolves.toContain(
-      "node_modules/akanjs/test/signalTest.preload.ts",
+      path.join("node_modules/akanjs/test/signalTest.preload.ts"),
     );
   });
 });
@@ -252,49 +176,6 @@ describe("scan convention", () => {
   });
 });
 
-describe("getModelFileData", () => {
-  test("reads model files and derives imported local, scalar, and lib models", async () => {
-    const root = await makeTempRoot();
-    const cwd = process.cwd();
-    process.chdir(root);
-    try {
-      await write(
-        path.join(root, "apps/demo/lib/post/post.constant.ts"),
-        [
-          'import { cnst as shared } from "@libs/shared";',
-          'import { User } from "../user/user.constant";',
-          'import { Money } from "../_money/money.constant";',
-          "export const Post = {};",
-          "",
-        ].join("\n"),
-      );
-      await write(
-        path.join(root, "apps/demo/lib/post/Post.Unit.tsx"),
-        "export default function Unit() { return null; }\n",
-      );
-      await write(
-        path.join(root, "apps/demo/lib/post/Post.View.tsx"),
-        "export default function View() { return null; }\n",
-      );
-
-      const data = await getModelFileData("apps/demo", "post");
-      expect(data).toMatchObject({
-        moduleType: "app",
-        moduleName: "demo",
-        modelName: "post",
-        importModelNames: ["user"],
-        hasImportScalar: true,
-        importLibNames: ["shared"],
-      });
-      expect(data.constantFileStr).toContain("export const Post");
-      expect(data.unitFileStr).toContain("Unit");
-      expect(data.viewFileStr).toContain("View");
-    } finally {
-      process.chdir(cwd);
-    }
-  });
-});
-
 describe("ApplicationBuildReporter", () => {
   test("formats duration, phase lines, and nested errors", () => {
     expect(ApplicationBuildReporter.formatDuration(999)).toBe("999ms");
@@ -316,5 +197,48 @@ describe("ApplicationBuildReporter", () => {
     expect(ApplicationBuildReporter.formatError(aggregate)).toBe(
       ["failed", "  first", "  second", "  third"].join("\n"),
     );
+  });
+
+  test("says where the bundler placed each reason, relative to the workspace root", async () => {
+    const root = await makeTempRoot();
+    const refuseWith = (message: string) => ({
+      name: "refuse",
+      setup: (build: Bun.PluginBuilder) => {
+        build.onLoad({ filter: /plugged\.ts$/ }, () => {
+          throw new Error(message);
+        });
+      },
+    });
+    const failureOf = (entry: string, plugins: Bun.BunPlugin[] = []) =>
+      Bun.build({ entrypoints: [path.join(root, entry)], plugins }).then(
+        () => null,
+        (error: unknown) => error,
+      );
+    await write(
+      path.join(root, "src/entry.ts"),
+      'export const a = 1;\nimport { gone } from "./not-there";\nexport const b = gone;\n',
+    );
+    await write(path.join(root, "src/plugged.ts"), "export const b = 1;\n");
+
+    const unresolved = await failureOf("src/entry.ts");
+    expect(ApplicationBuildReporter.formatError(unresolved, root)).toBe(
+      ["Bundle failed", '  Could not resolve: "./not-there" (src/entry.ts:2:22)'].join("\n"),
+    );
+    const outside = path.join(await realpath(root), "src/entry.ts");
+    expect(ApplicationBuildReporter.formatError(unresolved, path.join(root, "elsewhere"))).toBe(
+      ["Bundle failed", `  Could not resolve: "./not-there" (${outside}:2:22)`].join("\n"),
+    );
+    expect(
+      ApplicationBuildReporter.formatError(
+        await failureOf("src/plugged.ts", [refuseWith("refused\nsecond line")]),
+        root,
+      ),
+    ).toBe(["Bundle failed", "  refused (src/plugged.ts)", "  second line"].join("\n"));
+    expect(
+      ApplicationBuildReporter.formatError(
+        await failureOf("src/plugged.ts", [refuseWith("src/plugged.ts is refused")]),
+        root,
+      ),
+    ).toBe(["Bundle failed", "  src/plugged.ts is refused"].join("\n"));
   });
 });

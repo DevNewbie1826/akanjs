@@ -1,12 +1,13 @@
 import { DataList, type Dayjs, FIELD_META, type GetStateObject } from "akanjs/base";
 import {
   capitalize,
+  type DynamicRecord,
   deepObjectify,
   type FetchPolicy,
   isQueryEqual,
   Logger,
-  lowerlize,
   pathSet,
+  plainFieldsOf,
   resolveFileUploadCapability,
 } from "akanjs/common";
 import {
@@ -17,10 +18,13 @@ import {
   type FieldState,
   immerify,
   type ProtoFile,
+  type ProtoLightFile,
+  withSharedInstances,
 } from "akanjs/constant";
 import type { BaseFilterSortKey, ExtractSort, FilterInstance } from "akanjs/document";
 import type { FetchInitForm, FetchProxy } from "akanjs/fetch";
 import type {
+  LiveEventPayload,
   SerializedSlice,
   SlceCnstCapitalizedRefName,
   SlceCnstDefault,
@@ -33,18 +37,17 @@ import type {
   SlceDbSort,
   SliceCls,
 } from "akanjs/signal";
-import type { SliceStateKey } from "./state";
+import { expandQueryArgs, normalizeQueryArgs } from "../fetch/client/sliceQueryArgs";
+import { tagAction } from "./actionTag";
+import { databaseStateNames } from "./databaseStateNames";
+import { DraftStore } from "./draftStore";
+import { formSetterNames } from "./formSetterNames";
+import { type LiveSortableRow, livePlacementIndex } from "./liveInsert";
+import { SliceRequest } from "./SliceRequest";
+import { sliceKeysOf } from "./sliceKeys";
+import type { DraftState } from "./state";
 import type { SetGet, StoreSliceArgs, StoreSliceMap, StoreSliceSuffixCap } from "./types";
 
-type SliceActionKey =
-  | "initModel"
-  | "refreshModel"
-  | "selectModel"
-  | "setPageOfModel"
-  | "addPageOfModel"
-  | "setLimitOfModel"
-  | "setQueryArgsOfModel"
-  | "setSortOfModel";
 type _SliceMap<S extends SliceCls> = StoreSliceMap<S>;
 type _ActionRefName<S extends SliceCls> = SlceCnstRefName<S>;
 type _ActionCap<S extends SliceCls> = SlceCnstCapitalizedRefName<S>;
@@ -55,20 +58,15 @@ type _ActionDefault<S extends SliceCls> = SlceCnstDefault<S>;
 type _ActionDefaultInput<S extends SliceCls> = SlceCnstDefaultInput<S>;
 type _ActionFilter<S extends SliceCls> = SlceDbFilter<S>;
 type _ActionSort<S extends SliceCls> = SlceDbSort<S>;
-
-const isNullableSliceArg = (arg: SerializedSlice["args"][number]) => arg.nullable ?? arg.type === "search";
-
-const normalizeQueryArgs = (queryArgs: unknown[], sliceArgs: SerializedSlice["args"]) => {
-  let length = Math.min(queryArgs.length, sliceArgs.length);
-  while (length > 0 && isNullableSliceArg(sliceArgs[length - 1]) && queryArgs[length - 1] == null) length--;
-  return queryArgs.slice(0, length);
+type SliceInitForm<S extends SliceCls> = FetchInitForm<_ActionInput<S>, _ActionFilter<S>> & FetchPolicy;
+type SliceRefreshForm<S extends SliceCls, Suffix extends keyof _SliceMap<S>> = SliceInitForm<S> & {
+  queryArgs?: StoreSliceArgs<S, Suffix>;
 };
 
-const expandQueryArgs = (queryArgs: unknown[], sliceArgs: SerializedSlice["args"]) =>
-  sliceArgs.map((_, idx) => queryArgs[idx]);
+const UPLOAD_POLL_INTERVAL_MS = 3000;
+const UPLOAD_POLL_ATTEMPTS = 40;
 
 export interface CreateOption<Full extends { id: string }> {
-  idx?: number;
   path?: string;
   modal?: string;
   sliceName?: string;
@@ -79,6 +77,13 @@ export interface NewOption {
   modal?: string;
   setDefault?: boolean;
   sliceName?: string;
+  /** Built by the shell from the raw seed (merged date defaults would rotate the key). Absent means no draft. */
+  draftScope?: string;
+}
+export interface EditOption {
+  modal?: string | null;
+  /** Built by the shell from the record id. Absent means no draft. */
+  draftScope?: string;
 }
 type PartialOrNull<O> = { [K in keyof O]?: O[K] | null };
 
@@ -110,10 +115,13 @@ type BaseAction<
 } & {
   [K in `new${_CapitalizedRefName}`]: (partial?: PartialOrNull<Full>, options?: NewOption) => void;
 } & {
-  [K in `edit${_CapitalizedRefName}`]: (
-    model: Full | string,
-    options?: { modal?: string | null } & FetchPolicy,
-  ) => Promise<void>;
+  [K in `edit${_CapitalizedRefName}`]: (model: Full | string, options?: EditOption & FetchPolicy) => Promise<void>;
+} & {
+  [K in `load${_CapitalizedRefName}FormDraft`]: (draftScope?: string) => Promise<void>;
+} & {
+  [K in `restore${_CapitalizedRefName}FormDraft`]: () => void;
+} & {
+  [K in `discard${_CapitalizedRefName}FormDraft`]: () => void;
 } & {
   [K in `merge${_CapitalizedRefName}`]: (
     model: Full | string,
@@ -139,7 +147,7 @@ export type SliceAction<
   _CapitalizedRefName extends string = Capitalize<RefName>,
   _CapitalizedSuffix extends string = Capitalize<Suffix>,
   _Sort = ExtractSort<Filter>,
-  _FetchInitFormWithFetchPolicy = FetchInitForm<Input, Filter, DefaultOf<Input>, _Sort> & FetchPolicy,
+  _FetchInitFormWithFetchPolicy = FetchInitForm<Input, Filter> & FetchPolicy,
 > = {
   [KDefaultOf in `init${_CapitalizedRefName}${_CapitalizedSuffix}`]: (
     ...args: [...args: QueryArgs, initForm?: _FetchInitFormWithFetchPolicy]
@@ -156,7 +164,7 @@ export type SliceAction<
 } & {
   [K in `setPageOf${_CapitalizedRefName}${_CapitalizedSuffix}`]: (page: number, options?: FetchPolicy) => Promise<void>;
 } & {
-  [K in `addPageOf${_CapitalizedRefName}${_CapitalizedSuffix}`]: (page: number, options?: FetchPolicy) => Promise<void>;
+  [K in `loadMoreOf${_CapitalizedRefName}${_CapitalizedSuffix}`]: (options?: FetchPolicy) => Promise<void>;
 } & {
   [K in `setLimitOf${_CapitalizedRefName}${_CapitalizedSuffix}`]: (
     limit: number,
@@ -220,7 +228,7 @@ type FormSetter<
   ArrayFieldAddSetters<RefName, _CapitalizedRefName, _DefaultState> &
   ArrayFieldSubSetters<RefName, _CapitalizedRefName, _DefaultState> &
   ArrayFieldAddOrSubSetters<RefName, _CapitalizedRefName, _DefaultState> & {
-    [K in keyof _DefaultState as _DefaultState[K] extends (ProtoFile | null) | ProtoFile[]
+    [K in keyof _DefaultState as _DefaultState[K] extends (ProtoLightFile | null) | ProtoLightFile[]
       ? K extends string
         ? SetterKey<"upload", K, RefName, _CapitalizedRefName>
         : never
@@ -242,7 +250,7 @@ type DefaultSliceActionFields<
   ) => Promise<void>;
 } & {
   [Suffix in _Suffixes as `refresh${_CapRef}${StoreSliceSuffixCap<SlceCls, Suffix>}`]: (
-    initForm?: _FetchInitFormWithFetchPolicy & { queryArgs?: StoreSliceArgs<SlceCls, Suffix> },
+    initForm?: SliceRefreshForm<SlceCls, Suffix>,
   ) => Promise<void>;
 } & {
   [Suffix in _Suffixes as `select${_CapRef}${StoreSliceSuffixCap<SlceCls, Suffix>}`]: (
@@ -252,9 +260,12 @@ type DefaultSliceActionFields<
 } & {
   [Suffix in _Suffixes as
     | `setPageOf${_CapRef}${StoreSliceSuffixCap<SlceCls, Suffix>}`
-    | `addPageOf${_CapRef}${StoreSliceSuffixCap<SlceCls, Suffix>}`
     | `setLimitOf${_CapRef}${StoreSliceSuffixCap<SlceCls, Suffix>}`]: (
     value: number,
+    options?: FetchPolicy,
+  ) => Promise<void>;
+} & {
+  [Suffix in _Suffixes as `loadMoreOf${_CapRef}${StoreSliceSuffixCap<SlceCls, Suffix>}`]: (
     options?: FetchPolicy,
   ) => Promise<void>;
 } & {
@@ -285,7 +296,7 @@ export type DefaultAction<
   _DefaultInput = _ActionDefaultInput<SlceCls>,
   _Sort = _ActionSort<SlceCls>,
   _CreateOption = CreateOption<_Full>,
-  _FetchInitFormWithFetchPolicy = FetchInitForm<_Input, _Filter, _DefaultInput, _Sort> & FetchPolicy,
+  _FetchInitFormWithFetchPolicy = SliceInitForm<SlceCls>,
 > = BaseAction<_RefName, _Input, _Full, _Light, _CapitalizedRefName, _CreateOption> &
   FormSetter<_Full, _RefName, _CapitalizedRefName, _Default> &
   DefaultSliceActionFields<SlceCls, _CapitalizedRefName, _FetchInitFormWithFetchPolicy, _Light, _Sort>;
@@ -297,8 +308,6 @@ export const makeFormSetter = (refName: string, fetch: FetchProxy<any>) => {
   const fileUploadRefName = resolveFileUploadCapability(fetch.serializedSignal)?.refName;
 
   const names = {
-    model: fieldName,
-    Model: className,
     modelForm: `${fieldName}Form`,
     writeOnModel: `writeOn${className}`,
     addModelFiles: `add${className}Files`,
@@ -311,16 +320,7 @@ export const makeFormSetter = (refName: string, fetch: FetchProxy<any>) => {
     },
   };
   const fieldSetAction = Object.entries(modelRef[FIELD_META]).reduce((acc, [key, field]) => {
-    const [fieldKeyName, classKeyName] = [lowerlize(key), capitalize(key)];
-    const namesOfField = {
-      field: fieldKeyName,
-      Field: classKeyName,
-      setFieldOnModel: `set${classKeyName}On${className}`,
-      addFieldOnModel: `add${classKeyName}On${className}`,
-      subFieldOnModel: `sub${classKeyName}On${className}`,
-      addOrSubFieldOnModel: `addOrSub${classKeyName}On${className}`,
-      uploadFieldOnModel: `upload${classKeyName}On${className}`,
-    };
+    const namesOfField = formSetterNames(className, key);
     const singleFieldSetAction = {
       [namesOfField.setFieldOnModel]: function (this: SetGet, value: any | null) {
         this.set((state: { [key: string]: any }) => {
@@ -332,6 +332,11 @@ export const makeFormSetter = (refName: string, fetch: FetchProxy<any>) => {
                 : (value as object);
           (state[names.modelForm] as { [key: string]: any })[namesOfField.field] = setValue;
         });
+        // After the write, so a hook that reads the field sees the new value.
+        const postSet = (this as unknown as { [key: string]: ((value: unknown) => unknown) | undefined })[
+          namesOfField.postSetField
+        ];
+        if (postSet) void postSet.call(this, value);
       },
       ...(field.isArray
         ? {
@@ -341,7 +346,7 @@ export const makeFormSetter = (refName: string, fetch: FetchProxy<any>) => {
               options: { idx?: number; limit?: number } = {},
             ) {
               const form = (this.get() as { [key: string]: any })[names.modelForm] as { [key: string]: any };
-              const length = (form[namesOfField.field] as any[]).length;
+              const length = (form[namesOfField.field] as unknown[]).length;
               if (options.limit && options.limit <= length) return;
               const idx = options.idx ?? length;
               const setValue = field.isClass ? immerify<Light | Light[]>(field.modelRef, value) : value;
@@ -369,12 +374,16 @@ export const makeFormSetter = (refName: string, fetch: FetchProxy<any>) => {
             ) {
               const { [names.modelForm]: form } = this.get() as { [key: string]: { [key: string]: any[] } };
               const index = form[namesOfField.field].indexOf(value);
-              if (index === -1) ((this as any)[namesOfField.addFieldOnModel] as (...args: any) => void)(value, options);
-              else ((this as any)[namesOfField.subFieldOnModel] as (...args: any) => void)(index);
+              if (index === -1)
+                ((this as unknown as DynamicRecord)[namesOfField.addFieldOnModel] as (...args: any) => void)(
+                  value,
+                  options,
+                );
+              else ((this as unknown as DynamicRecord)[namesOfField.subFieldOnModel] as (...args: any) => void)(index);
             },
           }
         : {}),
-      ...(field.isClass && !!fileUploadRefName && ConstantRegistry.getRefName(field.modelRef) === fileUploadRefName
+      ...(field.isClass && fileUploadRefName && ConstantRegistry.getRefName(field.modelRef) === fileUploadRefName
         ? {
             [namesOfField.uploadFieldOnModel]: async function (
               this: SetGet,
@@ -388,45 +397,63 @@ export const makeFormSetter = (refName: string, fetch: FetchProxy<any>) => {
                 form.id,
               );
               if (field.isArray) {
-                const idx = index ?? (form[namesOfField.field] as ProtoFile[]).length;
-                this.set((state: { [key: string]: { [key: string]: ProtoFile[] } }) => {
+                const idx = index ?? (form[namesOfField.field] as ProtoLightFile[]).length;
+                this.set((state: { [key: string]: { [key: string]: ProtoLightFile[] } }) => {
                   state[names.modelForm][namesOfField.field] = [
-                    ...(form[namesOfField.field] as ProtoFile[]).slice(0, idx),
+                    ...(form[namesOfField.field] as ProtoLightFile[]).slice(0, idx),
                     ...files,
-                    ...(form[namesOfField.field] as ProtoFile[]).slice(idx),
+                    ...(form[namesOfField.field] as ProtoLightFile[]).slice(idx),
                   ];
                 });
               } else {
-                this.set((state: { [key: string]: { [key: string]: ProtoFile | null } }) => {
+                this.set((state: { [key: string]: { [key: string]: ProtoLightFile | null } }) => {
                   state[names.modelForm][namesOfField.field] = files[0];
                 });
               }
+              // A light-declared field stores the light projection, so the poll re-reads through the light endpoint.
+              const fileReadName = ConstantRegistry.isLight(field.modelRef)
+                ? `light${capitalize(fileUploadRefName)}`
+                : fileUploadRefName;
               files.forEach((file) => {
+                let attemptsLeft = UPLOAD_POLL_ATTEMPTS;
                 const intervalKey = setInterval(() => {
                   void (async () => {
-                    const currentFile = await (
-                      (fetch as { [key: string]: any })[fileUploadRefName as string] as (
-                        id: string,
-                      ) => Promise<ProtoFile>
-                    )(file.id);
-                    if (field.isArray)
-                      this.set((state: { [key: string]: { [key: string]: ProtoFile[] } }) => {
-                        state[names.modelForm][namesOfField.field] = state[names.modelForm][namesOfField.field].map(
-                          (file) => (file.id === currentFile.id ? currentFile : file),
-                        );
-                      });
-                    else
-                      this.set((state: { [key: string]: { [key: string]: ProtoFile | null } }) => {
-                        state[names.modelForm][namesOfField.field] = currentFile;
-                      });
-                    if (currentFile.status !== "uploading") clearInterval(intervalKey);
+                    attemptsLeft -= 1;
+                    try {
+                      const currentFile = await (
+                        (fetch as { [key: string]: any })[fileReadName] as (id: string) => Promise<ProtoLightFile>
+                      )(file.id);
+                      if (field.isArray)
+                        this.set((state: { [key: string]: { [key: string]: ProtoLightFile[] } }) => {
+                          state[names.modelForm][namesOfField.field] = state[names.modelForm][namesOfField.field].map(
+                            (file) => (file.id === currentFile.id ? currentFile : file),
+                          );
+                        });
+                      else
+                        this.set((state: { [key: string]: { [key: string]: ProtoLightFile | null } }) => {
+                          state[names.modelForm][namesOfField.field] = currentFile;
+                        });
+                      if (currentFile.status !== "uploading" || attemptsLeft <= 0) clearInterval(intervalKey);
+                    } catch (error) {
+                      clearInterval(intervalKey);
+                      Logger.warn(
+                        `Upload poll for ${fileReadName} ${file.id} stopped: ${
+                          error instanceof Error ? error.message : String(error)
+                        }`,
+                      );
+                    }
                   })();
-                }, 3000);
+                }, UPLOAD_POLL_INTERVAL_MS);
               });
             },
           }
         : {}),
     };
+    // The only place the state path is known; `st.do` carries the tag so `Field.*` can emit `data-akan-state`.
+    tagAction(singleFieldSetAction[namesOfField.setFieldOnModel] as (...args: never[]) => unknown, {
+      action: namesOfField.setFieldOnModel,
+      state: `${names.modelForm}.${namesOfField.field}`,
+    });
     return Object.assign(acc, singleFieldSetAction);
   }, {});
   return Object.assign(fieldSetAction, baseSetAction);
@@ -443,25 +470,19 @@ export const makeActions = (refName: string, slice: { [key: string]: SerializedS
   const [fieldName, className] = [refName, capitalize(refName)];
   const cnst = ConstantRegistry.getDatabase(refName);
   const modelRef = cnst.full;
+  // Deliberately not store state: a secret field in the opened form must not reach a subscribed component.
+  let openFormBase: object | null = null;
   const slices = Object.entries(slice).map(([suffix, serializedSlice]) => ({
     sliceName: `${refName}${capitalize(suffix)}`,
-    suffix,
+    keys: sliceKeysOf(refName, suffix),
     slice: serializedSlice,
   }));
   const names = {
-    model: fieldName,
-    _model: `_${fieldName}`,
+    ...databaseStateNames(refName),
     Model: className,
-    modelOperation: `${fieldName}Operation`,
-    defaultModel: `default${className}`,
     modelInsight: `${fieldName}Insight`,
-    modelForm: `${fieldName}Form`,
-    modelSubmit: `${fieldName}Submit`,
-    modelLoading: `${fieldName}Loading`,
-    modelFormLoading: `${fieldName}FormLoading`,
     modelList: `${fieldName}List`,
     modelListLoading: `${fieldName}ListLoading`,
-    modelSelection: `${fieldName}Selection`,
     createModelInForm: `create${className}InForm`,
     updateModelInForm: `update${className}InForm`,
     createModel: `create${className}`,
@@ -475,88 +496,130 @@ export const makeActions = (refName: string, slice: { [key: string]: SerializedS
     viewModel: `view${className}`,
     setModel: `set${className}`,
     resetModel: `reset${className}`,
-    modelViewAt: `${fieldName}ViewAt`,
-    modelModal: `${fieldName}Modal`,
-    initModel: `init${className}`,
-    modelInitList: `${fieldName}InitList`,
-    modelInitAt: `${fieldName}InitAt`,
-    modelStaleAt: `${fieldName}StaleAt`,
-    refreshModel: `refresh${className}`,
-    selectModel: `select${className}`,
-    setPageOfModel: `setPageOf${className}`,
-    addPageOfModel: `addPageOf${className}`,
-    setLimitOfModel: `setLimitOf${className}`,
-    setQueryArgsOfModel: `setQueryArgsOf${className}`,
-    setSortOfModel: `setSortOf${className}`,
-    lastPageOfModel: `lastPageOf${className}`,
-    pageOfModel: `pageOf${className}`,
-    limitOfModel: `limitOf${className}`,
-    queryArgsOfModel: `queryArgsOf${className}`,
-    sortOfModel: `sortOf${className}`,
+    loadModelDraft: `load${className}FormDraft`,
+    restoreModelDraft: `restore${className}FormDraft`,
+    discardModelDraft: `discard${className}FormDraft`,
   };
-  const staleAtOfOtherSlices = (createdSliceName: string) => {
+  const defaultKeyOf = (sliceName: string) => capitalize(sliceName).replace(names.Model, names.defaultModel);
+  // A back-navigation replays the pre-write RSC payload; this stamp makes `Load.Units` refetch on re-hydration.
+  const staleAtOfSlices = () => {
     const staleAt = new Date();
-    return Object.fromEntries(
-      slices
-        .filter(({ sliceName }) => sliceName !== createdSliceName)
-        .map(({ sliceName }) => [sliceName.replace(names.model, names.modelStaleAt), staleAt]),
-    );
+    return Object.fromEntries(slices.map(({ keys }) => [keys.state.modelStaleAt, staleAt]));
   };
+  const updatedAtOf = (model: Full): string | null => {
+    const updatedAt = (model as unknown as { updatedAt?: { toISOString?: () => string } }).updatedAt;
+    return typeof updatedAt?.toISOString === "function" ? updatedAt.toISOString() : null;
+  };
+  function armDraft(this: SetGet, draftScope: string | undefined, form: object, baseUpdatedAt: string | null) {
+    openFormBase = draftScope ? form : null;
+    if (!draftScope) return null;
+    // Catches a sign-out and sign-in that happened without a reload.
+    void DraftStore.reconcileIdentity();
+    return {
+      key: DraftStore.keyOf(refName, draftScope),
+      baseHash: DraftStore.formHash(refName, form),
+      baseUpdatedAt,
+      pending: null,
+      appliedAt: null,
+    };
+  }
+  async function applyDraft(this: SetGet, { auto }: { auto: boolean }) {
+    const draft = (this.get() as { [key: string]: any })[names.modelDraft] as DraftState | null;
+    if (!draft) return;
+    const record = await DraftStore.read(draft.key);
+    if (!record) return;
+    // The editor moved on while the read was in flight.
+    const current = (this.get() as { [key: string]: any })[names.modelDraft] as DraftState | null;
+    if (current?.key !== draft.key) return;
+    // Same content is not offered back: an autosaving form moves `updatedAt`, so its draft always reads as stale.
+    const openedForm = (this.get() as { [key: string]: any })[names.modelForm] as object;
+    if (DraftStore.contentHash(record.form) === DraftStore.contentHash(DraftStore.encodeForm(refName, openedForm))) {
+      await DraftStore.remove(draft.key);
+      return;
+    }
+    let form: object;
+    try {
+      form = DraftStore.decodeForm(refName, record.form);
+    } catch {
+      // The model changed shape under the draft; keeping it would fail again on every open.
+      await DraftStore.remove(draft.key);
+      return;
+    }
+    const savedAt = new Date(record.savedAt);
+    if (auto || record.baseUpdatedAt === draft.baseUpdatedAt) {
+      this.set({ [names.modelForm]: form, [names.modelDraft]: { ...draft, appliedAt: savedAt } });
+      return;
+    }
+    this.set({ [names.modelDraft]: { ...draft, pending: { savedAt, form } } });
+  }
+  const clearDraft = (draft: DraftState | null) => {
+    openFormBase = null;
+    if (draft) void DraftStore.remove(draft.key);
+    return null;
+  };
+  // A live slice places the row through `applyLive`, so the server's echo of this create is not counted twice.
+  function applyLocalCreate(this: SetGet, sliceName: string, model: Full, seen: { [key: string]: any }) {
+    const target = slices.find((entry) => entry.sliceName === sliceName);
+    if (target?.slice.live) {
+      const applyLive = (this as unknown as DynamicRecord)[target.keys.action.applyLiveModel] as
+        | ((event: LiveEventPayload) => void)
+        | undefined;
+      applyLive?.({ op: "enter", id: model.id, light: new cnst.light().set(model) as unknown as object });
+      return;
+    }
+    if (seen[sliceName.replace(names.model, names.modelListLoading)]) return;
+    const listKey = sliceName.replace(names.model, names.modelList);
+    const insightKey = sliceName.replace(names.model, names.modelInsight);
+    const modelInsight = seen[insightKey] as Insight & BaseInsight;
+    this.set({
+      [listKey]: new DataList([model, ...(seen[listKey] as DataList<Light>)]),
+      [insightKey]: new cnst.insight().set({ ...modelInsight, count: modelInsight.count + 1 }),
+    });
+  }
+  function patchLists(this: SetGet, updatedModel: Full) {
+    const updatedLightModel = new cnst.light().set(updatedModel) as unknown as Light;
+    slices.forEach(({ keys: { state: namesOfSlice } }) => {
+      const currentState = this.get() as { [key: string]: any };
+      const modelList = currentState[namesOfSlice.modelList] as DataList<Light>;
+      const modelListLoading = currentState[namesOfSlice.modelListLoading] as boolean;
+      if (modelListLoading || !modelList.has(updatedModel.id)) return;
+      this.set({ [namesOfSlice.modelList]: new DataList(modelList).set(updatedLightModel) });
+    });
+  }
   const baseAction = {
     [names.createModelInForm]: async function (
       this: SetGet,
-      { idx, path, modal, sliceName = names.model, onError, onSuccess }: CreateOption<Full> = {},
+      { path, modal, sliceName = names.model, onError, onSuccess }: CreateOption<Full> = {},
     ) {
-      const SliceName = capitalize(sliceName);
-      const namesOfSlice = {
-        defaultModel: SliceName.replace(names.Model, names.defaultModel),
-        modelList: sliceName.replace(names.model, names.modelList),
-        modelListLoading: sliceName.replace(names.model, names.modelListLoading),
-        modelInsight: sliceName.replace(names.model, names.modelInsight),
-      };
       const currentState = this.get() as { [key: string]: any };
       const modelForm = currentState[names.modelForm] as Input;
-      const modelList = currentState[namesOfSlice.modelList] as DataList<Light>;
-      const modelListLoading = currentState[namesOfSlice.modelListLoading] as boolean;
-      const modelInsight = currentState[namesOfSlice.modelInsight] as Insight & BaseInsight;
-      const defaultModel = currentState[namesOfSlice.defaultModel] as Full;
+      const defaultModel = currentState[defaultKeyOf(sliceName)] as Full;
       const modelInput = (cnst.input.purify as (form: any) => DefaultOf<Input> | null)(modelForm);
 
       if (!modelInput) return;
       this.set({ [names.modelLoading]: true });
       const model = await (fetch[names.createModel] as (...args: any[]) => Promise<Full>)(modelInput, { onError });
-      const newModelList = modelListLoading
-        ? modelList
-        : new DataList([...modelList.slice(0, idx ?? 0), model, ...modelList.slice(idx ?? 0)]);
-      const newModelInsight = new cnst.insight().set({
-        ...modelInsight,
-        count: modelInsight.count + 1,
-      });
       this.set({
         [names.modelForm]: immerify(modelRef, defaultModel),
+        [names.modelDraft]: clearDraft(currentState[names.modelDraft] as DraftState | null),
         [names.model]: model,
         [names.modelLoading]: false,
-        [namesOfSlice.modelList]: newModelList,
-        [namesOfSlice.modelInsight]: newModelInsight,
         [names.modelViewAt]: new Date(),
         [names.modelModal]: modal ?? null,
-        ...staleAtOfOtherSlices(sliceName),
+        ...staleAtOfSlices(),
         ...(typeof path === "string" && path ? { [path]: model } : {}),
       });
+      applyLocalCreate.call(this, sliceName, model, currentState);
       await onSuccess?.(model);
     },
     [names.updateModelInForm]: async function (
       this: SetGet,
       { path, modal, sliceName = names.model, onError, onSuccess }: CreateOption<Full> = {},
     ) {
-      const SliceName = capitalize(sliceName);
-      const namesOfSlice = {
-        defaultModel: SliceName.replace(names.Model, names.defaultModel),
-      };
       const currentState = this.get() as { [key: string]: any };
       const model = currentState[names.model] as Full | null;
       const modelForm = currentState[names.modelForm] as Input & { id: string };
-      const defaultModel = currentState[namesOfSlice.defaultModel] as Full;
+      const defaultModel = currentState[defaultKeyOf(sliceName)] as Full;
       const modelInput = (cnst.input.purify as (form: any) => DefaultOf<Input> | null)(modelForm);
       if (!modelInput) return;
       if (model?.id === modelForm.id) this.set({ [names.modelLoading]: modelForm.id });
@@ -570,69 +633,40 @@ export const makeActions = (refName: string, slice: { [key: string]: SerializedS
           ? { [names.model]: updatedModel, [names.modelLoading]: false, [names.modelViewAt]: new Date() }
           : {}),
         [names.modelForm]: immerify(modelRef, defaultModel),
+        [names.modelDraft]: clearDraft(currentState[names.modelDraft] as DraftState | null),
         [names.modelModal]: modal ?? null,
+        ...staleAtOfSlices(),
         ...(typeof path === "string" && path ? { [path]: updatedModel } : {}),
       });
-      const updatedLightModel = new cnst.light().set(updatedModel) as unknown as Light;
-      slices.forEach(({ sliceName }) => {
-        const namesOfSlice = {
-          modelList: sliceName.replace(names.model, names.modelList),
-          modelListLoading: sliceName.replace(names.model, names.modelListLoading),
-        };
-        const currentState = this.get() as { [key: string]: any };
-        const modelList = currentState[namesOfSlice.modelList] as DataList<Light>;
-        const modelListLoading = currentState[namesOfSlice.modelListLoading] as boolean;
-        if (modelListLoading || !modelList.has(updatedModel.id)) return;
-        const newModelList = new DataList(modelList).set(updatedLightModel);
-        this.set({ [namesOfSlice.modelList]: newModelList });
-      });
+      patchLists.call(this, updatedModel);
       await onSuccess?.(updatedModel);
     },
     [names.createModel]: async function (
       this: SetGet,
       data: GetStateObject<Input>,
-      { idx, path, modal, sliceName = names.model, onError, onSuccess }: CreateOption<Full> = {},
+      { path, modal, sliceName = names.model, onError, onSuccess }: CreateOption<Full> = {},
     ) {
-      const SliceName = capitalize(sliceName);
-      const namesOfSlice = {
-        defaultModel: SliceName.replace(names.Model, names.defaultModel),
-        modelList: sliceName.replace(names.model, names.modelList),
-        modelListLoading: sliceName.replace(names.model, names.modelListLoading),
-        modelInsight: sliceName.replace(names.model, names.modelInsight),
-      };
       const currentState = this.get() as { [key: string]: any };
-      const modelList = currentState[namesOfSlice.modelList] as DataList<Light>;
-      const modelListLoading = currentState[namesOfSlice.modelListLoading] as boolean;
-      const modelInsight = currentState[namesOfSlice.modelInsight] as Insight & BaseInsight;
       const modelInput = (cnst.input.purify as (data: any) => Input | null)(data);
       if (!modelInput) return;
       this.set({ [names.modelLoading]: true });
       const model = await (fetch[names.createModel] as (...args: any[]) => Promise<Full>)(modelInput, { onError });
-      const newModelList = modelListLoading
-        ? modelList
-        : new DataList([...modelList.slice(0, idx ?? 0), model, ...modelList.slice(idx ?? 0)]);
-
-      const newModelInsight = new cnst.insight().set({
-        ...modelInsight,
-        count: modelInsight.count + 1,
-      }) as unknown as Insight;
       this.set({
         [names.model]: model,
         [names.modelLoading]: false,
-        [namesOfSlice.modelList]: newModelList,
-        [namesOfSlice.modelInsight]: newModelInsight,
         [names.modelViewAt]: new Date(),
         [names.modelModal]: modal ?? null,
-        ...staleAtOfOtherSlices(sliceName),
+        ...staleAtOfSlices(),
         ...(typeof path === "string" && path ? { [path]: model } : {}),
       });
+      applyLocalCreate.call(this, sliceName, model, currentState);
       await onSuccess?.(model);
     },
     [names.updateModel]: async function (
       this: SetGet,
       id: string,
       data: GetStateObject<Input>,
-      { idx, path, modal, sliceName = names.model, onError, onSuccess }: CreateOption<Full> = {},
+      { path, modal, onError, onSuccess }: CreateOption<Full> = {},
     ) {
       const currentState = this.get() as { [key: string]: any };
       const model = currentState[names.model] as Full | null;
@@ -647,21 +681,10 @@ export const makeActions = (refName: string, slice: { [key: string]: SerializedS
           ? { [names.model]: updatedModel, [names.modelLoading]: false, [names.modelViewAt]: new Date() }
           : {}),
         [names.modelModal]: modal ?? null,
+        ...staleAtOfSlices(),
         ...(typeof path === "string" && path ? { [path]: updatedModel } : {}),
       });
-      const updatedLightModel = new cnst.light().set(updatedModel) as unknown as Light;
-      slices.forEach(({ sliceName }) => {
-        const namesOfSlice = {
-          modelList: sliceName.replace(names.model, names.modelList),
-          modelListLoading: sliceName.replace(names.model, names.modelListLoading),
-        };
-        const currentState = this.get() as { [key: string]: any };
-        const modelList = currentState[namesOfSlice.modelList] as DataList<Light>;
-        const modelListLoading = currentState[namesOfSlice.modelListLoading] as boolean;
-        if (modelListLoading || !modelList.has(updatedModel.id)) return;
-        const newModelList = new DataList(modelList).set(updatedLightModel);
-        this.set({ [namesOfSlice.modelList]: newModelList });
-      });
+      patchLists.call(this, updatedModel);
       await onSuccess?.(updatedModel);
     },
     [names.removeModel]: async function (this: SetGet, id: string, options?: FetchPolicy & { modal?: string | null }) {
@@ -671,13 +694,7 @@ export const makeActions = (refName: string, slice: { [key: string]: SerializedS
         fetchPolicyOptions,
       );
       const lightModel = new cnst.light().set(model) as unknown as Light;
-      slices.forEach(({ sliceName }) => {
-        const namesOfSlice = {
-          modelList: sliceName.replace(names.model, names.modelList),
-          modelListLoading: sliceName.replace(names.model, names.modelListLoading),
-          modelSelection: sliceName.replace(names.model, names.modelSelection),
-          modelInsight: sliceName.replace(names.model, names.modelInsight),
-        };
+      slices.forEach(({ keys: { state: namesOfSlice } }) => {
         const currentState = this.get() as { [key: string]: any };
         const modelList = currentState[namesOfSlice.modelList] as DataList<Light>;
         const modelListLoading = currentState[namesOfSlice.modelListLoading] as boolean;
@@ -707,6 +724,7 @@ export const makeActions = (refName: string, slice: { [key: string]: SerializedS
           });
         }
       });
+      this.set(staleAtOfSlices());
     },
     [names.checkModelSubmitable]: function (this: SetGet, disabled?: boolean) {
       const currentState = this.get() as { [key: string]: any };
@@ -720,44 +738,55 @@ export const makeActions = (refName: string, slice: { [key: string]: SerializedS
       const modelForm = currentState[names.modelForm] as Input & { id: string };
       const modelSubmit = currentState[names.modelSubmit] as { loading: boolean; times: number };
       this.set({ [names.modelSubmit]: { ...modelSubmit, loading: true } });
-      if (modelForm.id) await ((this as any)[names.updateModelInForm] as (...args: any[]) => Promise<Full>)(option);
-      else await ((this as any)[names.createModelInForm] as (...args: any[]) => Promise<Full>)(option);
+      if (modelForm.id)
+        await ((this as unknown as DynamicRecord)[names.updateModelInForm] as (...args: any[]) => Promise<Full>)(
+          option,
+        );
+      else
+        await ((this as unknown as DynamicRecord)[names.createModelInForm] as (...args: any[]) => Promise<Full>)(
+          option,
+        );
       this.set({ [names.modelSubmit]: { ...modelSubmit, loading: false, times: modelSubmit.times + 1 } });
     },
     [names.newModel]: function (
       this: SetGet,
       partial: Partial<Full> = {},
-      { modal, setDefault, sliceName = names.model }: NewOption = {},
+      { modal, setDefault, sliceName = names.model, draftScope }: NewOption = {},
     ) {
-      const SliceName = capitalize(sliceName);
-      const namesOfSlice = {
-        defaultModel: SliceName.replace(names.Model, names.defaultModel),
-      };
+      const defaultModelKey = defaultKeyOf(sliceName);
       const currentState = this.get() as { [key: string]: any };
-      const defaultModel = currentState[namesOfSlice.defaultModel] as Full;
+      const defaultModel = currentState[defaultModelKey] as Full;
+      const merged = { ...plainFieldsOf(defaultModel), ...partial };
+      const modelForm = immerify(modelRef, merged);
       this.set({
-        [names.modelForm]: immerify(modelRef, { ...defaultModel, ...partial }),
-        [namesOfSlice.defaultModel]: setDefault ? immerify(modelRef, { ...defaultModel, ...partial }) : defaultModel,
+        [names.modelForm]: modelForm,
+        [defaultModelKey]: setDefault ? immerify(modelRef, merged) : defaultModel,
         [names.model]: null,
         [names.modelModal]: modal ?? "edit",
         [names.modelFormLoading]: false,
+        [names.modelDraft]: armDraft.call(this, draftScope, modelForm, null),
       });
+      // A new form has nothing to conflict with, so its draft is applied without asking.
+      if (draftScope) void applyDraft.call(this, { auto: true });
     },
     [names.editModel]: async function (
       this: SetGet,
       modelOrId: Full | string,
-      { modal, onError }: { modal?: string | null } & FetchPolicy = {},
+      { modal, onError, draftScope }: EditOption & FetchPolicy = {},
     ) {
       const id = typeof modelOrId === "string" ? modelOrId : modelOrId.id;
       this.set({ [names.modelFormLoading]: id, [names.modelModal]: modal ?? "edit" });
       const model = await (fetch[names.model] as (...args: any[]) => Promise<Full>)(id, { onError });
-      const modelForm = deepObjectify<Input>(model as unknown as Input);
+      const modelForm = immerify(modelRef, deepObjectify<Input>(model as unknown as Input) as object) as Input;
       this.set({
         [names.model]: model,
         [names.modelFormLoading]: false,
         [names.modelViewAt]: new Date(),
         [names.modelForm]: modelForm,
+        [names.modelDraft]: armDraft.call(this, draftScope, modelForm, updatedAtOf(model)),
       });
+      // A record that moved keeps the draft pending: overwriting a server value the user sees is not recoverable.
+      if (draftScope) void applyDraft.call(this, { auto: false });
     },
     [names.mergeModel]: async function (
       this: SetGet,
@@ -777,20 +806,9 @@ export const makeActions = (refName: string, slice: { [key: string]: SerializedS
       this.set({
         [names.model]: id === model?.id ? updatedModel : model,
         [names.modelLoading]: false,
+        ...staleAtOfSlices(),
       });
-      const updatedLightModel = new cnst.light().set(updatedModel) as unknown as Light;
-      slices.forEach(({ sliceName }) => {
-        const namesOfSlice = {
-          modelList: sliceName.replace(names.model, names.modelList),
-          modelListLoading: sliceName.replace(names.model, names.modelListLoading),
-        };
-        const currentState = this.get() as { [key: string]: any };
-        const modelList = currentState[namesOfSlice.modelList] as DataList<Light>;
-        const modelListLoading = currentState[namesOfSlice.modelListLoading] as boolean;
-        if (modelListLoading || !modelList.has(updatedModel.id)) return;
-        const newModelList = new DataList(modelList).set(updatedLightModel);
-        this.set({ [namesOfSlice.modelList]: newModelList });
-      });
+      patchLists.call(this, updatedModel);
     },
     [names.viewModel]: async function (
       this: SetGet,
@@ -805,8 +823,6 @@ export const makeActions = (refName: string, slice: { [key: string]: SerializedS
     [names.setModel]: function (this: SetGet, ...fullOrLightModels: Full[]) {
       const currentState = this.get() as { [key: string]: any };
       if (fullOrLightModels.length === 0) return;
-
-      // set the first model to the model state
       const firstModel = fullOrLightModels[0];
       const model = currentState[names.model] as Full | null;
       const isFull = firstModel instanceof modelRef;
@@ -814,22 +830,13 @@ export const makeActions = (refName: string, slice: { [key: string]: SerializedS
         const crystalizedModel = new cnst.full().set(firstModel) as unknown as Full;
         this.set({ [names.model]: crystalizedModel });
       } else if (model?.id === firstModel.id) {
-        const crystalizedModel = new cnst.full().set({
-          ...model,
-          ...firstModel,
-        }) as unknown as Full;
+        const crystalizedModel = new cnst.full().set(model).set(firstModel) as unknown as Full;
         this.set({ [names.model]: crystalizedModel });
       }
-
-      // set the rest of the models to the model list
-      const lightModels = fullOrLightModels.map(
-        (fullOrLightModel) => new cnst.light().set(fullOrLightModel) as unknown as Light,
+      const lightModels = withSharedInstances(() =>
+        fullOrLightModels.map((fullOrLightModel) => new cnst.light().set(fullOrLightModel) as unknown as Light),
       );
-      slices.forEach(({ sliceName }) => {
-        const namesOfSlice = {
-          modelList: sliceName.replace(names.model, names.modelList),
-          modelListLoading: sliceName.replace(names.model, names.modelListLoading),
-        };
+      slices.forEach(({ keys: { state: namesOfSlice } }) => {
         const modelList = currentState[namesOfSlice.modelList] as DataList<Light>;
         const modelListLoading = currentState[namesOfSlice.modelListLoading] as boolean;
         if (modelListLoading) return;
@@ -839,6 +846,7 @@ export const makeActions = (refName: string, slice: { [key: string]: SerializedS
         });
         this.set({ [namesOfSlice.modelList]: modelList.save() });
       });
+      this.set(staleAtOfSlices());
     },
     [names.resetModel]: function (this: SetGet, model?: Full) {
       const currentState = this.get() as { [key: string]: any };
@@ -848,59 +856,94 @@ export const makeActions = (refName: string, slice: { [key: string]: SerializedS
         [names.modelViewAt]: new Date(0),
         [names.modelForm]: immerify(modelRef, defaultModel),
         [names.modelModal]: null,
+        [names.modelDraft]: clearDraft(currentState[names.modelDraft] as DraftState | null),
       });
       return model ?? null;
     },
+    // For a form seeded from an RSC payload: arms saving and offers the draft, as `edit<Model>` does after its fetch.
+    [names.loadModelDraft]: async function (this: SetGet, draftScope?: string) {
+      const currentState = this.get() as { [key: string]: any };
+      const model = currentState[names.model] as Full | null;
+      const modelForm = currentState[names.modelForm] as object;
+      this.set({
+        [names.modelDraft]: armDraft.call(this, draftScope, modelForm, model ? updatedAtOf(model) : null),
+      });
+      if (draftScope) await applyDraft.call(this, { auto: false });
+    },
+    [names.restoreModelDraft]: function (this: SetGet) {
+      const draft = (this.get() as { [key: string]: any })[names.modelDraft] as DraftState | null;
+      if (!draft?.pending) return;
+      this.set({
+        [names.modelForm]: draft.pending.form,
+        [names.modelDraft]: { ...draft, pending: null, appliedAt: draft.pending.savedAt },
+      });
+    },
+    [names.discardModelDraft]: function (this: SetGet) {
+      const draft = (this.get() as { [key: string]: any })[names.modelDraft] as DraftState | null;
+      if (!draft) return;
+      void DraftStore.remove(draft.key);
+      // Saving stays armed; dropping an applied draft puts back the form as the editor opened it.
+      this.set({
+        ...(draft.appliedAt && openFormBase ? { [names.modelForm]: openFormBase } : {}),
+        [names.modelDraft]: { ...draft, pending: null, appliedAt: null },
+      });
+    },
   };
-  const sliceAction = slices.reduce((acc, { sliceName, slice }) => {
-    const SliceName = capitalize(sliceName);
-    const namesOfSlice: { [key in SliceActionKey | SliceStateKey | "modelList"]: string } = {
-      defaultModel: SliceName.replace(names.Model, names.defaultModel),
-      modelInsight: sliceName.replace(names.model, names.modelInsight),
-      modelList: sliceName.replace(names.model, names.modelList),
-      modelListLoading: sliceName.replace(names.model, names.modelListLoading),
-      initModel: SliceName.replace(names.Model, names.initModel),
-      modelInitList: SliceName.replace(names.Model, names.modelInitList),
-      modelInitAt: SliceName.replace(names.Model, names.modelInitAt),
-      modelStaleAt: SliceName.replace(names.Model, names.modelStaleAt),
-      refreshModel: SliceName.replace(names.Model, names.refreshModel),
-      selectModel: SliceName.replace(names.Model, names.selectModel),
-      setPageOfModel: SliceName.replace(names.Model, names.setPageOfModel),
-      addPageOfModel: SliceName.replace(names.Model, names.addPageOfModel),
-      setLimitOfModel: SliceName.replace(names.Model, names.setLimitOfModel),
-      setQueryArgsOfModel: SliceName.replace(names.Model, names.setQueryArgsOfModel),
-      setSortOfModel: SliceName.replace(names.Model, names.setSortOfModel),
-      lastPageOfModel: SliceName.replace(names.Model, names.lastPageOfModel),
-      pageOfModel: SliceName.replace(names.Model, names.pageOfModel),
-      limitOfModel: SliceName.replace(names.Model, names.limitOfModel),
-      queryArgsOfModel: SliceName.replace(names.Model, names.queryArgsOfModel),
-      sortOfModel: SliceName.replace(names.Model, names.sortOfModel),
-      modelSelection: SliceName.replace(names.Model, names.modelSelection),
+  const sliceAction = slices.reduce((acc, { sliceName, keys, slice }) => {
+    // One ticket per slice: every action below writes the same list.
+    const requests = new SliceRequest();
+    // One room per slice, not per component: a second room would apply every event to the one list twice.
+    let liveWatch: { signature: string; dispose: () => void } | null = null;
+    const livePauseIdxs = (slice.live?.pauseOn ?? [])
+      .map((name) => slice.args.findIndex((arg) => arg.name === name))
+      .filter((idx) => idx >= 0);
+    const namesOfSlice = { ...keys.state, ...keys.action };
+    // Read off the batch, not the insight count: that is absent under `{ insight: false }` and drifts with live events.
+    const hasMoreFrom = (batch: unknown[], askedFor: number) => ({
+      [namesOfSlice.hasMoreOfModel]: batch.length >= askedFor && askedFor > 0,
+    });
+    const fetchList = (queryArgs: unknown[], skip: number, limit: number, sort: Sort, options?: object) =>
+      (fetch[namesOfSlice.modelList] as (...args: any[]) => Promise<Light[]>)(
+        ...expandQueryArgs(queryArgs, slice.args),
+        skip,
+        limit,
+        sort,
+        options,
+      );
+    const fetchInsight = (queryArgs: unknown[], options?: object) =>
+      (fetch[namesOfSlice.modelInsight] as (...args: any[]) => Promise<Insight & BaseInsight>)(
+        ...expandQueryArgs(queryArgs, slice.args),
+        options,
+      );
+    const loadList = async <T>(self: SetGet, load: () => Promise<T>, commit: (loaded: T) => object) => {
+      self.set({ [namesOfSlice.modelListLoading]: true });
+      const ticket = requests.claim();
+      try {
+        const loaded = await load();
+        if (requests.isCurrent(ticket)) self.set(commit(loaded));
+      } finally {
+        if (requests.isCurrent(ticket)) self.set({ [namesOfSlice.modelListLoading]: false });
+      }
     };
     const singleSliceAction = {
       [namesOfSlice.initModel]: async function (
         this: SetGet,
-        ...args: [...args: any[], initForm: FetchInitForm<Input, Filter, DefaultOf<Input>, Sort> & FetchPolicy]
+        ...args: [...args: any[], initForm: FetchInitForm<Input, Filter> & FetchPolicy]
       ) {
         const initArgLength = Math.min(args.length, slice.args.length);
-        const initForm = { invalidate: false, ...(args[slice.args.length] ?? {}) } as FetchInitForm<
-          Input,
-          Filter,
-          DefaultOf<Input>,
-          Sort
-        > &
+        const initForm = { invalidate: false, ...(args[slice.args.length] ?? {}) } as FetchInitForm<Input, Filter> &
           FetchPolicy;
         const queryArgs = new Array(initArgLength).fill(null).map((_, i) => args[i] as object);
         const defaultModel = new cnst.full().set(initForm.default ?? {}) as unknown as Full;
-        this.set({ [names.defaultModel]: defaultModel });
-        await ((this as any)[namesOfSlice.refreshModel] as (...args: any[]) => Promise<void>)({
+        this.set({ [names.defaultModel]: defaultModel, [namesOfSlice.isCumulativeOfModel]: false });
+        await ((this as unknown as DynamicRecord)[namesOfSlice.refreshModel] as (...args: any[]) => Promise<void>)({
           ...initForm,
           queryArgs,
         });
       },
       [namesOfSlice.refreshModel]: async function (
         this: SetGet,
-        initForm: FetchInitForm<Input, Filter, DefaultOf<Input>, Sort> & FetchPolicy & { queryArgs?: any[] } = {},
+        initForm: FetchInitForm<Input, Filter> & FetchPolicy & { queryArgs?: any[] } = {},
       ) {
         const args = initForm.queryArgs ?? [];
         const refreshArgLength = Math.min(args.length, slice.args.length);
@@ -924,6 +967,10 @@ export const makeActions = (refName: string, slice: { [key: string]: SerializedS
           ...fetchPolicy
         } = initForm;
         const modelOperation = currentState[names.modelOperation] as string;
+        const isCumulative = currentState[namesOfSlice.isCumulativeOfModel] as boolean;
+        const loadedLength = (currentState[namesOfSlice.modelList] as DataList<Light>).length;
+        // A cumulative list refetches every loaded row, or it would collapse back to the first page.
+        const fetchLimit = isCumulative ? Math.max(limit, loadedLength) : limit;
         const queryArgsOfModel = currentState[namesOfSlice.queryArgsOfModel] as object[];
         const pageOfModel = currentState[namesOfSlice.pageOfModel] as number;
         const limitOfModel = currentState[namesOfSlice.limitOfModel] as number;
@@ -936,36 +983,34 @@ export const makeActions = (refName: string, slice: { [key: string]: SerializedS
           limit === limitOfModel &&
           isQueryEqual(sort as unknown as object, sortOfModel as unknown as object)
         )
-          return; // store-level cache hit
-        else this.set({ [namesOfSlice.modelListLoading]: true });
-        const fetchQueryArgs = expandQueryArgs(queryArgs, slice.args);
-        const [modelDataList, modelInsight] = await Promise.all([
-          (fetch[namesOfSlice.modelList] as (...args: any[]) => Promise<Light[]>)(
-            ...fetchQueryArgs,
-            (page - 1) * limit,
-            limit,
-            sort,
-            { ...fetchPolicy, onError: initForm.onError },
-          ),
-          (fetch[namesOfSlice.modelInsight] as (...args: any[]) => Promise<Insight & BaseInsight>)(...fetchQueryArgs, {
-            ...fetchPolicy,
-            onError: initForm.onError,
-          }),
-        ]);
-        const modelList = new DataList(modelDataList);
-        this.set({
-          [namesOfSlice.modelList]: modelList,
-          [namesOfSlice.modelListLoading]: false,
-          [namesOfSlice.modelInsight]: modelInsight,
-          [namesOfSlice.modelInitList]: modelList,
-          [namesOfSlice.modelInitAt]: new Date(),
-          [namesOfSlice.lastPageOfModel]: Math.max(Math.floor((modelInsight.count - 1) / limit) + 1, 1),
-          [namesOfSlice.limitOfModel]: limit,
-          [namesOfSlice.queryArgsOfModel]: queryArgs,
-          [namesOfSlice.sortOfModel]: sort,
-          [namesOfSlice.pageOfModel]: page,
-          [names.modelOperation]: "idle",
-        });
+          return;
+        await loadList(
+          this,
+          () =>
+            Promise.all([
+              fetchList(queryArgs, (page - 1) * limit, fetchLimit, sort, { ...fetchPolicy, onError: initForm.onError }),
+              insight === false ? null : fetchInsight(queryArgs, { ...fetchPolicy, onError: initForm.onError }),
+            ]),
+          ([modelDataList, modelObjInsight]) => {
+            const modelList = new DataList(modelDataList);
+            const modelInsight =
+              modelObjInsight ??
+              (new cnst.insight().set({ count: modelDataList.length }) as unknown as Insight & BaseInsight);
+            return {
+              [namesOfSlice.modelList]: modelList,
+              [namesOfSlice.modelInsight]: modelInsight,
+              [namesOfSlice.modelInitList]: modelList,
+              [namesOfSlice.modelInitAt]: new Date(),
+              [namesOfSlice.lastPageOfModel]: Math.max(Math.floor((modelInsight.count - 1) / (limit || 20)) + 1, 1),
+              ...hasMoreFrom(modelDataList, fetchLimit),
+              [namesOfSlice.limitOfModel]: limit,
+              [namesOfSlice.queryArgsOfModel]: queryArgs,
+              [namesOfSlice.sortOfModel]: sort,
+              [namesOfSlice.pageOfModel]: page,
+              [names.modelOperation]: "idle",
+            };
+          },
+        );
       },
       [namesOfSlice.selectModel]: function (
         this: SetGet,
@@ -991,43 +1036,45 @@ export const makeActions = (refName: string, slice: { [key: string]: SerializedS
         const limitOfModel = currentState[namesOfSlice.limitOfModel] as number;
         const sortOfModel = currentState[namesOfSlice.sortOfModel] as Sort;
         if (pageOfModel === page) return;
-        this.set({ [namesOfSlice.modelListLoading]: true });
-        const fetchQueryArgs = expandQueryArgs(queryArgsOfModel, slice.args);
-        const modelDataList = await (fetch[namesOfSlice.modelList] as (...args: any[]) => Promise<Light[]>)(
-          ...fetchQueryArgs,
-          (page - 1) * limitOfModel,
-          limitOfModel,
-          sortOfModel,
-          options,
+        await loadList(
+          this,
+          () => fetchList(queryArgsOfModel, (page - 1) * limitOfModel, limitOfModel, sortOfModel, options),
+          (modelDataList) => ({
+            [namesOfSlice.modelList]: new DataList(modelDataList),
+            [namesOfSlice.pageOfModel]: page,
+            [namesOfSlice.isCumulativeOfModel]: false,
+            ...hasMoreFrom(modelDataList, limitOfModel),
+          }),
         );
-        const modelList = new DataList(modelDataList);
-        this.set({
-          [namesOfSlice.modelList]: modelList,
-          [namesOfSlice.pageOfModel]: page,
-          [namesOfSlice.modelListLoading]: false,
-        });
       },
-      [namesOfSlice.addPageOfModel]: async function (this: SetGet, page: number, options?: FetchPolicy) {
+      // Offsets by the rows on screen, not a page, so a live insert cannot shift it. Never raises `ListLoading`
+      // (that would drop live events), so concurrent calls may fetch one offset twice; the ticket keeps the newest.
+      [namesOfSlice.loadMoreOfModel]: async function (this: SetGet, options?: FetchPolicy) {
         const currentState = this.get() as { [key: string]: any };
+        // A refresh in flight owns the spinner; claiming a ticket over it would strand the spinner on.
+        if (currentState[namesOfSlice.modelListLoading] as boolean) return;
+        if (!(currentState[namesOfSlice.hasMoreOfModel] as boolean)) return;
         const modelList = currentState[namesOfSlice.modelList] as DataList<Light>;
         const queryArgsOfModel = currentState[namesOfSlice.queryArgsOfModel] as object[];
         const pageOfModel = currentState[namesOfSlice.pageOfModel] as number;
-        const limitOfModel = currentState[namesOfSlice.limitOfModel] as number;
+        const limitOfModel = (currentState[namesOfSlice.limitOfModel] as number) || 20;
         const sortOfModel = currentState[namesOfSlice.sortOfModel] as Sort;
-        if (pageOfModel === page) return;
-        const addFront = page < pageOfModel;
-        const fetchQueryArgs = expandQueryArgs(queryArgsOfModel, slice.args);
-        const modelDataList = await (fetch[namesOfSlice.modelList] as (...args: any[]) => Promise<Light[]>)(
-          ...fetchQueryArgs,
-          (page - 1) * limitOfModel,
+        const ticket = requests.claim();
+        const modelDataList = await fetchList(
+          queryArgsOfModel,
+          (pageOfModel - 1) * limitOfModel + modelList.length,
           limitOfModel,
           sortOfModel,
           options,
         );
-        const newModelList = new DataList(
-          addFront ? [...modelDataList, ...modelList] : [...modelList, ...modelDataList],
-        );
-        this.set({ [namesOfSlice.modelList]: newModelList, [namesOfSlice.pageOfModel]: page });
+        if (!requests.isCurrent(ticket)) return;
+        // Re-read: a live event may have placed a row meanwhile, and `DataList` collapses the shifted duplicate.
+        const currentModelList = (this.get() as { [key: string]: any })[namesOfSlice.modelList] as DataList<Light>;
+        this.set({
+          [namesOfSlice.modelList]: new DataList([...currentModelList.values, ...modelDataList]),
+          [namesOfSlice.isCumulativeOfModel]: true,
+          ...hasMoreFrom(modelDataList, limitOfModel),
+        });
       },
       [namesOfSlice.setLimitOfModel]: async function (this: SetGet, limit: number, options?: FetchPolicy) {
         const currentState = this.get() as { [key: string]: any };
@@ -1039,21 +1086,18 @@ export const makeActions = (refName: string, slice: { [key: string]: SerializedS
         if (limitOfModel === limit) return;
         const skip = (pageOfModel - 1) * limitOfModel;
         const page = Math.max(Math.floor((skip - 1) / limit) + 1, 1);
-        const fetchQueryArgs = expandQueryArgs(queryArgsOfModel, slice.args);
-        const modelDataList = await (fetch[namesOfSlice.modelList] as (...args: any[]) => Promise<Light[]>)(
-          ...fetchQueryArgs,
-          (page - 1) * limit,
-          limit,
-          sortOfModel,
-          options,
+        await loadList(
+          this,
+          () => fetchList(queryArgsOfModel, (page - 1) * limit, limit, sortOfModel, options),
+          (modelDataList) => ({
+            [namesOfSlice.modelList]: new DataList(modelDataList),
+            [namesOfSlice.lastPageOfModel]: Math.max(Math.floor((modelInsight.count - 1) / limit) + 1, 1),
+            [namesOfSlice.limitOfModel]: limit,
+            [namesOfSlice.pageOfModel]: page,
+            [namesOfSlice.isCumulativeOfModel]: false,
+            ...hasMoreFrom(modelDataList, limit),
+          }),
         );
-        const modelList = new DataList(modelDataList);
-        this.set({
-          [namesOfSlice.modelList]: modelList,
-          [namesOfSlice.lastPageOfModel]: Math.max(Math.floor((modelInsight.count - 1) / limit) + 1, 1),
-          [namesOfSlice.limitOfModel]: limit,
-          [namesOfSlice.pageOfModel]: page,
-        });
       },
       [namesOfSlice.setQueryArgsOfModel]: async function (
         this: SetGet,
@@ -1075,56 +1119,132 @@ export const makeActions = (refName: string, slice: { [key: string]: SerializedS
         const sortOfModel = currentState[namesOfSlice.sortOfModel] as Sort;
         if (isQueryEqual(queryArgsOfModel, queryArgs)) {
           Logger.trace(`${namesOfSlice.queryArgsOfModel} store-level cache hit`);
-          return; // store-level cache hit
+          return;
         }
-        this.set({ [namesOfSlice.modelListLoading]: true });
-        const fetchQueryArgs = expandQueryArgs(queryArgs, slice.args);
-        const [modelDataList, modelInsight] = await Promise.all([
-          (fetch[namesOfSlice.modelList] as (...args: any[]) => Promise<Light[]>)(
-            ...fetchQueryArgs,
-            0,
-            limitOfModel,
-            sortOfModel,
-            options,
-          ),
-          (fetch[namesOfSlice.modelInsight] as (...args: any[]) => Promise<Insight & BaseInsight>)(
-            ...fetchQueryArgs,
-            options,
-          ),
-        ]);
-        const modelList = new DataList(modelDataList);
-        this.set({
-          [namesOfSlice.queryArgsOfModel]: queryArgs,
-          [namesOfSlice.modelList]: modelList,
-          [namesOfSlice.modelInsight]: modelInsight,
-          [namesOfSlice.lastPageOfModel]: Math.max(Math.floor((modelInsight.count - 1) / limitOfModel) + 1, 1),
-          [namesOfSlice.pageOfModel]: 1,
-          [namesOfSlice.modelSelection]: new Map(),
-          [namesOfSlice.modelListLoading]: false,
-        });
+        await loadList(
+          this,
+          () =>
+            Promise.all([
+              fetchList(queryArgs, 0, limitOfModel, sortOfModel, options),
+              fetchInsight(queryArgs, options),
+            ]),
+          ([modelDataList, modelInsight]) => ({
+            [namesOfSlice.queryArgsOfModel]: queryArgs,
+            [namesOfSlice.modelList]: new DataList(modelDataList),
+            [namesOfSlice.modelInsight]: modelInsight,
+            [namesOfSlice.lastPageOfModel]: Math.max(Math.floor((modelInsight.count - 1) / limitOfModel) + 1, 1),
+            [namesOfSlice.pageOfModel]: 1,
+            [namesOfSlice.isCumulativeOfModel]: false,
+            ...hasMoreFrom(modelDataList, limitOfModel),
+            [namesOfSlice.modelSelection]: new Map(),
+          }),
+        );
       },
       [namesOfSlice.setSortOfModel]: async function (this: SetGet, sort: Sort, options?: FetchPolicy) {
         const currentState = this.get() as { [key: string]: any };
         const queryArgsOfModel = currentState[namesOfSlice.queryArgsOfModel] as object[];
         const limitOfModel = currentState[namesOfSlice.limitOfModel] as number;
         const sortOfModel = currentState[namesOfSlice.sortOfModel] as Sort;
-        if (sortOfModel === sort) return; // store-level cache hit
-        this.set({ [namesOfSlice.modelListLoading]: true });
-        const fetchQueryArgs = expandQueryArgs(queryArgsOfModel, slice.args);
-        const modelDataList = await (fetch[namesOfSlice.modelList] as (...args: any[]) => Promise<Light[]>)(
-          ...fetchQueryArgs,
-          0,
-          limitOfModel,
-          sort,
-          options,
+        if (sortOfModel === sort) return;
+        await loadList(
+          this,
+          () => fetchList(queryArgsOfModel, 0, limitOfModel, sort, options),
+          (modelDataList) => ({
+            [namesOfSlice.modelList]: new DataList(modelDataList),
+            [namesOfSlice.sortOfModel]: sort,
+            [namesOfSlice.pageOfModel]: 1,
+            [namesOfSlice.isCumulativeOfModel]: false,
+            ...hasMoreFrom(modelDataList, limitOfModel),
+          }),
         );
-        const modelList = new DataList(modelDataList);
-        this.set({
-          [namesOfSlice.modelList]: modelList,
-          [namesOfSlice.sortOfModel]: sort,
-          [namesOfSlice.pageOfModel]: 1,
-          [namesOfSlice.modelListLoading]: false,
+      },
+      // Membership was decided server-side; a row is placed only where its position is knowable, else stamped stale.
+      [namesOfSlice.applyLiveModel]: function (this: SetGet, event: LiveEventPayload) {
+        const currentState = this.get() as { [key: string]: any };
+        if (currentState[namesOfSlice.modelListLoading] as boolean) return;
+        const modelList = currentState[namesOfSlice.modelList] as DataList<Light>;
+        const staleAt = { [namesOfSlice.modelStaleAt]: new Date() };
+        if (event.op === "invalidate") {
+          this.set(staleAt);
+          return;
+        }
+        const modelInsight = currentState[namesOfSlice.modelInsight] as Insight & BaseInsight;
+        const limit = (currentState[namesOfSlice.limitOfModel] as number) || 20;
+        const isCumulative = currentState[namesOfSlice.isCumulativeOfModel] as boolean;
+        const countedTo = (count: number) => ({
+          [namesOfSlice.modelInsight]: new cnst.insight().set({ ...modelInsight, count }),
+          [namesOfSlice.lastPageOfModel]: Math.max(Math.floor((count - 1) / limit) + 1, 1),
         });
+        if (event.op === "leave") {
+          if (!modelList.has(event.id)) return;
+          this.set({
+            [namesOfSlice.modelList]: new DataList(modelList).delete(event.id).save(),
+            ...countedTo(Math.max(modelInsight.count - 1, 0)),
+            ...staleAt,
+          });
+          return;
+        }
+        const light = event.light ? (new cnst.light().set(event.light) as unknown as Light) : null;
+        if (event.op === "update") {
+          // Not in this window: another page reads the new value when it is fetched.
+          if (!light || !modelList.has(event.id)) return;
+          this.set({ [namesOfSlice.modelList]: new DataList(modelList).set(light).save() });
+          return;
+        }
+        // A row already in the window is an echo of an applied insert, so the count must not rise twice.
+        const placement =
+          light && !modelList.has(event.id)
+            ? livePlacementIndex({
+                list: modelList as unknown as LiveSortableRow[],
+                row: light as unknown as LiveSortableRow,
+                page: currentState[namesOfSlice.pageOfModel] as number,
+                limit,
+                cumulative: isCumulative,
+                hasMore: currentState[namesOfSlice.hasMoreOfModel] as boolean,
+                sortKey: String(currentState[namesOfSlice.sortOfModel]),
+                allowedSorts: slice.live?.sort ?? [],
+                sorts: fetch.sortValueMap?.get(refName),
+              })
+            : null;
+        if (!light || placement === null) {
+          this.set({ ...(modelList.has(event.id) ? {} : countedTo(modelInsight.count + 1)), ...staleAt });
+          return;
+        }
+        // A paged window pushes its last row to the next page; a cumulative list keeps it, since it is on screen.
+        const inserted = [...modelList.slice(0, placement), light, ...modelList.slice(placement)];
+        const placed = isCumulative ? inserted : inserted.slice(0, limit);
+        this.set({
+          [namesOfSlice.modelList]: new DataList(placed as Light[]),
+          ...countedTo(modelInsight.count + 1),
+          ...staleAt,
+        });
+      },
+      // Opens this slice's live room for `queryArgs`, or closes it on null.
+      [namesOfSlice.watchLiveModel]: function (this: SetGet, queryArgs: unknown[] | null) {
+        if (!slice.live) return;
+        const args = queryArgs ? expandQueryArgs(normalizeQueryArgs(queryArgs, slice.args), slice.args) : null;
+        // A filled `pauseOn` argument closes the room as null does, until it is cleared.
+        const paused = !!args && livePauseIdxs.some((idx) => args[idx] != null);
+        const signature = args && !paused ? JSON.stringify(args) : null;
+        if (liveWatch && signature !== liveWatch.signature) {
+          liveWatch.dispose();
+          liveWatch = null;
+        }
+        if (!args || paused || liveWatch) return;
+        const self = this as unknown as DynamicRecord;
+        const apply = self[namesOfSlice.applyLiveModel] as (event: unknown) => void;
+        const refresh = self[namesOfSlice.refreshModel] as (form: object) => Promise<void>;
+        // The generated subscriber serializes room args as the list query does; a hand-built id would not.
+        const subscribe = fetch[`subscribe${capitalize(sliceName.replace(names.model, `${names.model}Live`))}`] as
+          | ((...args: unknown[]) => () => void)
+          | undefined;
+        if (!subscribe) return;
+        const dispose = subscribe(...args, (event: unknown) => apply(event), {
+          crystalize: false,
+          // The events missed while the socket was down are gone, so the list is refetched rather than patched.
+          onResync: () => void refresh({ invalidate: true }),
+        });
+        liveWatch = { signature: signature ?? "", dispose };
       },
     };
     return Object.assign(acc, singleSliceAction);

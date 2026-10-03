@@ -1,6 +1,16 @@
 {{- $namespaceParts := split "-" .Release.Namespace }}
 {{- $branch := index $namespaceParts "_1" }}
 {{- $config := index .Values $branch }}
+{{- $database := default dict $config.database }}
+{{- $mode := default "single" $database.mode }}
+{{- $cluster := eq $mode "cluster" }}
+{{- $storage := default dict $config.storage }}
+{{- if eq $mode "multiple" }}
+{{- fail "multiple mode opens one SQLite file from every container on one host; run it with docker compose, not this chart" }}
+{{- end }}
+{{- if and $cluster (not $database.secretName) }}
+{{- fail "cluster mode needs database.secretName: a Secret holding POSTGRES_URL and REDIS_URI" }}
+{{- end }}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -10,7 +20,8 @@ metadata:
   labels:
     app: app
 spec:
-  replicas: 1
+  # A single-mode pod owns its SQLite file on a ReadWriteOnce volume, so only a cluster runs more than one.
+  replicas: {{ if $cluster }}{{ default 2 $config.app.pods }}{{ else }}1{{ end }}
   selector:
     matchLabels:
       app: app
@@ -19,6 +30,9 @@ spec:
       labels:
         app: app
     spec:
+      # `AkanServer` gives itself 30s to drain (`AKAN_SHUTDOWN_TIMEOUT_MS`); k8s defaults to exactly that, so
+      # SIGKILL would land the instant its own budget expired. Leave it room to finish.
+      terminationGracePeriodSeconds: 40
       containers:
         - name: app
           image: {{ .Values.image.registry }}/{{ .Values.repoName }}/{{ .Values.appName }}:{{ default (printf "%s-live" $branch) .Values.image.tag }}
@@ -32,20 +46,80 @@ spec:
             limits:
               memory: {{ $config.app.resources.limits.memory }}
               cpu: {{ $config.app.resources.limits.cpu }}
+          {{- with $database.secretName }}
+          envFrom:
+            - secretRef:
+                name: {{ . }}
+          {{- end }}
           env:
             - name: AKAN_PUBLIC_ENV
               value: {{ $branch }}
+            - name: AKAN_DATABASE_MODE
+              value: {{ $mode }}
+            {{- if and $cluster $storage.sharedClaim }}
+            - name: AKAN_STORAGE_SHARED
+              value: "true"
+            {{- end }}
+            # One traffic replica runs in the container's only process; more spawn a gateway that proxies them.
             - name: AKAN_REPLICA
               value: {{ $config.app.replica }}
+            {{- if hasKey $config.app "solo" }}
+            - name: AKAN_SOLO
+              value: {{ $config.app.solo | quote }}
+            {{- end }}
+          # With one replica nothing supervises the server but the kubelet, so these are what restarts a wedged
+          # pod. `startupProbe` carries the boot: an SSR replica loads its route artifacts before it listens.
+          startupProbe:
+            httpGet:
+              path: /_akan/app/health
+              port: 8282
+            periodSeconds: 5
+            failureThreshold: 24
+          livenessProbe:
+            httpGet:
+              path: /_akan/app/health
+              port: 8282
+            periodSeconds: 15
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /_akan/app/health
+              port: 8282
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 2
+          {{- if not $cluster }}
           volumeMounts:
             - name: sqlite-data
               mountPath: /workspace/sqlite
+            # Local blob storage (uploads) writes under /workspace/local; without this it lived on the container's
+            # own filesystem and every restart dropped it. A subPath keeps the SQLite files at the volume root where
+            # existing releases already put them.
+            - name: sqlite-data
+              mountPath: /workspace/local
+              subPath: local
+          {{- else if $storage.sharedClaim }}
+          # Every pod writes uploads here, so the claim has to be ReadWriteMany; the app refuses a local disk the
+          # other pods cannot read unless AKAN_STORAGE_SHARED says it is shared.
+          volumeMounts:
+            - name: shared-uploads
+              mountPath: /workspace/local
+          {{- end }}
       imagePullSecrets:
         - name: regcred
+      {{- if not $cluster }}
       volumes:
         - name: sqlite-data
           persistentVolumeClaim:
             claimName: sqlite-data
+      {{- else if $storage.sharedClaim }}
+      volumes:
+        - name: shared-uploads
+          persistentVolumeClaim:
+            claimName: {{ $storage.sharedClaim }}
+      {{- end }}
+{{- if not $cluster }}
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -58,6 +132,7 @@ spec:
   resources:
     requests:
       storage: {{ $config.app.resources.storage }}
+{{- end }}
 ---
 apiVersion: v1
 kind: Service

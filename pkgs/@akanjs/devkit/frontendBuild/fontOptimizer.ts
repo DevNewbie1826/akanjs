@@ -21,10 +21,6 @@ export interface OptimizeAppFontsResult {
   files: string[];
 }
 
-/**
- * Lets a boot that changed nothing about its fonts skip re-subsetting them. `files` is stored relative
- * to the artifact root so the `build` and `start` roots keep independent, relocatable caches.
- */
 interface FontOptimizerCache {
   version: number;
   key: string;
@@ -43,7 +39,7 @@ export class FontOptimizer {
   #woff2Ready: Promise<void> | null = null;
 
   static #ksX1001Text: string | null = null;
-  static readonly #cacheVersion = 1;
+  static readonly #cacheVersion = 2;
 
   constructor(app: App, command: FontOptimizerCommand = "start") {
     this.#app = app;
@@ -74,10 +70,7 @@ export class FontOptimizer {
     return path.join(this.#artifactRoot, "fontCache.json");
   }
 
-  /**
-   * Null means "do not cache this run": a source we cannot stat is a source whose staleness we cannot
-   * detect, and the uncached path is also the one that warns about it.
-   */
+  // null skips the cache: an unstat-able source's staleness is undetectable, and the uncached path warns about it.
   async #buildCacheKey(fonts: ReactFont[]): Promise<string | null> {
     const sources: unknown[] = [];
     for (const font of fonts) {
@@ -94,11 +87,15 @@ export class FontOptimizer {
         if (!stamp) return null;
         sources.push({ subsetFile: filePath, ...stamp });
       }
-      // `auto` derives the subset from app source text, which no font config hash can capture.
       if (this.#getFontSubsets(font).includes("auto"))
-        sources.push({ autoSubsetText: this.#hashFontConfig(await this.#collectAutoSubsetText()) });
+        sources.push({ autoSubsetText: this.#cacheDigest(await this.#collectAutoSubsetText()) });
     }
-    return this.#hashFontConfig({ version: FontOptimizer.#cacheVersion, fonts, sources });
+    return this.#cacheDigest({ version: FontOptimizer.#cacheVersion, fonts, sources });
+  }
+
+  // sha256, not #hashFontConfig's 32-bit FNV: a key collision would serve a stale subset as current.
+  #cacheDigest(value: unknown) {
+    return new Bun.CryptoHasher("sha256").update(this.#stableStringify(value)).digest("hex");
   }
 
   async #fileStamp(filePath: string): Promise<{ mtimeMs: number; size: number } | null> {
@@ -141,13 +138,11 @@ export class FontOptimizer {
         const file = Bun.file(filePath);
         if (!(await file.exists())) return;
         const source = await file.text();
-        // A declaration named `fonts` cannot exist in text that never mentions it, and parsing the
-        // route files that never declare one is what a cached optimize() otherwise spends its time on.
         if (!source.includes("fonts")) return;
         fonts.push(...this.#extractFontsExport(source, filePath));
       }),
     );
-    return this.#dedupeFonts(fonts);
+    return [...new Map(fonts.map((font) => [JSON.stringify(font), font] as const)).values()];
   }
 
   async #optimizeFont(font: ReactFont) {
@@ -177,21 +172,67 @@ export class FontOptimizer {
 
   #extractFontsExport(source: string, filePath: string): ReactFont[] {
     const sourceFile = ts.createSourceFile(filePath, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
-    const fonts: ReactFont[] = [];
+    const declaration = this.#findFontsDeclaration(sourceFile);
+    if (!declaration) return [];
+    const value = this.#literalToValue(declaration);
+    const entries: unknown[] = Array.isArray(value) ? value : [];
+    const fonts = entries.filter((entry): entry is ReactFont => this.#isReadableFont(entry));
+    if (fonts.length !== entries.length || !Array.isArray(value))
+      this.#app.logger.warn(
+        `[font] ${path.relative(this.#app.cwdPath, filePath)} declares fonts the build cannot read without evaluating the module — write the list inline, or nothing is subset for it and every /_akan/fonts request 404s`,
+      );
+    return fonts.map((font) => ({ ...font, subsets: font.subsets ?? [...DEFAULT_FONT_SUBSETS] }));
+  }
+
+  #isReadableFont(value: unknown): value is ReactFont {
+    if (!value || typeof value !== "object") return false;
+    const font = value as Partial<ReactFont>;
+    return typeof font.name === "string" && Array.isArray(font.paths);
+  }
+
+  #findFontsDeclaration(sourceFile: ts.SourceFile): ts.Expression | null {
     for (const statement of sourceFile.statements) {
+      if (ts.isExportAssignment(statement)) {
+        if (statement.isExportEquals) continue;
+        const stage = this.#findChainStageArgument(statement.expression, "fonts");
+        if (stage) return stage;
+        continue;
+      }
       if (!ts.isVariableStatement(statement)) continue;
       const modifiers = ts.canHaveModifiers(statement) ? ts.getModifiers(statement) : undefined;
-      const isExported = modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.ExportKeyword) ?? false;
-      if (!isExported) continue;
+      if (!modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.ExportKeyword)) continue;
       for (const declaration of statement.declarationList.declarations) {
         if (!ts.isIdentifier(declaration.name) || declaration.name.text !== "fonts") continue;
-        const value = declaration.initializer ? this.#literalToValue(declaration.initializer) : null;
-        if (Array.isArray(value)) {
-          fonts.push(...(value as ReactFont[]).map((font) => this.#withFontDefaults(font)));
-        }
+        if (declaration.initializer) return declaration.initializer;
       }
     }
-    return fonts;
+    return null;
+  }
+
+  // Outermost call first, so `??=` keeps the stage that wins at runtime.
+  #findChainStageArgument(expression: ts.Expression, stageName: string): ts.Expression | null {
+    let node = this.#unwrapExpression(expression);
+    let argument: ts.Expression | null = null;
+    while (node && ts.isCallExpression(node)) {
+      const callee = this.#unwrapExpression(node.expression);
+      if (!callee) return null;
+      if (ts.isIdentifier(callee)) return callee.text === "rootLayout" ? argument : null;
+      if (!ts.isPropertyAccessExpression(callee)) return null;
+      if (callee.name.text === stageName) argument ??= node.arguments[0] ?? null;
+      node = this.#unwrapExpression(callee.expression);
+    }
+    return null;
+  }
+
+  #unwrapExpression(expression?: ts.Expression): ts.Expression | undefined {
+    let current = expression;
+    while (
+      current &&
+      (ts.isAsExpression(current) || ts.isSatisfiesExpression(current) || ts.isParenthesizedExpression(current))
+    ) {
+      current = current.expression;
+    }
+    return current;
   }
 
   #literalToValue(node: ts.Node): unknown {
@@ -221,16 +262,6 @@ export class FontOptimizer {
     return null;
   }
 
-  #dedupeFonts(fonts: ReactFont[]) {
-    const map = new Map<string, ReactFont>();
-    for (const font of fonts) map.set(JSON.stringify(font), font);
-    return [...map.values()];
-  }
-
-  #withFontDefaults(font: ReactFont): ReactFont {
-    return { ...font, subsets: font.subsets ?? [...DEFAULT_FONT_SUBSETS] };
-  }
-
   #getFontSubsets(font: ReactFont): ReactFontSubset[] {
     return font.subsets ?? DEFAULT_FONT_SUBSETS;
   }
@@ -247,12 +278,8 @@ export class FontOptimizer {
     return font.optimize !== false;
   }
 
-  #getFontStyles(font: ReactFont): ReactFontStyle[] {
-    return font.styles?.length ? font.styles : ["normal"];
-  }
-
   #getFontFaces(font: ReactFont): ReactFontFace[] {
-    const enabledStyles = new Set(this.#getFontStyles(font));
+    const enabledStyles = new Set<ReactFontStyle>(font.styles?.length ? font.styles : ["normal"]);
     return font.paths
       .map((fontPath) => {
         const style = fontPath.style ?? "normal";
@@ -330,8 +357,7 @@ export class FontOptimizer {
     return null;
   }
 
-  /** `subset-font`, `fonteditor-core` and `fontaine` are imported here rather than at module scope so a
-   * cache hit — the common case once the cache exists — loads none of them. */
+  // The font libraries are imported lazily so a cache hit loads none of them.
   async #buildFontBuffer(font: ReactFont, sourceBuffer: Buffer, sourcePath: string) {
     if (font.subset === false) return this.#convertToWoff2(sourceBuffer, sourcePath);
     const { default: subsetFont } = await import("subset-font");
@@ -340,14 +366,10 @@ export class FontOptimizer {
 
   async #convertToWoff2(buffer: Buffer, sourcePath: string) {
     const { createFont } = await import("fonteditor-core");
-    await this.#initWoff2();
+    this.#woff2Ready ??= import("fonteditor-core").then(({ woff2 }) => woff2.init()).then(() => undefined);
+    await this.#woff2Ready;
     const font = createFont(buffer, { type: this.#getFontType(sourcePath, buffer) });
     return font.write({ type: "woff2", toBuffer: true });
-  }
-
-  async #initWoff2() {
-    this.#woff2Ready ??= import("fonteditor-core").then(({ woff2 }) => woff2.init()).then(() => undefined);
-    return this.#woff2Ready;
   }
 
   #getFontType(sourcePath: string, buffer: Buffer) {
@@ -380,40 +402,32 @@ export class FontOptimizer {
   }
 
   async #getSubsetPresetText(subset: ReactFontSubset) {
-    if (subset === "latin") return this.#rangeText(0x20, 0x7e);
-    if (subset === "latin-ext") return `${this.#rangeText(0x20, 0x7e)}${this.#rangeText(0xa0, 0x024f)}`;
+    if (subset === "latin") return FontOptimizer.#rangeText(0x20, 0x7e);
+    if (subset === "latin-ext")
+      return `${FontOptimizer.#rangeText(0x20, 0x7e)}${FontOptimizer.#rangeText(0xa0, 0x024f)}`;
     if (subset === "ks-x-1001") return FontOptimizer.#getKsX1001Text();
     if (subset === "auto") return this.#collectAutoSubsetText();
     return "";
   }
 
+  // Keep the order stable: #buildCacheKey hashes this text. `lib` counts because dictionaries hold user-visible text.
   async #collectAutoSubsetText() {
     //* Synced lib pages hold app-visible text too, and a glob never crosses the symlink that mounts them.
     const libPageRoots = (await this.#app.getPageRoots()).filter((root) => root.keyPrefix).map((root) => root.dir);
-    const roots = [...["page", "ui"].map((dir) => path.join(this.#app.cwdPath, dir)), ...libPageRoots];
+    const roots = [...["page", "ui", "lib"].map((dir) => path.join(this.#app.cwdPath, dir)), ...libPageRoots];
     const glob = new Bun.Glob("**/*.{ts,tsx,js,jsx,html,md}");
     const parts: string[] = [];
-    await Promise.all(
-      roots.map(async (root) => {
-        if (
-          !(await stat(root).then(
-            (entry) => entry.isDirectory(),
-            () => false,
-          ))
-        )
-          return;
-        for await (const filePath of glob.scan({ cwd: root, absolute: true })) {
-          parts.push(await Bun.file(filePath).text());
-        }
-      }),
-    );
+    for (const root of [...new Set(roots)].sort()) {
+      const isDir = await stat(root).then(
+        (entry) => entry.isDirectory(),
+        () => false,
+      );
+      if (!isDir) continue;
+      const filePaths: string[] = [];
+      for await (const filePath of glob.scan({ cwd: root, absolute: true })) filePaths.push(filePath);
+      for (const filePath of filePaths.sort()) parts.push(await Bun.file(filePath).text());
+    }
     return parts.join("");
-  }
-
-  #rangeText(start: number, end: number) {
-    let text = "";
-    for (let code = start; code <= end; code++) text += String.fromCodePoint(code);
-    return text;
   }
 
   static #getKsX1001Text() {
@@ -429,12 +443,12 @@ export class FontOptimizer {
       }
       FontOptimizer.#ksX1001Text = [...chars].join("");
     } catch {
-      FontOptimizer.#ksX1001Text = FontOptimizer.#rangeTextStatic(0xac00, 0xd7a3);
+      FontOptimizer.#ksX1001Text = FontOptimizer.#rangeText(0xac00, 0xd7a3);
     }
     return FontOptimizer.#ksX1001Text;
   }
 
-  static #rangeTextStatic(start: number, end: number) {
+  static #rangeText(start: number, end: number) {
     let text = "";
     for (let code = start; code <= end; code++) text += String.fromCodePoint(code);
     return text;

@@ -1,12 +1,21 @@
 import { msg } from "@libs/shared/client";
+import { withRedirectQuery } from "@libs/shared/common";
+import { loadRefreshToken, saveRefreshToken } from "@libs/shared/webkit";
 import { type Dayjs, dayjs } from "akanjs/base";
 import { getCookie, router, setAuth, setCookie } from "akanjs/client";
-import { isPhoneNumber } from "akanjs/common";
+import { formatPhone, isPhoneNumber } from "akanjs/common";
 import { store } from "akanjs/store";
 
 import * as cnst from "../cnst";
 import type { RootStore } from "../st";
 import { fetch, sig } from "../useClient";
+
+// Firefox and desktop Safari ship no Badging API, and reading a missing method off `navigator` and calling it
+// throws synchronously — which would take the whole badge action down with it.
+const setAppBadge = (count: number) => {
+  if (!("setAppBadge" in navigator)) return;
+  void navigator.setAppBadge(count);
+};
 
 export class UserStore extends store(sig.user, () => ({
   self: new cnst.User(),
@@ -21,6 +30,7 @@ export class UserStore extends store(sig.user, () => ({
   phoneCode: "",
   phoneCodeAt: null as Dayjs | null,
   phoneVerifiedAt: null as Dayjs | null,
+  emailCode: "",
   turnstileToken: null as string | null,
   sameAccountIdExists: "unknown" as "unknown" | boolean,
   sameNicknameExists: "unknown" as "unknown" | boolean,
@@ -37,7 +47,7 @@ export class UserStore extends store(sig.user, () => ({
     if (!self.id) return;
     const user = await fetch.addBadgeCount(self.id);
     this.set({ self: user });
-    void navigator.setAppBadge(user.badgeCount);
+    setAppBadge(user.badgeCount);
   }
 
   async subBadgeCount() {
@@ -45,22 +55,13 @@ export class UserStore extends store(sig.user, () => ({
     if (!self.id) return;
     const user = await fetch.subBadgeCount(self.id);
     this.set({ self: user });
-    void navigator.setAppBadge(user.badgeCount);
+    setAppBadge(user.badgeCount);
   }
 
-  async addNotiDeviceTokenOfSelf(notiDeviceToken: string) {
-    const { self } = this.get();
-    if (!self.id) return;
-    await fetch.addNotiDeviceTokenOfSelf(notiDeviceToken);
-  }
-  async subNotiDeviceTokenOfSelf(notiDeviceToken: string) {
-    const { self } = this.get();
-    if (!self.id) return;
-    await fetch.subNotiDeviceTokenOfSelf(notiDeviceToken);
-  }
   async setLeaveInfoOfSelf() {
     const { leaveInfo } = this.get();
-    if (!leaveInfo.reason || !leaveInfo.satisfaction || !leaveInfo.voc) return;
+    // voc 는 선택 항목이고 satisfaction 은 1이 유효한 값이라, 빈 값 검사로 설문 전체를 버리면 안 된다.
+    if (!leaveInfo.reason || leaveInfo.satisfaction === null) return;
     await fetch.setLeaveInfoOfSelf({
       type: leaveInfo.type,
       reason: leaveInfo.reason,
@@ -100,29 +101,32 @@ export class UserStore extends store(sig.user, () => ({
     const userId = await fetch.getUserIdHasNickname(nickname);
     this.set({ sameNicknameExists: !!userId });
   }
-  async activateUser(userId: string, { redirect }: { redirect: string }) {
+  async activateUser(userId: string, { redirect, agreePolicies }: { redirect?: string; agreePolicies?: string[] }) {
+    // 약관 화면이 따로 없는 가입 흐름에서는 활성화 버튼 자체가 동의 표시라, 동의 목록을 함께 넘겨 기록한다.
+    if (agreePolicies?.length) await fetch.setAgreePoliciesOfPrepareUser(userId, agreePolicies);
     const accessToken = await fetch.activateUser(userId);
     setAuth(accessToken);
+    await saveRefreshToken("user", accessToken.refreshToken);
     await this.getSelf(accessToken);
-    router.push(redirect);
+    if (redirect) router.push(redirect);
   }
   async setNicknameOfSelf({ redirect }: { redirect: string }) {
     const { self, userForm } = this.get();
     if (!self.id || !userForm.nickname) return;
     await fetch.setNicknameOfSelf(userForm.nickname);
-    if (redirect) router.push(`${redirect}?userId=${self.id}`);
+    if (redirect) router.push(withRedirectQuery(redirect, { userId: self.id }));
   }
   async setNicknameOfPrepareUser(userId: string, { redirect }: { redirect: string }) {
     const { userForm } = this.get();
     if (!userForm.nickname) return;
     await fetch.setNicknameOfPrepareUser(userId, userForm.nickname);
-    if (redirect) router.push(`${redirect}?userId=${userId}`);
+    if (redirect) router.push(withRedirectQuery(redirect, { userId }));
   }
   async setAppliedImagesOfSelf(appliedImages: cnst.File[], { redirect }: { redirect?: string }) {
     const { self } = this.get();
     if (!self.id || !appliedImages.length) return;
     await fetch.setAppliedImagesOfSelf(appliedImages.map((file) => file.id));
-    if (redirect) router.push(`${redirect}?userId=${self.id}`);
+    if (redirect) router.push(withRedirectQuery(redirect, { userId: self.id }));
   }
   async setAppliedImagesOfPrepareUser(userId: string, { redirect }: { redirect?: string }) {
     const { userForm } = this.get();
@@ -131,7 +135,7 @@ export class UserStore extends store(sig.user, () => ({
       userId,
       userForm.appliedImages.map((file) => file.id),
     );
-    if (redirect) router.push(`${redirect}?userId=${userId}`);
+    if (redirect) router.push(withRedirectQuery(redirect, { userId }));
   }
   //*================================================================*//
   //*====================== Admin Control Area ======================*//
@@ -164,6 +168,9 @@ export class UserStore extends store(sig.user, () => ({
     await fetch.setPasswordByAdmin(user.id, password);
     msg.success("user.changePasswordSuccess", { key: "changePasswordByAdmin" });
   }
+  setPhone(phone: string) {
+    this.set({ phone: formatPhone(phone) });
+  }
   async setPhoneByAdmin(phone: string) {
     const { user } = this.pick("user");
     msg.loading("user.changePhoneLoading", { key: "changePhoneByAdmin" });
@@ -179,9 +186,15 @@ export class UserStore extends store(sig.user, () => ({
     const { accountId } = this.get();
     if (!accountId) return;
     await fetch.setAccountIdInPrepareUser(userId, accountId);
-    router.push(`${redirect}?userId=${userId}`);
+    router.push(withRedirectQuery(redirect, { userId }));
   }
-  async generatePrepareUserWithAccountId({ redirect }: { redirect: string }) {
+  async generatePrepareUserWithAccountId({
+    redirect,
+    requestEmailCode = false,
+  }: {
+    redirect: string;
+    requestEmailCode?: boolean;
+  }) {
     const { accountId } = this.get();
     if (!accountId) return;
     const accountIdExists = await fetch.userExistsHasAccountId(accountId);
@@ -190,13 +203,31 @@ export class UserStore extends store(sig.user, () => ({
       return;
     }
     const prepareUser = await fetch.generatePrepareUser(null, "dummy");
-    await this.setAccountIdInPrepareUser(prepareUser.id, { redirect });
+    if (!requestEmailCode) {
+      await this.setAccountIdInPrepareUser(prepareUser.id, { redirect });
+      return;
+    }
+    await fetch.setAccountIdInPrepareUser(prepareUser.id, accountId);
+    await this.requestEmailCodeInPrepareUser(prepareUser.id);
+    router.push(withRedirectQuery(redirect, { userId: prepareUser.id }));
+  }
+  async requestEmailCodeInPrepareUser(userId: string) {
+    await fetch.requestEmailCodeInPrepareUser(userId);
+    this.set({ emailCode: "" });
+    msg.success("user.emailCodeSentSuccess", { key: "emailCode" });
+  }
+  async verifyEmailInPrepareUser(userId: string, { redirect }: { redirect?: string } = {}) {
+    const { emailCode } = this.get();
+    if (emailCode.length !== 6) return;
+    await fetch.verifyEmailInPrepareUser(userId, emailCode);
+    this.set({ emailCode: "" });
+    if (redirect) router.push(withRedirectQuery(redirect, { userId }));
   }
   async setPasswordInPrepareUser(userId: string, { redirect }: { redirect: string }) {
     const { accountId, password, passwordConfirm } = this.get();
     if (!accountId || !password || password !== passwordConfirm) return;
     await fetch.setPasswordInPrepareUser(userId, accountId, password);
-    router.push(`${redirect}?userId=${userId}`);
+    router.push(withRedirectQuery(redirect, { userId }));
   }
   async signinWithPassword({ redirect, replace }: { redirect: string; replace?: boolean }) {
     try {
@@ -204,6 +235,7 @@ export class UserStore extends store(sig.user, () => ({
       const { accountId, password } = this.pick("accountId", "password");
       const accessToken = await fetch.signinWithPassword(accountId, password, turnstileToken ?? "dummy");
       setAuth(accessToken);
+      await saveRefreshToken("user", accessToken.refreshToken);
       await this.getSelf(accessToken);
       if (replace) router.replace(redirect);
       else router.push(redirect);
@@ -257,13 +289,13 @@ export class UserStore extends store(sig.user, () => ({
     else if (!isPhoneNumber(phone)) return;
     await fetch.setPhoneInPrepareUser(userId, phone, hash);
     this.set({ phoneCode: "", phoneCodeAt: dayjs().add(3, "minutes") });
-    if (redirect) router.push(`${redirect}?userId=${userId}&phone=${encodeURIComponent(phone)}&hash=${hash}`);
+    if (redirect) router.push(withRedirectQuery(redirect, { userId, phone, hash }));
   }
   async verifyPhoneInPrepareUser(userId: string, { redirect }: { redirect?: string } = {}) {
     const { phone, phoneCode } = this.pick("phone", "phoneCode");
     if (!phone || !phoneCode) return;
     await fetch.verifyPhoneInPrepareUser(userId, phone, phoneCode);
-    if (redirect) router.push(`${redirect}?userId=${userId}`);
+    if (redirect) router.push(withRedirectQuery(redirect, { userId }));
   }
   async requestPhoneCodeForSignin(userId: string, phone: string, hash = "signin") {
     const { phoneCodeAt } = this.get();
@@ -278,6 +310,7 @@ export class UserStore extends store(sig.user, () => ({
     this.set({ signToken });
     const accessToken = await fetch.signinWithSignToken(userId, signToken);
     setAuth(accessToken);
+    await saveRefreshToken("user", accessToken.refreshToken);
     await this.getSelf(accessToken);
     this.set({ signToken: null });
     router.push(redirect);
@@ -289,18 +322,19 @@ export class UserStore extends store(sig.user, () => ({
   //*====================== Secret Setup Area =======================*//
   async setNameOfPrepareUser(userId: string, name: string, { redirect }: { redirect: string }) {
     const success = await fetch.setNameOfPrepareUser(userId, name);
-    if (success) router.push(`${redirect}?userId=${userId}`);
+    if (success) router.push(withRedirectQuery(redirect, { userId }));
   }
   async setAgreePoliciesOfPrepareUser(userId: string, agreePolicies: string[], { redirect }: { redirect: string }) {
     const success = await fetch.setAgreePoliciesOfPrepareUser(userId, agreePolicies);
-    if (success) router.push(`${redirect}?userId=${userId}`);
+    if (success) router.push(withRedirectQuery(redirect, { userId }));
   }
   //*====================== Secret Setup Area =======================*//
   //*================================================================*//
 
   async refreshJwt() {
-    const accessToken = await fetch.refreshJwt(null);
+    const accessToken = await fetch.refreshJwt(await loadRefreshToken("user"));
     setAuth(accessToken);
+    await saveRefreshToken("user", accessToken.refreshToken);
   }
 
   //*======================================================*//
@@ -315,9 +349,9 @@ export class UserStore extends store(sig.user, () => ({
     }: { signinRedirect: string; signupRedirect: string; errorRedirect: string; replace?: boolean },
   ) {
     setCookie("ssoFor", "user");
-    setCookie("signinRedirect", `${router.getPrefixedPath(signinRedirect)}`);
-    setCookie("signupRedirect", `${router.getPrefixedPath(signupRedirect)}`);
-    setCookie("errorRedirect", `${router.getPrefixedPath(errorRedirect)}`);
+    setCookie("signinRedirect", encodeURIComponent(router.getPrefixedPath(signinRedirect)));
+    setCookie("signupRedirect", encodeURIComponent(router.getPrefixedPath(signupRedirect)));
+    setCookie("errorRedirect", encodeURIComponent(router.getPrefixedPath(errorRedirect)));
     setCookie("ssoOrigin", location.origin);
     const url = `/api/user/${ssoType}`;
     if (replace) location.replace(url);

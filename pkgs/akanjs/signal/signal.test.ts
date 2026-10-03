@@ -1,25 +1,30 @@
-import { describe, expect, test } from "bun:test";
-import { ENDPOINT_META, ID, INJECT_META, INTERNAL_META, Int, SLICE_META } from "akanjs/base";
+import { afterEach, describe, expect, test } from "bun:test";
+import { Any, ENDPOINT_META, ID, INJECT_META, INTERNAL_META, Int, SLICE_META } from "akanjs/base";
+import { Logger, type LoggerSinkEntry } from "akanjs/common";
 import { ConstantRegistry, via } from "akanjs/constant";
 import { by, type DatabaseCls, DatabaseRegistry, from, into, type ModelCls } from "akanjs/document";
 import {
   adapt,
+  CacheAdaptorRole,
   type DatabaseService,
   getDefaultInjectRegistry,
+  getDefaultLiveRegistry,
+  type InjectRegistry,
   type LiveRegistry,
+  type Service,
   ServiceModel,
   serve,
 } from "akanjs/service";
 import { endpoint } from "./endpoint";
 import { buildEndpoint, type EndpointInfo } from "./endpointInfo";
 import { Exception } from "./exception";
-import type { Guard, GuardCls } from "./guard";
+import type { Guard, GuardCls, GuardScope } from "./guard";
 import { None, Public } from "./guards";
 import { type Internal, internal } from "./internal";
 import type { InternalArg } from "./internalArg";
 import { Ws } from "./internalArg";
 import { buildInternal } from "./internalInfo";
-import { middleware } from "./middleware";
+import { middleware, Timeout } from "./middleware";
 import { FetchSerializer } from "./serializer";
 import { serverSignal } from "./serverSignal";
 import { SignalContext } from "./signalContext";
@@ -88,6 +93,34 @@ ConstantRegistry.buildModel(
   },
 );
 
+const SignalTestHolderInput = via((f) => ({
+  label: f(String),
+  related: f(SignalTestRelatedFull).optional(),
+  relateds: f([SignalTestRelatedFull]),
+  requiredRelated: f(SignalTestRelatedFull),
+}));
+const SignalTestHolderObject = via(SignalTestHolderInput, () => ({}));
+const SignalTestHolderLight = via(SignalTestHolderObject, ["label"] as const, () => ({}));
+const SignalTestHolderFull = via(SignalTestHolderObject, SignalTestHolderLight, () => ({}));
+const SignalTestHolderInsight = via(SignalTestHolderFull, (f) => ({
+  total: f(Int, { default: 0, accumulate: {} }),
+}));
+ConstantRegistry.buildModel(
+  "signalTestHolder",
+  SignalTestHolderInput,
+  SignalTestHolderObject,
+  SignalTestHolderFull,
+  SignalTestHolderLight,
+  SignalTestHolderInsight,
+  {
+    SignalTestHolderInput,
+    SignalTestHolderObject,
+    SignalTestHolderFull,
+    SignalTestHolderLight,
+    SignalTestHolderInsight,
+  },
+);
+
 class SignalTestFilter extends from(SignalTestFull, (filter) => ({
   query: {
     byOwner: filter()
@@ -113,7 +146,7 @@ const signalTestDatabase = DatabaseRegistry.buildModel(
   SignalTestDoc,
   SignalTestModel,
   SignalTestObject,
-  SignalTestInsight,
+  SignalTestInsight as unknown as Parameters<typeof DatabaseRegistry.buildModel>[5],
   SignalTestFilter,
 );
 
@@ -133,12 +166,14 @@ const signalTestServiceModel = ServiceModel.fromModel(SignalTestService, signalT
 
 class TestAdmin implements Guard {
   static name = "TestAdmin";
+  static scope: GuardScope = "account";
   canPass() {
     return true;
   }
 }
 class TestDeny implements Guard {
   static name = "TestDeny";
+  static scope: GuardScope = "account";
   canPass() {
     return false;
   }
@@ -175,34 +210,23 @@ class EndpointMiddleware extends middleware("endpoint") {
 }
 let signalTestOrder: string[] = [];
 
-const makeLiveRegistry = (): LiveRegistry => ({
-  adaptor: new Map(),
-  adaptorCls: new Map(),
-  service: new Map(),
-  serviceCls: new Map(),
-  endpoint: new Map(),
-  endpointCls: new Map(),
-  slice: new Map(),
-  sliceCls: new Map(),
-  internal: new Map(),
-  internalCls: new Map(),
-  serverSignal: new Map(),
-  serverSignalCls: new Map(),
-});
-
 const makeHttpRequest = ({
   url = "http://localhost/api?ownerId=u1&ids=a&ids=b",
   params = { id: "123" },
   body,
+  headers = {},
 }: {
   url?: string;
   params?: Record<string, string>;
   body?: Record<string, unknown>;
+  headers?: Record<string, string>;
 } = {}) =>
   ({
     url,
     params,
     body: body ? {} : undefined,
+    // `CrossSiteGuard` refuses a JSON body without this content type.
+    headers: new Headers(body ? { "content-type": "application/json", ...headers } : headers),
     json: async () => body ?? {},
   }) as unknown as Bun.BunRequest;
 
@@ -210,23 +234,44 @@ const makeSignalContext = ({
   endpointInfo = buildEndpoint.query(String).exec(() => "ok"),
   request = makeHttpRequest(),
   adaptor = new (adapt("signalTestContextAdaptor"))(),
-  live = makeLiveRegistry(),
+  live = getDefaultLiveRegistry(),
   middlewareMap = new Map(),
+  registry = getDefaultInjectRegistry(),
 }: {
-  endpointInfo?: ReturnType<typeof buildEndpoint.query>;
+  endpointInfo?: EndpointInfo;
   request?: Bun.BunRequest;
   adaptor?: InstanceType<ReturnType<typeof adapt>>;
   live?: LiveRegistry;
   middlewareMap?: Map<string, typeof GlobalMiddleware>;
+  registry?: InjectRegistry;
 } = {}) =>
   new SignalContext("contextKey", request, {
     endpointInfo,
     adaptor,
-    registry: getDefaultInjectRegistry(),
+    registry,
     env: {} as never,
     live,
     middleware: middlewareMap,
   });
+
+class FakeCacheAdaptor {
+  readonly store = new Map<string, string>();
+  async get<T>(topic: string, key: string) {
+    return this.store.get(`${topic}:${key}`) as T | undefined;
+  }
+  async set(topic: string, key: string, value: string | number | Buffer) {
+    this.store.set(`${topic}:${key}`, String(value));
+  }
+  async delete(topic: string, key: string) {
+    this.store.delete(`${topic}:${key}`);
+  }
+}
+
+const makeCacheRegistry = (cache: FakeCacheAdaptor) => {
+  const registry = getDefaultInjectRegistry();
+  registry.adaptor.set(CacheAdaptorRole as never, cache as never);
+  return registry;
+};
 
 describe("signal metadata builders", () => {
   test("builds endpoint metadata, paths, nullable search args, and validation errors", () => {
@@ -250,7 +295,7 @@ describe("signal metadata builders", () => {
       ["search", "tags", 1, true],
       ["body", "input", 0, true],
     ]);
-    expect(endpointInfo.returns.returnRef).toBe(SignalTestFull);
+    expect(endpointInfo.returns.returnRef as unknown).toBe(SignalTestFull);
     expect(endpointInfo.returns.arrDepth).toBe(1);
     expect(endpointInfo.returns.nullable).toBe(true);
     expect(endpointInfo.signalOption.partial).toEqual(["title"]);
@@ -272,7 +317,8 @@ describe("signal metadata builders", () => {
   test("builds slice metadata with query, internal args, and nullable search args", () => {
     const sliceInfo = buildSlice(
       "signalTestItem",
-      SignalTestInput,
+      // A `via()` input does not line up with the `Input` `buildSlice` infers, as in `DatabaseRegistry.buildModel`.
+      SignalTestInput as unknown as Parameters<typeof buildSlice>[1],
       SignalTestFull,
       SignalTestLight,
       SignalTestInsight,
@@ -295,7 +341,7 @@ describe("signal metadata builders", () => {
     expect(() =>
       buildSlice(
         "signalTestItem",
-        SignalTestInput,
+        SignalTestInput as unknown as Parameters<typeof buildSlice>[1],
         SignalTestFull,
         SignalTestLight,
         SignalTestInsight,
@@ -374,8 +420,33 @@ describe("signal class factories and composition", () => {
     expect(MainEndpoint[ENDPOINT_META].getTitle?.args[0]?.name).toBe("id");
     expect(MainEndpoint[ENDPOINT_META].publish?.type).toBe("pubsub");
     expect(Object.keys(MainEndpoint.srv.srvMap).sort()).toEqual(["signalTestAuxService", "signalTestItemService"]);
-    expect(MainEndpoint[INJECT_META].signalTestItemService.type).toBe("service");
-    expect(MainEndpoint[INJECT_META].signalTestAuxService.type).toBe("service");
+    const mainInjects = MainEndpoint[INJECT_META] as Record<string, { type: string }>;
+    expect(mainInjects.signalTestItemService?.type).toBe("service");
+    expect(mainInjects.signalTestAuxService?.type).toBe("service");
+  });
+
+  test("names a query's body argument at declaration, since fetch sends a query as GET without a body", () => {
+    const entries: LoggerSinkEntry[] = [];
+    const removeSink = Logger.addSink((entry) => void entries.push(entry), { minLevel: "warn" });
+    try {
+      class QueryBodyEndpoint extends endpoint(ServiceModel.from(SignalTestAuxService), (builder) => ({
+        lookup: builder
+          .query(String)
+          .body("filter", String)
+          .exec((filter) => filter),
+        save: builder
+          .mutation(String)
+          .body("data", String)
+          .exec((data) => data),
+      })) {}
+      expect(Object.keys(QueryBodyEndpoint[ENDPOINT_META]).sort()).toEqual(["lookup", "save"]);
+      const warnings = entries.map((entry) => entry.message).filter((message) => message.includes("never arrives"));
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toContain("signalTestAux.lookup");
+      expect(warnings[0]).toContain('"filter"');
+    } finally {
+      removeSink();
+    }
   });
 
   test("creates internal classes and merges lib internals", () => {
@@ -396,8 +467,8 @@ describe("signal class factories and composition", () => {
     expect(MainInternal[INTERNAL_META].hourly?.signalOption.scheduleType).toBe("cron");
     expect(MainInternal[INTERNAL_META].auxProcess?.type).toBe("process");
     expect(Object.keys(MainInternal.srv.srvMap).sort()).toEqual(["signalTestAuxService", "signalTestItemService"]);
-    expect(MainInternal[INJECT_META].schedule.type).toBe("plug");
-    expect(MainInternal[INJECT_META].queue.type).toBe("plug");
+    expect((MainInternal[INJECT_META] as unknown as Record<string, { type: string }>).schedule?.type).toBe("plug");
+    expect((MainInternal[INJECT_META] as unknown as Record<string, { type: string }>).queue?.type).toBe("plug");
   });
 
   test("creates slice classes with default root slice, guards, and lib slice metadata", () => {
@@ -423,12 +494,48 @@ describe("signal class factories and composition", () => {
     ) {}
 
     expect(Object.keys(MainSlice[SLICE_META]).sort()).toEqual(["", "byOwner", "libOwner"]);
-    expect(MainSlice[SLICE_META][""]?.args[0]?.name).toBe("query");
-    expect(MainSlice[SLICE_META][""]?.args[0]?.option?.nullable).toBe(true);
+    expect(MainSlice[SLICE_META][""]?.args.map((arg) => arg.name)).toEqual(["queryKey", "args"]);
+    expect(MainSlice[SLICE_META][""]?.args.every((arg) => arg.option?.nullable)).toBe(true);
     expect(MainSlice.getGuards.map((guard) => guard.name)).toEqual(["Public", "None"]);
     expect(MainSlice.cruGuards.map((guard) => guard.name)).toEqual(["TestAdmin"]);
     expect(Object.keys(MainSlice.srv.srvMap).sort()).toEqual(["signalTestAuxService", "signalTestItemService"]);
     expect(() => slice(ServiceModel.from(SignalTestAuxService), {}, () => ({}))).toThrow("cnst and db are required");
+  });
+
+  test("keeps an app's own root and named slices over a lib's, so the app's filter keys resolve", () => {
+    class AppFilter extends from(
+      SignalTestFull,
+      (filter) => ({
+        query: { inReview: filter().query(() => ({ title: "review" })) },
+        sort: {},
+      }),
+      SignalTestFilter,
+    ) {}
+    const appServiceModel = ServiceModel.fromModel(SignalTestService, signalTestConstant, {
+      ...signalTestDatabase,
+      filter: AppFilter as unknown as typeof SignalTestFilter,
+    });
+    const libInOwner = (ownerId: string) => ({ ownerId, from: "lib" });
+    const appInOwner = (ownerId: string) => ({ ownerId, from: "app" });
+    class LibSlice extends slice(signalTestServiceModel, { guards: { root: Public } }, (init) => ({
+      inOwner: init().param("ownerId", ID).exec(libInOwner),
+      libOnly: init().exec(() => ({})),
+    })) {}
+    class AppSlice extends slice(
+      appServiceModel,
+      { guards: { root: TestAdmin } },
+      (init) => ({
+        inOwner: init().param("ownerId", ID).exec(appInOwner),
+      }),
+      LibSlice,
+    ) {}
+
+    const resolveRoot = AppSlice[SLICE_META][""]?.execFn as (queryKey: string, args: unknown[]) => unknown;
+    expect(resolveRoot("inReview", [])).toEqual({ title: "review" });
+    expect(resolveRoot("byOwner", ["507f1f77bcf86cd799439011"])).toEqual({ ownerId: "507f1f77bcf86cd799439011" });
+    expect(AppSlice[SLICE_META][""]?.signalOption.guards?.map((guard) => guard.name)).toEqual(["TestAdmin"]);
+    expect(AppSlice[SLICE_META].inOwner?.execFn).toBe(appInOwner);
+    expect(Object.keys(AppSlice[SLICE_META]).sort()).toEqual(["", "inOwner", "libOnly"]);
   });
 });
 
@@ -464,6 +571,21 @@ describe("signal serialization and registry", () => {
   ) {}
   class RegistryServerSignal extends serverSignal(RegistryEndpoint, RegistryInternal) {}
 
+  test("resolves the mcp map the way it resolves the guards map, and ships only what is off", () => {
+    class McpSlice extends slice(
+      signalTestServiceModel,
+      { guards: { root: Public, get: Public, cru: Public }, mcp: { cru: false, update: true, root: false } },
+      (init) => ({}),
+    ) {}
+    expect(McpSlice.mcp).toEqual({ get: true, create: false, update: true, remove: false });
+    const serialized = FetchSerializer.serializeDatabaseSignal(McpSlice, RegistryEndpoint);
+    expect(serialized.mcp).toEqual({ create: false, remove: false });
+    expect(serialized.slice?.[""]?.mcp).toBe(false);
+
+    class QuietSlice extends slice(signalTestServiceModel, { guards: { root: Public }, mcp: false }, () => ({})) {}
+    expect(QuietSlice.mcp).toEqual({ get: false, create: false, update: false, remove: false });
+  });
+
   test("serializes database and service signals", () => {
     const databaseSignal = FetchSerializer.serializeDatabaseSignal(RegistrySlice, RegistryEndpoint);
     const serviceEndpoint = endpoint(ServiceModel.from(SignalTestAuxService), (builder) => ({
@@ -475,7 +597,7 @@ describe("signal serialization and registry", () => {
     expect(databaseSignal.slice?.byOwner?.args[0]).toMatchObject({ type: "param", name: "ownerId", refName: "ID" });
     expect(databaseSignal.endpoint.list).toMatchObject({
       type: "query",
-      path: "items/list",
+      path: "/signalTestItem/items/list",
       guards: ["Public"],
       returns: { refName: "signalTestItem", modelType: "light", arrDepth: 1, partial: ["title"] },
     });
@@ -491,6 +613,17 @@ describe("signal serialization and registry", () => {
       modelType: "full",
       nullable: true,
     });
+    expect(databaseSignal.filter?.sortKeys).toEqual(["latest", "oldest", "relevance", "titleAsc"]);
+    expect(databaseSignal.filter?.filter.byOwner).toEqual([
+      { type: "search", refName: "ID", name: "ownerId", ref: "user" },
+    ]);
+    expect(databaseSignal.slice?.[""]?.args[0]).toEqual({
+      type: "search",
+      refName: "String",
+      name: "queryKey",
+      nullable: true,
+      oneOf: ["any", "byOwner"],
+    });
     expect(databaseSignal.getGuards).toBeUndefined();
     expect(databaseSignal.cruGuards).toBeUndefined();
     expect(serviceSignal).toEqual({
@@ -498,6 +631,18 @@ describe("signal serialization and registry", () => {
         ping: { type: "query", args: [], returns: { refName: "String" } },
       },
     });
+  });
+
+  test("serializes a declared timeout so the client can size its own request budget", () => {
+    const TimedEndpoint = endpoint(ServiceModel.from(SignalTestAuxService), (builder) => ({
+      provision: builder.mutation(String, { guards: [Public], timeout: 300_000 }).exec(() => "done"),
+      ping: builder.query(String).exec(() => "pong"),
+    }));
+
+    const serialized = FetchSerializer.serializeServiceSignal(TimedEndpoint);
+
+    expect(serialized.endpoint.provision?.timeout).toBe(300_000);
+    expect(serialized.endpoint.ping).not.toHaveProperty("timeout");
   });
 
   test("registers signals and serializes live registry", () => {
@@ -519,7 +664,7 @@ describe("signal serialization and registry", () => {
       ServiceEndpoint,
       ServiceServer,
     );
-    const live = makeLiveRegistry();
+    const live = getDefaultLiveRegistry();
     live.endpointCls.set("signalTestItem", RegistryEndpoint);
     live.sliceCls.set("signalTestItem", RegistrySlice);
     live.endpointCls.set("signalTestAux", ServiceEndpoint);
@@ -540,7 +685,7 @@ describe("signal serialization and registry", () => {
       ),
     ).toThrow('Signal base mismatch: endpoint uses "signalTestAux", but registry expected "signalTestItem"');
 
-    const brokenLive = makeLiveRegistry();
+    const brokenLive = getDefaultLiveRegistry();
     brokenLive.endpointCls.set("signalTestItem", RegistryEndpoint);
     expect(() => FetchSerializer.serializeRegistry(brokenLive)).toThrow(
       'No slice found for service signal "signalTestItem"',
@@ -563,7 +708,7 @@ describe("signal serialization and registry", () => {
 
     expect(Object.keys(SignalRef[ENDPOINT_META])).toEqual(["publishItem"]);
     expect(Object.keys(SignalRef[INTERNAL_META])).toEqual(["queueItem"]);
-    expect(SignalRef[INJECT_META].queue.type).toBe("plug");
+    expect((SignalRef[INJECT_META] as unknown as Record<string, { type: string }>).queue?.type).toBe("plug");
   });
 });
 
@@ -575,7 +720,7 @@ describe("SignalContext execution", () => {
       .search("ids", [ID])
       .search("maybe", String)
       .body("title", String)
-      .exec((id, ids, maybe, title) => `${id}:${ids.join(",")}:${maybe ?? "none"}:${title}`);
+      .exec((id, ids, maybe, title) => `${id}:${(ids ?? []).join(",")}:${maybe ?? "none"}:${title}`);
     const context = makeSignalContext({
       endpointInfo,
       request: makeHttpRequest({
@@ -599,6 +744,44 @@ describe("SignalContext execution", () => {
     );
   });
 
+  test("parses boolean search args sent as query text", async () => {
+    const endpointInfo = buildEndpoint
+      .query(String)
+      .search("archived", Boolean)
+      .exec((archived) => `archived:${String(archived)}`);
+    const context = makeSignalContext({
+      endpointInfo,
+      request: makeHttpRequest({ url: "http://localhost/items?archived=true" }),
+    });
+
+    await context.init();
+    const response = (await context.exec()) as Response;
+
+    expect(context.args).toEqual([true]);
+    expect(await response.json()).toBe("archived:true");
+  });
+
+  test("parses an Any search arg as the JSON the query string carries", async () => {
+    const endpointInfo = buildEndpoint
+      .query(String)
+      .search("args", Any)
+      .exec((args) => JSON.stringify(args));
+    const contextOf = (url: string) => makeSignalContext({ endpointInfo, request: makeHttpRequest({ url }) });
+
+    const context = contextOf(`http://localhost/items?args=${encodeURIComponent('["Alpha",7]')}`);
+    await context.init();
+    expect(context.args).toEqual([["Alpha", 7]]);
+    expect(await ((await context.exec()) as Response).json()).toBe('["Alpha",7]');
+
+    const empty = contextOf("http://localhost/items");
+    await empty.init();
+    expect(empty.args).toEqual([null]);
+
+    const malformed = contextOf("http://localhost/items?args=not-json");
+    // `SignalContext.try` wraps init at the route, so a bad value answers 400 instead of a 500.
+    await expect(malformed.init()).rejects.toMatchObject({ message: 'Invalid JSON in "args"', statusCode: 400 });
+  });
+
   test("parses websocket message and pubsub room args", async () => {
     const messageInfo = buildEndpoint
       .message(String)
@@ -610,7 +793,7 @@ describe("SignalContext execution", () => {
       .room("roomId", String)
       .exec(() => undefined);
     const wsReq = {
-      ws: { id: "ws-1" },
+      ws: { id: "ws-1", data: { socketId: "socket-1" } },
       data: ["hello"],
       eventType: "message",
     } as never;
@@ -619,18 +802,18 @@ describe("SignalContext execution", () => {
       adaptor: new (adapt("signalTestWsAdaptor"))(),
       registry: getDefaultInjectRegistry(),
       env: {} as never,
-      live: makeLiveRegistry(),
+      live: getDefaultLiveRegistry(),
       middleware: new Map(),
     });
     const pubsubContext = new SignalContext(
       "roomKey",
-      { ws: { id: "ws-2" }, data: ["room-1"], eventType: "subscribe" } as never,
+      { ws: { id: "ws-2", data: { socketId: "socket-2" } }, data: ["room-1"], eventType: "subscribe" } as never,
       {
         endpointInfo: pubsubInfo,
         adaptor: new (adapt("signalTestPubsubAdaptor"))(),
         registry: getDefaultInjectRegistry(),
         env: {} as never,
-        live: makeLiveRegistry(),
+        live: getDefaultLiveRegistry(),
         middleware: new Map(),
       },
     );
@@ -642,6 +825,68 @@ describe("SignalContext execution", () => {
     expect(messageContext.internalArgs).toEqual([]);
     expect(pubsubContext.args).toEqual(["room-1"]);
     expect(pubsubContext.getRoomId("roomKey")).toBe("roomKey-room-1");
+  });
+
+  test("hands a message handler the socket id minted at the handshake", async () => {
+    const endpointInfo = buildEndpoint
+      .message(String)
+      .msg("text", String)
+      .with(Ws)
+      .exec((text, ws) => `${text}:${ws.socketId}`);
+    const context = new SignalContext(
+      "messageKey",
+      { ws: { data: { socketId: "socket-1" } }, data: ["hello"], eventType: "message" } as never,
+      {
+        endpointInfo,
+        adaptor: new (adapt("signalTestWsSocketIdAdaptor"))(),
+        registry: getDefaultInjectRegistry(),
+        env: {} as never,
+        live: getDefaultLiveRegistry(),
+        middleware: new Map(),
+      },
+    );
+
+    await context.init();
+    const result = (await context.exec()) as unknown as string;
+
+    expect(result).toBe("hello:socket-1");
+  });
+
+  test("registers ws cleanup through the detached on/off the Ws arg hands out", async () => {
+    const cleaned: string[] = [];
+    const endpointInfo = buildEndpoint
+      .pubsub(String)
+      .room("roomId", String)
+      .with(Ws)
+      .exec((roomId, ws) => {
+        const remove = () => {
+          cleaned.push(`removed:${roomId as string}`);
+        };
+        ws.on("disconnect", remove);
+        ws.on("unsubscribe", remove);
+        ws.off("unsubscribe", remove);
+      });
+    const context = new SignalContext(
+      "roomKey",
+      { ws: { data: { socketId: "socket-1" } }, data: ["room-1"], eventType: "subscribe" } as never,
+      {
+        endpointInfo,
+        adaptor: new (adapt("signalTestWsLifecycleAdaptor"))(),
+        registry: getDefaultInjectRegistry(),
+        env: {} as never,
+        live: getDefaultLiveRegistry(),
+        middleware: new Map(),
+      },
+    );
+
+    await context.init();
+    await context.exec();
+
+    const wsCtx = context.getWebSocketContext();
+    expect(wsCtx.onDisconnect.size).toBe(1);
+    expect(wsCtx.onUnsubscribe.size).toBe(0);
+    for (const handler of wsCtx.onDisconnect) await handler();
+    expect(cleaned).toEqual(["removed:room-1"]);
   });
 
   test("runs guards, internal args, and middleware in order", async () => {
@@ -669,6 +914,124 @@ describe("SignalContext execution", () => {
       "endpoint:after",
       "global:after",
     ]);
+  });
+
+  test("bounds an endpoint that declared a timeout, and stands aside for one that did not", async () => {
+    const slowExec = async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      return "late";
+    };
+    const boundedInfo = buildEndpoint.query(String, { guards: [Public], timeout: 5 }).exec(slowExec);
+    const unboundedInfo = buildEndpoint.query(String, { guards: [Public] }).exec(slowExec);
+    const adaptor = new (adapt("signalTestTimeoutAdaptor"))();
+    const middlewareMap = new Map([["timeout", Timeout]]) as never;
+
+    const bounded = (await SignalContext.try(adaptor, boundedInfo, "bounded", async () => {
+      const context = makeSignalContext({ endpointInfo: boundedInfo, adaptor, middlewareMap });
+      await context.init();
+      return (await context.exec()) as Response;
+    })) as Response;
+    const unboundedContext = makeSignalContext({ endpointInfo: unboundedInfo, adaptor, middlewareMap });
+    await unboundedContext.init();
+    const unbounded = (await unboundedContext.exec()) as Response;
+
+    expect(bounded.status).toBe(504);
+    expect(await bounded.json()).toMatchObject({ error: "base.error.gatewayTimeout", statusCode: 504 });
+    expect(await unbounded.json()).toBe("late");
+  });
+
+  test("clears the deadline of a call that answered in time", async () => {
+    const info = buildEndpoint.query(String, { guards: [Public], timeout: 60_000 }).exec(() => "ok");
+    const context = makeSignalContext({
+      endpointInfo: info,
+      middlewareMap: new Map([["timeout", Timeout]]) as never,
+    });
+    const originalClearTimeout = globalThis.clearTimeout;
+    let cleared = 0;
+    globalThis.clearTimeout = ((id?: number | Timer) => {
+      cleared++;
+      originalClearTimeout(id);
+    }) as typeof clearTimeout;
+
+    try {
+      await context.init();
+      expect(await ((await context.exec()) as Response).json()).toBe("ok");
+    } finally {
+      globalThis.clearTimeout = originalClearTimeout;
+    }
+    expect(cleared).toBeGreaterThan(0);
+  });
+
+  test("serves a declared cache only after the guards admitted a caller the middleware resolved", async () => {
+    let runs = 0;
+    let passes = 0;
+    class SignedInOnly implements Guard {
+      static name = "SignedInOnly";
+      static scope: GuardScope = "account";
+      canPass(context: SignalContext) {
+        passes++;
+        return context.get<{ id?: string }>("account")?.id === "user-1";
+      }
+    }
+    class ResolveAccount extends middleware("signalTestResolveAccount") {
+      override async use() {
+        return async (context: SignalContext, next: () => Promise<unknown>) => {
+          Object.assign(context.getHttpContext().req, { account: { id: "user-1" } });
+          return await next();
+        };
+      }
+    }
+    const info = buildEndpoint.query(String, { guards: [SignedInOnly], cache: 60_000 }).exec(() => {
+      runs++;
+      return `run-${runs}`;
+    });
+    const adaptor = new (adapt("signalTestCacheAdaptor"))();
+    const cache = new FakeCacheAdaptor();
+    const call = async (middlewareMap: Map<string, typeof GlobalMiddleware>) =>
+      (await SignalContext.try(adaptor, info, "cached", async () => {
+        const context = makeSignalContext({
+          endpointInfo: info,
+          adaptor,
+          middlewareMap,
+          registry: makeCacheRegistry(cache),
+        });
+        await context.init();
+        return (await context.exec()) as Response;
+      })) as Response;
+    const signedIn = new Map([["resolveAccount", ResolveAccount]]) as never;
+
+    expect(await (await call(signedIn)).json()).toBe("run-1");
+    expect(await (await call(signedIn)).json()).toBe("run-1");
+    expect((await call(new Map())).status).toBe(403);
+    expect(runs).toBe(1);
+    expect(passes).toBe(3);
+  });
+
+  test("refuses a cache on a mutation and on a query that takes an internal argument", async () => {
+    let mutations = 0;
+    const mutationInfo = buildEndpoint.mutation(String, { guards: [Public], cache: 60_000 }).exec(() => {
+      mutations++;
+      return `mutation-${mutations}`;
+    });
+    const perCallerInfo = buildEndpoint
+      .query(String, { guards: [Public], cache: 60_000 })
+      .with(TestInternalArg)
+      .exec((internalValue) => internalValue);
+    const cache = new FakeCacheAdaptor();
+    const call = async (endpointInfo: EndpointInfo) => {
+      const context = makeSignalContext({
+        endpointInfo,
+        request: makeHttpRequest({ body: {} }),
+        registry: makeCacheRegistry(cache),
+      });
+      await context.init();
+      return await ((await context.exec()) as Response).json();
+    };
+
+    expect(await call(mutationInfo)).toBe("mutation-1");
+    expect(await call(mutationInfo)).toBe("mutation-2");
+    expect(await call(perCallerInfo)).toBe("internal-value");
+    expect(cache.store.size).toBe(0);
   });
 
   test("reports guard and internal argument failures through HTTP responses", async () => {
@@ -711,8 +1074,53 @@ describe("SignalContext execution", () => {
     expect(await nullableResponse.json()).toBe("nullable");
   });
 
+  test("forwards a rethrown remote failure instead of generalizing it to a 500", async () => {
+    // What `restoreRemoteError` hands a server process that calls another with `{ origin }` and rethrows.
+    const remote = Object.assign(new Error("signalTest.error.applyTimeout"), {
+      statusCode: 400,
+      toJSON: () => ({ error: "signalTest.error.applyTimeout", statusCode: 400, data: { timeout: 3000 } }),
+    });
+    const endpointInfo = buildEndpoint.query(String).exec(() => {
+      throw remote;
+    });
+    const adaptor = new (adapt("signalTestRemoteAdaptor"))();
+
+    const response = (await SignalContext.try(adaptor, endpointInfo, "remote", async () => {
+      const context = makeSignalContext({ endpointInfo, adaptor });
+      await context.init();
+      return (await context.exec()) as Response;
+    })) as Response;
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({
+      error: "signalTest.error.applyTimeout",
+      statusCode: 400,
+      data: { timeout: 3000 },
+    });
+  });
+
+  test("answers null when a nullable endpoint returns nothing, and names an endpoint that may not", async () => {
+    const run = async (endpointInfo: EndpointInfo) => {
+      const adaptor = new (adapt("signalTestUndefinedAdaptor"))();
+      return (await SignalContext.try(adaptor, endpointInfo, "finishTime", async () => {
+        const context = makeSignalContext({ endpointInfo, adaptor });
+        await context.init();
+        return (await context.exec()) as Response;
+      })) as Response;
+    };
+    const nullablePrimitive = await run(buildEndpoint.query(Date, { nullable: true }).exec(() => undefined as never));
+    const nullableAny = await run(buildEndpoint.query(Any).exec(() => undefined as never));
+    const required = await run(buildEndpoint.query(Date).exec(() => undefined as never));
+
+    expect(nullablePrimitive.status).toBe(200);
+    expect(await nullablePrimitive.json()).toBeNull();
+    expect(nullableAny.status).toBe(200);
+    expect(await nullableAny.json()).toBeNull();
+    expect(required.status).toBe(500);
+  });
+
   test("passes through raw Response results", async () => {
-    const endpointInfo = buildEndpoint.query(Response as never).exec(() => Response.json({ ok: true }));
+    const endpointInfo = buildEndpoint.query(Response as never).exec(() => Response.json({ ok: true }) as never);
     const context = makeSignalContext({ endpointInfo });
 
     await context.init();
@@ -866,7 +1274,7 @@ describe("SignalContext guards", () => {
 
 describe("SignalContext return resolution", () => {
   test("resolves primitives, arrays, hidden fields, scalar fields, nested documents, and resolve fields", async () => {
-    const live = makeLiveRegistry();
+    const live = getDefaultLiveRegistry();
     const relatedService = {
       __load: async (id: string) => ({
         toJSON: () => ({ id, title: `related:${id}` }),
@@ -879,7 +1287,7 @@ describe("SignalContext return resolution", () => {
     class ResolveInternal extends internal(signalTestServiceModel, (builder) => ({
       resolvedLabel: builder.resolveField(String).exec((parent) => `resolved:${(parent as { title: string }).title}`),
     })) {}
-    live.service.set("signalTestRelated", relatedService);
+    live.service.set("signalTestRelated", relatedService as unknown as Service);
     live.internal.set("signalTestItemInternal", new ResolveInternal() as unknown as Internal);
 
     const resolved = await SignalContext.resolveReturn(
@@ -935,6 +1343,64 @@ describe("SignalContext return resolution", () => {
     expect(resolvedArray).toEqual([
       [{ title: "A", nested: { label: "N" }, relatedIds: [], resolvedLabel: "resolved:A" }],
     ]);
+  });
+
+  test("loads and walks a relation once per response, however many rows name it", async () => {
+    const loaded: string[] = [];
+    const live = getDefaultLiveRegistry();
+    live.service.set("signalTestRelated", {
+      __load: async (id: string) => {
+        loaded.push(id);
+        return { toJSON: () => ({ id, title: `related:${id}` }) };
+      },
+    } as unknown as Service);
+    const resolveHolders = async () =>
+      (await SignalContext.resolveReturn(
+        [
+          { label: "a", related: "rel-1", relateds: ["rel-1", "rel-2"], requiredRelated: "rel-1" },
+          { label: "b", related: "rel-1", relateds: ["rel-2"], requiredRelated: "rel-2" },
+        ],
+        {
+          signalContext: null,
+          returnRef: SignalTestHolderFull,
+          arrDepth: 1,
+          registry: getDefaultInjectRegistry(),
+          live,
+        },
+      )) as { related: unknown; relateds: unknown[]; requiredRelated: unknown }[];
+
+    const holders = await resolveHolders();
+
+    expect(loaded.toSorted((a, b) => a.localeCompare(b))).toEqual(["rel-1", "rel-2"]);
+    expect(holders[0].related).toMatchObject({ id: "rel-1", title: "related:rel-1" });
+    expect(holders[0].related).toBe(holders[1].related);
+    expect(holders[0].relateds[0]).toBe(holders[0].related);
+    expect(holders[1].requiredRelated).toBe(holders[0].relateds[1]);
+
+    await resolveHolders();
+    expect(loaded).toHaveLength(4);
+  });
+
+  test("refuses a missing document for a non-nullable relation even when a nullable one cached the miss", async () => {
+    const live = getDefaultLiveRegistry();
+    live.service.set("signalTestRelated", {
+      __load: async () => null,
+    } as unknown as Service);
+    const resolveHolder = async (holder: object) =>
+      await SignalContext.resolveReturn(holder, {
+        signalContext: null,
+        returnRef: SignalTestHolderFull,
+        arrDepth: 0,
+        registry: getDefaultInjectRegistry(),
+        live,
+      });
+
+    await expect(resolveHolder({ label: "a", related: "gone", relateds: [], requiredRelated: "gone" })).rejects.toThrow(
+      "Document gone is not found",
+    );
+    await expect(resolveHolder({ label: "a", related: "gone", relateds: [], requiredRelated: null })).rejects.toThrow(
+      "Document null is not found",
+    );
   });
 
   test("loadNested handles nullable and non-nullable missing documents", async () => {
@@ -1020,7 +1486,9 @@ describe("representative signal usage regressions", () => {
       .query(String, { path: "wsl/homes/:dongho/erv", prefix: false })
       .param("dongho", String)
       .exec((dongho) => dongho);
-    const wildcard = buildEndpoint.query(Response as never, { path: "localFile/getBlob/*" }).exec(() => new Response());
+    const wildcard = buildEndpoint
+      .query(Response as never, { path: "localFile/getBlob/*" })
+      .exec(() => new Response() as never);
     const processInternal = buildInternal
       .process(Boolean, { serverMode: "all" })
       .msg("force", Boolean)
@@ -1069,7 +1537,7 @@ describe("SignalContext websocket authorization", () => {
       adaptor: new (adapt("signalTestWsGuardAdaptor"))(),
       registry: getDefaultInjectRegistry(),
       env: {} as never,
-      live: makeLiveRegistry(),
+      live: getDefaultLiveRegistry(),
       middleware: middlewareMap as never,
     });
 
@@ -1155,5 +1623,32 @@ describe("SignalContext websocket authorization", () => {
 
     expect(await context.authorize()).toBe(true);
     expect(signalTestOrder).toEqual(["global:before", "global:after"]);
+  });
+});
+
+describe("SignalContext caller address", () => {
+  afterEach(() => SignalContext.setHttpPeerResolver(null));
+
+  test("prefers a proxy's header over the socket peer", () => {
+    SignalContext.setHttpPeerResolver(() => ({ address: "10.0.0.9", port: 55_000 }));
+    const context = makeSignalContext({
+      request: makeHttpRequest({ headers: { "x-real-ip": "203.0.113.7", "x-forwarded-port": "443" } }),
+    });
+    expect(context.getClientIp()).toBe("203.0.113.7");
+    expect(context.getClientPort()).toBe(443);
+  });
+
+  test("falls back to the socket peer when nothing proxied the call", () => {
+    SignalContext.setHttpPeerResolver(() => ({ address: "::ffff:198.51.100.4", port: 44_100 }));
+    const context = makeSignalContext({ request: makeHttpRequest() });
+    // Unwrapped from its IPv4-mapped form, so it can address a socket as well as identify a caller.
+    expect(context.getClientIp()).toBe("198.51.100.4");
+    expect(context.getClientPort()).toBe(44_100);
+  });
+
+  test("is null rather than a placeholder when there is no header and no peer", () => {
+    const context = makeSignalContext({ request: makeHttpRequest() });
+    expect(context.getClientIp()).toBeNull();
+    expect(context.getClientPort()).toBeNull();
   });
 });

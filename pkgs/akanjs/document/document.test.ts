@@ -18,6 +18,7 @@ import {
   DocumentSchema,
   documentQueryHelper,
   encodeDocumentValue,
+  FilterQueryError,
   fillMissingFilterArgs,
   from,
   getFilterInfoByKey,
@@ -27,8 +28,10 @@ import {
   into,
   isDocumentId,
   type ModelCls,
+  resolveFilterQuery,
   type SchemaOf,
   sanitizeJson,
+  splitFilterArgs,
 } from ".";
 
 type Equal<Left, Right> =
@@ -117,6 +120,7 @@ const DocumentTestModelMixinRef = DocumentTestModelMixin as unknown as ModelCls<
 const DocumentTestItemInputRef = DocumentTestItemInput as unknown as DatabaseCls<
   InstanceType<typeof DocumentTestItemInput>
 >;
+class DocumentTestItemInsightDoc extends by(DocumentTestItemInsight) {}
 
 class LibFilter extends from(DocumentTestItemFull, (makeFilter) => ({
   query: {
@@ -265,6 +269,8 @@ const documentAppClassUserModelInfo = ConstantRegistry.buildModel(
     DocumentAppClassUserInsight,
   },
 );
+// `by` resolves the refName from ConstantRegistry, so an insight doc class cannot precede its buildModel call.
+class DocumentAppClassUserInsightDoc extends by(DocumentAppClassUserInsight) {}
 class DocumentAppClassUserDoc extends by(DocumentAppClassUser) {
   setEducation(education: string | undefined) {
     this.set({ education });
@@ -284,7 +290,7 @@ const documentAppClassUserDatabase = DatabaseRegistry.buildModel(
   DocumentAppClassUserDoc,
   DocumentAppClassUserModel,
   DocumentAppClassUserObject,
-  DocumentAppClassUserInsight,
+  DocumentAppClassUserInsightDoc,
   DocumentAppClassUserFilter,
 );
 const DocumentNoActionDocRef = class DocumentNoActionDoc {} as unknown as DatabaseCls<Record<string, never>>;
@@ -448,6 +454,56 @@ describe("by, from, into, and DatabaseRegistry", () => {
     });
   });
 
+  test("splits a trailing query option from the filter's own args", () => {
+    const byTitle = getFilterInfoByKey(DocumentTestFilter, "byTitle");
+
+    // The args are spread into the filter function, so an option read as an arg lands in a filter slot and
+    // changes the query. Every key naming a query option is the test — the values may all be null or absent.
+    expect(splitFilterArgs(byTitle, ["Alpha", { sample: 2 }])).toEqual({
+      queryArgs: ["Alpha", undefined],
+      queryOption: { sample: 2 },
+    });
+    expect(splitFilterArgs(byTitle, ["Alpha", { sort: null, limit: null }]).queryArgs).toEqual(["Alpha", undefined]);
+    expect(splitFilterArgs(byTitle, ["Alpha", {}]).queryArgs).toEqual(["Alpha", undefined]);
+    expect(splitFilterArgs(byTitle, ["Alpha", true, { limit: 5 }])).toEqual({
+      queryArgs: ["Alpha", true],
+      queryOption: { limit: 5 },
+    });
+
+    // A filter arg is a scalar, a date, an id or an array — never a bare object of option keys.
+    expect(splitFilterArgs(byTitle, ["Alpha", true]).queryArgs).toEqual(["Alpha", true]);
+    expect(splitFilterArgs(byTitle, ["Alpha", []]).queryArgs).toEqual(["Alpha", []]);
+    expect(splitFilterArgs(byTitle, ["Alpha", new Date(0)]).queryArgs).toEqual(["Alpha", new Date(0)]);
+    expect(splitFilterArgs(byTitle, ["Alpha", dayjs(0)]).queryArgs).toEqual(["Alpha", dayjs(0)]);
+    expect(splitFilterArgs(byTitle, ["Alpha", null]).queryArgs).toEqual(["Alpha", null]);
+  });
+
+  test("compiles a query key and its args into the filter's own query", () => {
+    expect(resolveFilterQuery(DocumentTestFilter, "byTitle", ["Alpha", true])).toEqual({
+      kind: "all",
+      queries: [{ title: "Alpha" }, { archived: true }],
+    });
+    // No key at all is the `any` filter every model carries, which is what a listing with no filter picked means.
+    expect(resolveFilterQuery(DocumentTestFilter)).toEqual({ removedAt: { empty: true } });
+    // An omitted optional reaches the query as `undefined`, exactly as the other filter call paths pad it.
+    expect(resolveFilterQuery(DocumentTestFilter, "byTitle", ["Alpha"])).toEqual({
+      kind: "all",
+      queries: [{ title: "Alpha" }, {}],
+    });
+    // The declared type is what parses the value, so an id the wire spelled wrong is refused here.
+    expect(() => resolveFilterQuery(DocumentTestFilter, "byOwner", ["not-an-id"])).toThrow(
+      'Invalid filter argument "ownerId" for key: byOwner',
+    );
+    expect(() => resolveFilterQuery(DocumentTestFilter, "byTitle", [])).toThrow(
+      'Missing filter argument "title" for key: byTitle',
+    );
+    expect(() => resolveFilterQuery(DocumentTestFilter, "missing")).toThrow(FilterQueryError);
+    // Args past the ones the filter declared are dropped: the caller names a filter, never a query.
+    expect(resolveFilterQuery(DocumentTestFilter, "byOwner", ["1234567890abcdef12345678", "extra"])).toEqual({
+      ownerId: "1234567890abcdef12345678",
+    });
+  });
+
   test("executes filter query functions with document query helpers", () => {
     const byTitle = getFilterInfoByKey(DocumentTestFilter, "byTitle");
     const byOwner = getFilterInfoByKey(DocumentTestFilter, "byOwner");
@@ -467,6 +523,20 @@ describe("by, from, into, and DatabaseRegistry", () => {
     expect(insightFields.count.getProps().accumulate).toEqual({});
     expect(insightFields.highScoreCount.getProps().accumulate).toEqual({ score: { gte: 10 } });
     expect(insightFields.taggedCount.getProps().accumulate).toEqual({ tags: { oneOf: ["featured", "urgent"] } });
+  });
+
+  test("exposes typed insight and count query methods on an into model", () => {
+    const assertModelQueryMethods = async (model: DocumentTestModel) => {
+      const countByTitle: number = await model.countByTitle("Alpha", false);
+      const insightByOwner: DocumentModel<InstanceType<typeof DocumentTestItemInsight>> =
+        await model.insightByOwner("1234567890abcdef12345678");
+      const insight = await model.insightByTitle("Alpha", false);
+      // Arithmetic, not a computation: it fails to compile the moment the insight falls back to `unknown`.
+      const accumulated: number = insight.count + insight.highScoreCount + insight.taggedCount;
+      return { countByTitle, insightByOwner, accumulated };
+    };
+
+    expect(assertModelQueryMethods).toBeFunction();
   });
 
   test("exposes typed database query methods for filter keys", () => {
@@ -552,7 +622,7 @@ describe("by, from, into, and DatabaseRegistry", () => {
       DocumentTestDoc,
       DocumentTestModel,
       DocumentTestItemObject,
-      DocumentTestItemInsight,
+      DocumentTestItemInsightDoc,
       DocumentTestFilter,
     );
     const scalar = DatabaseRegistry.buildScalar("documentTestScalar", DocumentTestScalar);
@@ -851,12 +921,52 @@ describe("data loaders", () => {
     expect(batches).toEqual([["a", "b"]]);
   });
 
-  test("DataLoader cache can be cleared and primed", async () => {
+  test("DataLoader remembers nothing past its own batch unless a cache is declared", async () => {
     let calls = 0;
     const loader = new DataLoader<string, string>(async (keys) => {
       calls++;
       return keys.map((key) => `loaded:${key}`);
     });
+
+    await Promise.all([loader.load("a"), loader.load("a")]);
+    await loader.load("a");
+    loader.prime("a", "primed:a");
+    await expect(loader.load("a")).resolves.toBe("loaded:a");
+    expect(calls).toBe(3);
+  });
+
+  test("DataLoader keeps a key for the declared milliseconds and never keeps a failure", async () => {
+    let calls = 0;
+    let fail = true;
+    const loader = new DataLoader<string, string>(
+      async (keys) => {
+        calls++;
+        if (fail) throw new Error("store down");
+        return keys.map((key) => `loaded:${key}`);
+      },
+      { cache: 30 },
+    );
+
+    await expect(loader.load("a")).rejects.toThrow("store down");
+    fail = false;
+    await expect(loader.load("a")).resolves.toBe("loaded:a");
+    await expect(loader.load("a")).resolves.toBe("loaded:a");
+    expect(calls).toBe(2);
+
+    await Bun.sleep(40);
+    await expect(loader.load("a")).resolves.toBe("loaded:a");
+    expect(calls).toBe(3);
+  });
+
+  test("DataLoader cache can be cleared and primed", async () => {
+    let calls = 0;
+    const loader = new DataLoader<string, string>(
+      async (keys) => {
+        calls++;
+        return keys.map((key) => `loaded:${key}`);
+      },
+      { cache: true },
+    );
 
     await expect(loader.load("a")).resolves.toBe("loaded:a");
     await expect(loader.load("a")).resolves.toBe("loaded:a");

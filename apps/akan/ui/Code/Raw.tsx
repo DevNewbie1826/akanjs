@@ -1,19 +1,18 @@
 import { transformerNotationDiff, transformerNotationHighlight } from "@shikijs/transformers";
-import { clsx } from "akanjs/client";
-import type { BundledLanguage, BundledTheme, ShikiTransformer } from "shiki";
+import { cn } from "akanjs/client";
+import type { BundledLanguage, ShikiTransformer } from "shiki";
 import { createHighlighter } from "shiki";
 
 import { Shiki_Client } from "./Shiki_Client";
 
+// Dual theme: shiki emits per-token `--shiki-light`/`--shiki-dark` CSS variables (defaultColor: false)
+// instead of baking one theme's colors inline, so code blocks follow the app's [data-theme] switch.
+// The variable → color wiring lives in ./styles.css.
+const loadedLangs = ["typescript", "tsx", "bash", "yaml", "json", "markdown"] as const;
 const highlighter = createHighlighter({
   themes: ["github-light", "github-dark"],
-  langs: ["typescript", "bash"],
+  langs: [...loadedLangs],
 });
-
-const defaultThemes = {
-  light: "github-light",
-  dark: "github-dark",
-} as const satisfies Record<"light" | "dark", BundledTheme>;
 
 const transformerLineNumbers: ShikiTransformer = {
   line(node, line) {
@@ -26,16 +25,31 @@ const transformerLineNumbers: ShikiTransformer = {
   },
 };
 
-const transformerBashLine: ShikiTransformer = {
+//? a `$` only where a command starts: not on blank lines, comments, or the lines a trailing `\` continues
+const bashPromptLines = (code: string) => {
+  const lines = code.split("\n");
+  return new Set(
+    lines
+      .map((line, idx) => ({
+        text: line.trim(),
+        continued: (lines[idx - 1] ?? "").trimEnd().endsWith("\\"),
+        num: idx + 1,
+      }))
+      .filter(({ text, continued }) => text && !text.startsWith("#") && !continued)
+      .map(({ num }) => num),
+  );
+};
+
+const transformerBashLine = (promptLines: Set<number>): ShikiTransformer => ({
   line(node, line) {
     node.children.unshift({
       type: "element",
       tagName: "span",
-      properties: { class: "line-number" },
-      children: [{ type: "text", value: "$" }],
+      properties: { class: "line-number line-prompt" },
+      children: [{ type: "text", value: promptLines.has(line) ? "$" : "" }],
     });
   },
-};
+});
 
 const transformerLineData: ShikiTransformer = {
   line(node, line) {
@@ -81,17 +95,19 @@ const parseCollapseAnnotations = (
 interface RawProps {
   className?: string;
   language?: BundledLanguage;
-  theme?: BundledTheme;
   code: string;
   showLineNumbers?: boolean;
 }
 
-export const Raw = ({ className, language = "typescript", theme, code, showLineNumbers = true }: RawProps) => {
+export const Raw = ({ className, language = "typescript", code, showLineNumbers = true }: RawProps) => {
   const { cleanedCode, focusLines } = parseCollapseAnnotations(code);
+  //? shiki throws on a grammar it was not loaded with, which used to render an empty block
+  const lang = (loadedLangs as readonly string[]).includes(language) ? language : "text";
   const htmlPromise = highlighter.then((highlighter) =>
     highlighter.codeToHtml(cleanedCode, {
-      lang: language,
-      ...(theme ? { theme } : { themes: defaultThemes }),
+      lang,
+      themes: { light: "github-light", dark: "github-dark" },
+      defaultColor: false,
       transformers: [
         transformerNotationDiff({
           matchAlgorithm: "v3",
@@ -100,9 +116,13 @@ export const Raw = ({ className, language = "typescript", theme, code, showLineN
         }),
         transformerNotationHighlight(),
         transformerLineData,
-        ...(showLineNumbers ? (language === "bash" ? [transformerBashLine] : [transformerLineNumbers]) : []),
+        ...(showLineNumbers
+          ? language === "bash"
+            ? [transformerBashLine(bashPromptLines(cleanedCode))]
+            : [transformerLineNumbers]
+          : []),
       ],
     }),
   );
-  return <Shiki_Client className={clsx("w-max", className)} htmlPromise={htmlPromise} focusLines={focusLines} />;
+  return <Shiki_Client className={cn("w-max", className)} htmlPromise={htmlPromise} focusLines={focusLines} />;
 };

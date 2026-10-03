@@ -1,3 +1,6 @@
+import type { LogRecord } from "akanjs/common";
+import type { LiveChange } from "./predefinedAdaptor/websocket.adaptor";
+
 export type AkanChildRole = "all" | "federation" | "batch";
 
 export type AkanChildStatus = "starting" | "ready" | "healthy" | "draining" | "unhealthy" | "exited" | "crashed";
@@ -7,6 +10,7 @@ export type AkanUpstream = { type: "unix"; socketPath: string } | { type: "tcp";
 export interface AkanJobOptions {
   delay?: number;
   attempts?: number;
+  /** Smaller runs sooner, and a job with none runs before every prioritized one — bullmq's reading. */
   priority?: number;
   backoff?: number | { type?: string; delay?: number };
   removeOnComplete?: boolean | number;
@@ -37,6 +41,7 @@ export interface AkanMetricsReport {
   queueWakeCount?: number;
   pubsubDeliverCount?: number;
   pubsubDropCount?: number;
+  pubsubCoalesceCount?: number;
   rssBytes?: number;
   heapTotalBytes?: number;
   heapUsedBytes?: number;
@@ -55,6 +60,26 @@ export interface AkanMetricsReport {
   rscWorkerRestartCount?: number;
   rscWorkerRecycleCount?: number;
   rscWorkerLastRecycleReason?: string;
+  // The RSC worker's own process sample, prefixed so it cannot overwrite its host replica's.
+  rscWorkerReportedAt?: number;
+  rscWorkerRssBytes?: number;
+  rscWorkerHeapTotalBytes?: number;
+  rscWorkerHeapUsedBytes?: number;
+  rscWorkerExternalBytes?: number;
+  rscWorkerArrayBuffersBytes?: number;
+  rscWorkerCpuUserMicros?: number;
+  rscWorkerCpuSystemMicros?: number;
+  rscWorkerMaxRssKb?: number;
+  rscWorkerJscHeapSizeBytes?: number;
+  rscWorkerJscHeapCapacityBytes?: number;
+  /** Off-heap bytes JSC attributes to JS objects — typed-array backing stores, i.e. cached Flight chunks. */
+  rscWorkerJscExtraMemorySizeBytes?: number;
+  rscWorkerJscObjectCount?: number;
+  rscWorkerJscProtectedObjectCount?: number;
+  rscWorkerEventLoopLagMeanMs?: number;
+  rscWorkerEventLoopLagP99Ms?: number;
+  rscWorkerEventLoopLagMaxMs?: number;
+  rscWorkerGcDurationMs?: number;
   rscPendingRenderCount?: number;
   rscQueuedSendCount?: number;
   rscHostPendingChunkOverflowCount?: number;
@@ -80,9 +105,13 @@ export interface AkanMetricsReport {
   rscLastRenderLoadedModuleDelta?: number;
   rscLastRenderLoadedModules?: string[];
   rscResultCacheEntries?: number;
+  rscResultCacheBytes?: number;
+  rscPatchResultCacheEntries?: number;
+  rscPatchResultCacheBytes?: number;
   rscResultCacheHits?: number;
   rscResultCacheMisses?: number;
   rscResultCacheBypass?: number;
+  /** Keys the SSR chunk registry tracks — NOT a memory bound; the modules stay in Bun's ESM registry. */
   ssrChunkRegistrySize?: number;
   ssrChunkLoadCount?: number;
   ssrChunkCacheHitCount?: number;
@@ -93,6 +122,7 @@ export interface AkanMetricsReport {
   httpCsrCount?: number;
   httpImageCount?: number;
   httpHtmlCacheEntries?: number;
+  httpHtmlCacheBytes?: number;
   httpHtmlCacheHits?: number;
   httpHtmlCacheMisses?: number;
   httpHtmlCacheBypass?: number;
@@ -113,6 +143,7 @@ export type AkanIpcMessage =
       /** Actual websocket upstream the child bound; may differ from the preferred port when it was in use. */
       wsUpstream?: Extract<AkanUpstream, { type: "tcp" }>;
       healthPath?: string;
+      crossSite?: { allowedOrigins: string[]; enabled: boolean };
     }
   | { type: "backend-ready"; pid: number }
   | { type: "pubsub.publish"; roomId: string; data: object | object[]; origin?: string }
@@ -121,6 +152,7 @@ export type AkanIpcMessage =
   | { type: "pubsub.unsubscribe"; roomId: string; socketId?: string; pid?: number }
   | { type: "pubsub.snapshot.request" }
   | { type: "pubsub.snapshot"; rooms: string[]; pid?: number }
+  | { type: "live.change"; change: LiveChange; origin?: string }
   | { type: "queue.enqueued"; queue: string; name: string; jobId: string }
   | { type: "queue.wake"; queue?: string; name?: string }
   | { type: "health.ping"; nonce: string; sentAt: number }
@@ -128,7 +160,13 @@ export type AkanIpcMessage =
   | { type: "ws.opened"; socketId: string; roomId?: string; pid?: number }
   | { type: "ws.closed"; socketId: string; roomId?: string; pid?: number }
   | { type: "metrics.report"; metrics: AkanMetricsReport; pid?: number }
+  | { type: "log.records"; records: LogRecord[]; dropped?: number; pid?: number }
+  /** Hub → child: the lowest severity any subscriber wants; `null` tells the child to stop forwarding. */
+  | { type: "log.level"; minSev: number | null }
   | { type: "shutdown"; signal?: string }
+  /** Desktop server → the shell that started it: the path behind a file picker grant (forServer). */
+  | { type: "file.resolve"; id: string; grant: string }
+  | { type: "file.resolved"; id: string; path?: string; mode?: "read" | "write" | "folder"; error?: string }
   | { type: "error"; message: string; stack?: string; pid?: number };
 
 export const sendAkanIpc = (message: AkanIpcMessage) => {

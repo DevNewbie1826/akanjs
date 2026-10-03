@@ -1,18 +1,20 @@
 "use client";
-import { PrimitiveRegistry } from "akanjs/base";
-import { usePage } from "akanjs/client";
-import { type ConstantCls, ConstantRegistry } from "akanjs/constant";
+import { cn } from "akanjs/client";
+import { mcpHintsOf, mcpRefusalOf } from "akanjs/common";
 import { FetchClient, type FetchProxy } from "akanjs/fetch";
 import type { SerializedEndpoint } from "akanjs/signal";
 import { st } from "akanjs/store";
 import { useMemo, useState } from "react";
-import { AiOutlineApi, AiOutlineCopy, AiOutlineFileWord, AiOutlineSend } from "react-icons/ai";
+import { AiOutlineApi, AiOutlineCopy, AiOutlineFileWord, AiOutlineSend, AiOutlineWarning } from "react-icons/ai";
+import { buttonRecipe } from "../Button";
 import { Copy } from "../Copy";
-import { Signal } from ".";
+import { docPill, docUi, Segmented } from "../Reference";
 import Arg from "./Arg";
+import { ArgSection, EndpointCollapse, EndpointInterface } from "./Endpoint";
+import { endpointEntriesOf, isWsEndpoint, matchesGuards, matchesSearch } from "./endpointEntries";
 import { getExampleData } from "./makeExample";
 import Response from "./Response";
-import { getEndpointBadgeClassName, getGuardBadgeClassName, signalUi } from "./style";
+import { getMcpBadgeClassName, getMethodBadgeClassName, getMethodLabel } from "./style";
 
 type RestApiFetchFn = (
   ...args: [...args: unknown[], option: { token?: string; crystalize?: boolean }]
@@ -22,6 +24,11 @@ export default function RestApi() {
   return <div></div>;
 }
 
+const restViewItems = [
+  { key: "doc", label: "Reference", icon: <AiOutlineFileWord /> },
+  { key: "test", label: "Try it", icon: <AiOutlineApi /> },
+] as const;
+
 interface RestApiEndpointsProps {
   refName: string;
   fetch: FetchProxy;
@@ -29,45 +36,34 @@ interface RestApiEndpointsProps {
   endpoints?: string[];
   openAll?: boolean;
   httpUri?: string;
+  search?: string;
 }
-const RestApiEndpoints = ({ refName, fetch, prefix, endpoints, openAll, httpUri }: RestApiEndpointsProps) => {
-  const tryRoles = st.use.tryRoles();
+const RestApiEndpoints = ({ refName, fetch, prefix, endpoints, openAll, httpUri, search }: RestApiEndpointsProps) => {
+  const tryGuards = st.use.tryGuards({ agent: false });
   const signal = fetch.serializedSignal[refName];
+  if (!signal) return <div className={docUi.emptyPanel}>No signal is registered as “{refName}”.</div>;
   const signalPrefix = prefix ?? signal.prefix;
-  const baseEndpointEntries = Object.entries(FetchClient.getBaseEndpoint(refName, signal));
-  const sliceEndpointEntries = signal.slice
-    ? Object.entries(signal.slice).flatMap(([suffix, slice]) => {
-        const endpoint = FetchClient.getEndpointFromSlice(refName, suffix, slice);
-        return Object.entries(endpoint);
-      })
-    : [];
-  const endpointEntries = [...baseEndpointEntries, ...sliceEndpointEntries, ...Object.entries(signal.endpoint)]
-    .filter(([key, endpoint]) => !endpoints || endpoints.includes(key))
-    .sort(([keyA], [keyB]) => (keyA > keyB ? 1 : -1))
-    .filter(([key, endpoint]) => {
-      if (endpoint.type === "pubsub" || endpoint.type === "message") return false;
-      if (!endpoint.guards?.length) return true;
-      if (endpoint.guards?.includes("Public") && tryRoles.includes("Public")) return true;
-      if ((endpoint.guards?.includes("User") || endpoint.guards?.includes("Every")) && tryRoles.includes("User"))
-        return true;
-      if ((endpoint.guards?.includes("Admin") || endpoint.guards?.includes("Every")) && tryRoles.includes("Admin"))
-        return true;
-      if (
-        (endpoint.guards?.includes("SuperAdmin") || endpoint.guards?.includes("Every")) &&
-        tryRoles.includes("SuperAdmin")
-      )
-        return true;
-      return false;
-    });
+  const endpointEntries = endpointEntriesOf(refName, fetch)
+    .filter(({ key }) => !endpoints || endpoints.includes(key))
+    .filter(({ key, endpoint }) =>
+      matchesSearch(key, FetchClient.makeHttpUrl(key, endpoint, signalPrefix, new Map()), search ?? ""),
+    )
+    .filter(({ endpoint }) => !isWsEndpoint(endpoint) && matchesGuards(endpoint, tryGuards));
+  if (!endpointEntries.length)
+    return (
+      <div className={docUi.emptyPanel}>
+        {search?.trim() ? `No endpoint matches “${search.trim()}”.` : "No endpoint is gated by the selected guards."}
+      </div>
+    );
   return (
-    <div>
-      {endpointEntries.map(([endpointKey, endpoint], idx) => (
+    <div className="flex flex-col gap-2">
+      {endpointEntries.map(({ key, endpoint }) => (
         <RestApiEndpoint
-          key={endpointKey}
+          key={key}
           signalPrefix={signalPrefix}
           refName={refName}
           fetch={fetch}
-          endpointKey={endpointKey}
+          endpointKey={key}
           endpoint={endpoint}
           open={openAll}
           httpUri={httpUri}
@@ -97,68 +93,49 @@ const RestApiEndpoint = ({
   open,
   httpUri,
 }: RestApiEndpointProps) => {
-  const { l } = usePage();
   const [viewStatus, setViewStatus] = useState<"doc" | "test">("doc");
   const path = FetchClient.makeHttpUrl(endpointKey, endpoint, signalPrefix, new Map());
+  // The server's own fail-closed rules, so the badge says what the MCP catalogue says.
+  const mcpRefusal = mcpRefusalOf(endpoint, { refName, key: endpointKey });
+  const hints = Object.entries(mcpHintsOf(endpointKey, endpoint)).filter(([, on]) => on);
   return (
-    <div className={signalUi.endpointCard}>
-      <input type="checkbox" defaultChecked={open} />
-      <div className="collapse-title">
-        <div className="flex flex-wrap items-center gap-2">
-          <div className={getEndpointBadgeClassName(endpoint.type)}>{endpoint.type === "query" ? "GET" : "POST"}</div>
-          <div className="font-bold text-lg">{path}</div>
-          <div className="text-base-content/70 text-sm">{l._(`${refName}.signal.${endpointKey}`)}</div>
+    <EndpointCollapse
+      refName={refName}
+      endpointKey={endpointKey}
+      endpoint={endpoint}
+      open={open}
+      badge={<span className={getMethodBadgeClassName(endpoint.type)}>{getMethodLabel(endpoint.type)}</span>}
+      title={path}
+      extraBadge={<span className={getMcpBadgeClassName(!mcpRefusal)}>{mcpRefusal ? "MCP refused" : "MCP"}</span>}
+    >
+      {mcpRefusal ? (
+        <div className="flex items-start gap-2 rounded-box border border-warning/30 bg-warning/10 p-3 text-sm text-warning">
+          <AiOutlineWarning className="mt-0.5 shrink-0" />
+          <span>{mcpRefusal}</span>
         </div>
-      </div>
-      <div className={signalUi.endpointContent}>
-        <div className="rounded-xl bg-base-100 p-3">
-          <div className={signalUi.sectionTitle}>Description</div>
-          {endpoint.guards?.some((guard) => guard !== "None") ? (
-            <div className="mt-2 flex flex-wrap items-center gap-2 font-normal text-sm">
-              <span className="text-base-content/70">Guards</span>
-              {endpoint.guards.map((guard) => (
-                <span className={getGuardBadgeClassName(guard)} key={guard}>
-                  {guard}
-                </span>
-              ))}
-            </div>
-          ) : null}
-          <div className="mt-2 font-normal text-base-content/70 text-sm">
-            {l._(`${refName}.signal.${endpointKey}.desc`)}
-          </div>
+      ) : hints.length ? (
+        <div className="flex flex-wrap items-center gap-1.5">
+          {hints.map(([hint]) => (
+            <span className={docPill("muted")} key={hint}>
+              {hint}
+            </span>
+          ))}
         </div>
-        <div className="join w-fit">
-          <button
-            onClick={() => {
-              setViewStatus("doc");
-            }}
-            className={`btn join-item btn-sm ${viewStatus === "doc" ? "btn-primary" : "btn-outline"}`}
-          >
-            <AiOutlineFileWord className="text-xl" /> View Doc
-          </button>
-          <button
-            onClick={() => {
-              setViewStatus("test");
-            }}
-            className={`btn join-item btn-sm ${viewStatus === "test" ? "btn-primary" : "btn-outline"}`}
-          >
-            <AiOutlineApi className="text-xl" /> Restful API
-          </button>
-        </div>
-        {viewStatus === "doc" ? (
-          <RestApiInterface refName={refName} endpointKey={endpointKey} endpoint={endpoint} />
-        ) : (
-          <RestApiTry
-            signalPrefix={signalPrefix}
-            fetch={fetch}
-            refName={refName}
-            endpointKey={endpointKey}
-            endpoint={endpoint}
-            httpUri={httpUri}
-          />
-        )}
-      </div>
-    </div>
+      ) : null}
+      <Segmented items={restViewItems} onChange={setViewStatus} value={viewStatus} />
+      {viewStatus === "doc" ? (
+        <RestApiInterface refName={refName} endpointKey={endpointKey} endpoint={endpoint} />
+      ) : (
+        <RestApiTry
+          signalPrefix={signalPrefix}
+          fetch={fetch}
+          refName={refName}
+          endpointKey={endpointKey}
+          endpoint={endpoint}
+          httpUri={httpUri}
+        />
+      )}
+    </EndpointCollapse>
   );
 };
 RestApi.Endpoint = RestApiEndpoint;
@@ -168,65 +145,21 @@ interface RestApiInterfaceProps {
   endpointKey: string;
   endpoint: SerializedEndpoint;
 }
-const RestApiInterface = ({ refName, endpointKey, endpoint }: RestApiInterfaceProps) => {
-  const returnRef = ConstantRegistry.getModelRef(endpoint.returns.refName, endpoint.returns.modelType);
-  const isReturnModelType = !PrimitiveRegistry.has(returnRef);
-  const uploadArgs = endpoint.args.filter((arg) => arg.type === "upload");
-  const paramArgs = endpoint.args.filter((arg) => arg.type === "param");
-  const searchArgs = endpoint.args.filter((arg) => arg.type === "search");
-  const bodyArgs = endpoint.args.filter((arg) => arg.type === "body");
-  return (
-    <div className="flex w-full flex-col gap-4">
-      {uploadArgs.length ? (
-        <div>
-          <div className={signalUi.sectionTitle}>Form data upload</div>
-          <div className={signalUi.tablePanel}>
-            <Arg.Table refName={refName} endpointKey={endpointKey} args={uploadArgs} />
-          </div>
-        </div>
-      ) : null}
-      {paramArgs.length ? (
-        <div>
-          <div className={signalUi.sectionTitle}>Parameters</div>
-          <div className={signalUi.tablePanel}>
-            <Arg.Table refName={refName} endpointKey={endpointKey} args={paramArgs} />
-          </div>
-        </div>
-      ) : null}
-      {searchArgs.length ? (
-        <div>
-          <div className={signalUi.sectionTitle}>Query</div>
-          <div className={signalUi.tablePanel}>
-            <Arg.Table refName={refName} endpointKey={endpointKey} args={searchArgs} />
-          </div>
-        </div>
-      ) : null}
-      {bodyArgs.length ? (
-        <div>
-          <div className={signalUi.sectionTitle}>Body</div>
-          <div className={signalUi.tablePanel}>
-            <Arg.Table refName={refName} endpointKey={endpointKey} args={bodyArgs} />
-          </div>
-        </div>
-      ) : null}
-      <div className="font-bold text-lg">
-        <div className="flex w-full flex-col gap-2 rounded-md font-normal md:flex-row">
-          <div className="w-full md:w-1/2">
-            <div className={signalUi.sectionTitle}>Response Type</div>
-            <div className="max-h-72 overflow-auto rounded-xl bg-base-100 p-4 md:h-72">
-              Returns: <Signal.Object.Type objRef={returnRef} arrDepth={endpoint.returns.arrDepth ?? 0} />
-              {isReturnModelType ? <Signal.Object.Detail objRef={returnRef as ConstantCls} /> : null}
-            </div>
-          </div>
-          <div className="w-full md:w-1/2">
-            <div className={signalUi.sectionTitle}>Response Example</div>
-            <Response.Example endpoint={endpoint} />
-          </div>
-        </div>
-      </div>
-    </div>
-  );
-};
+const RestApiInterface = ({ refName, endpointKey, endpoint }: RestApiInterfaceProps) => (
+  <EndpointInterface
+    className="flex w-full flex-col gap-4"
+    refName={refName}
+    endpointKey={endpointKey}
+    endpoint={endpoint}
+    argSections={[
+      { label: "Form data", args: endpoint.args.filter((arg) => arg.type === "upload") },
+      { label: "Path parameters", args: endpoint.args.filter((arg) => arg.type === "param") },
+      { label: "Query", args: endpoint.args.filter((arg) => arg.type === "search") },
+      { label: "Body", args: endpoint.args.filter((arg) => arg.type === "body") },
+    ]}
+    returnsLabel="Returns"
+  />
+);
 RestApi.Interface = RestApiInterface;
 
 interface RestApiTryProps {
@@ -242,7 +175,7 @@ const RestApiTry = ({ signalPrefix, refName, endpointKey, endpoint, fetch, httpU
   const paramArgs = endpoint.args.filter((arg) => arg.type === "param");
   const bodyArgs = endpoint.args.filter((arg) => arg.type === "body");
   const uploadArgs = endpoint.args.filter((arg) => arg.type === "upload");
-  const tryJwt = st.use.tryJwt();
+  const tryJwt = st.use.tryJwt({ agent: false });
   const paramExample = useMemo(() => getExampleData<string>(paramArgs, "restapi"), []);
   const queryExample = useMemo(() => getExampleData<string>(queryArgs, "restapi"), []);
   const bodyExample = useMemo(() => JSON.stringify(getExampleData(bodyArgs, "restapi"), null, 2), []);
@@ -297,77 +230,78 @@ const RestApiTry = ({ signalPrefix, refName, endpointKey, endpoint, fetch, httpU
   };
   return (
     <div className="flex w-full flex-col gap-4">
-      <div className="flex flex-wrap items-center gap-2 rounded-xl bg-base-100 p-3">
-        <div className={signalUi.sectionTitle}>Request URL</div>
+      <div className="flex flex-wrap items-center gap-2 rounded-box border border-border bg-background px-3 py-2">
+        <span className={getMethodBadgeClassName(endpoint.type)}>{getMethodLabel(endpoint.type)}</span>
+        <span className="min-w-0 flex-1 break-all font-mono text-foreground/80 text-sm">
+          {httpUri ?? ""}
+          {requestPath}
+        </span>
         <Copy text={`${httpUri ?? ""}${requestPath}`}>
-          <button className="btn btn-sm btn-outline">
-            {requestPath} <AiOutlineCopy />
+          <button className={buttonRecipe({ variant: "ghost", size: "xs" }, "text-foreground/50")} type="button">
+            <AiOutlineCopy />
           </button>
         </Copy>
       </div>
       {uploadArgs.length ? (
-        <div>
-          <div className={signalUi.sectionTitle}>Form data upload</div>
-          {uploadArgs.map((arg) => (
-            <Arg.FormData
-              key={arg.name}
-              endpointKey={endpointKey}
-              arg={arg}
-              value={""}
-              onChange={(fileList: FileList) => {
-                setUploadRequest({ ...uploadRequest, [arg.name]: fileList });
-              }}
-            />
-          ))}
-        </div>
+        <ArgSection label="Form data">
+          <div className={docUi.panel}>
+            {uploadArgs.map((arg) => (
+              <Arg.FormData
+                key={arg.name}
+                endpointKey={endpointKey}
+                arg={arg}
+                value={""}
+                onChange={(fileList: FileList) => {
+                  setUploadRequest({ ...uploadRequest, [arg.name]: fileList });
+                }}
+              />
+            ))}
+          </div>
+        </ArgSection>
       ) : null}
       {paramArgs.length ? (
-        <div className={signalUi.sectionPanel}>
-          <div className={signalUi.sectionTitle}>Parameters</div>
-          {paramArgs.map((arg, idx) => (
-            <Arg.Param
-              key={idx}
-              endpointKey={endpointKey}
-              arg={arg}
-              value={paramRequest[arg.name]}
-              onChange={(value: string) => {
-                setParamRequest({ ...paramRequest, [arg.name]: value });
-              }}
-            />
-          ))}
-        </div>
+        <ArgSection label="Path parameters">
+          <div className={cn(docUi.panel, "px-3 py-1")}>
+            {paramArgs.map((arg, idx) => (
+              <Arg.Param
+                key={idx}
+                endpointKey={endpointKey}
+                arg={arg}
+                value={paramRequest[arg.name]}
+                onChange={(value: string) => {
+                  setParamRequest({ ...paramRequest, [arg.name]: value });
+                }}
+              />
+            ))}
+          </div>
+        </ArgSection>
       ) : null}
       {queryArgs.length ? (
-        <div className={signalUi.sectionPanel}>
-          <div className={signalUi.sectionTitle}>Queries</div>
-          {queryArgs.map((arg, idx) => (
-            <Arg.Query
-              key={idx}
-              endpointKey={endpointKey}
-              arg={arg}
-              value={queryRequest[arg.name] ?? ""}
-              onChange={(value: string) => {
-                setQueryRequest({ ...queryRequest, [arg.name]: value });
-              }}
-            />
-          ))}
-        </div>
+        <ArgSection label="Query">
+          <div className={cn(docUi.panel, "px-3 py-1")}>
+            {queryArgs.map((arg, idx) => (
+              <Arg.Query
+                key={idx}
+                endpointKey={endpointKey}
+                arg={arg}
+                value={queryRequest[arg.name] ?? ""}
+                onChange={(value: string) => {
+                  setQueryRequest({ ...queryRequest, [arg.name]: value });
+                }}
+              />
+            ))}
+          </div>
+        </ArgSection>
       ) : null}
       {bodyArgs.length ? (
-        <div>
-          <div className={signalUi.sectionTitle}>Body</div>
+        <ArgSection label="Body">
           <Arg.Json value={bodyRequest} onChange={setBodyRequest} />
-        </div>
+        </ArgSection>
       ) : null}
-      <div>
-        <button className="btn btn-primary w-full" onClick={() => void onSend()}>
-          <AiOutlineSend className="-mt-0.5" /> Send Request
-        </button>
-      </div>
-      <div>
-        <div className={signalUi.sectionTitle}>Response</div>
-        <Response.Result status={response.status} data={response.data as object} />
-      </div>
+      <button className={buttonRecipe({ variant: "primary" }, "w-full")} onClick={() => void onSend()} type="button">
+        <AiOutlineSend /> Send Request
+      </button>
+      <Response.Result status={response.status} data={response.data as object} />
     </div>
   );
 };

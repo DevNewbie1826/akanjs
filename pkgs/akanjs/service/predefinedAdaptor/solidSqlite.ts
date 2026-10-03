@@ -1,8 +1,8 @@
 import { Database } from "bun:sqlite";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
-import type { BaseEnv, Dayjs } from "akanjs/base";
-import { resolveDefaultSqliteFile } from "./sqlitePath";
+import type { Dayjs } from "akanjs/base";
+import { defaultSqliteFile } from "./sqlitePath";
 
 export interface SolidConfig {
   filePath?: string;
@@ -12,9 +12,10 @@ export interface SolidConfig {
   cleanupIntervalMs?: number;
   queuePollIntervalMs?: number;
   queueLeaseMs?: number;
+  queueFailedRetentionMs?: number;
 }
 
-export interface SolidEnv extends BaseEnv {
+export interface SolidEnv {
   workspaceRoot?: string;
   solid?: SolidConfig;
 }
@@ -24,28 +25,22 @@ export type SolidValueType = "string" | "number" | "buffer" | "json";
 const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 export const getSolidConfig = (env: SolidEnv): Required<SolidConfig> => {
-  const appName = env.appName ?? "akan";
-  const environment = env.environment ?? "local";
-  const defaultFile = resolveDefaultSqliteFile({
-    appName,
-    fileName: `${appName}-${environment}_solid.db`,
-    isProduction: process.env.NODE_ENV === "production",
-    operationMode: env.operationMode,
-    workspaceRoot: env.workspaceRoot,
-  });
   return {
-    filePath: env.solid?.filePath ?? process.env.AKAN_SOLID_DB_PATH ?? defaultFile,
+    // Where the data lives is the deployment's to say, over whatever the build bundled.
+    filePath: process.env.AKAN_SOLID_DB_PATH ?? env.solid?.filePath ?? defaultSqliteFile("_solid", env.workspaceRoot),
     journalMode: env.solid?.journalMode ?? "WAL",
     busyTimeoutMs: env.solid?.busyTimeoutMs ?? 5000,
     synchronous: env.solid?.synchronous ?? "NORMAL",
     cleanupIntervalMs: env.solid?.cleanupIntervalMs ?? 60_000,
     queuePollIntervalMs: env.solid?.queuePollIntervalMs ?? 2000,
     queueLeaseMs: env.solid?.queueLeaseMs ?? 30_000,
+    queueFailedRetentionMs: env.solid?.queueFailedRetentionMs ?? 7 * 24 * 60 * 60 * 1000,
   };
 };
 
 export const openSolidDatabase = async (config: Required<SolidConfig>) => {
-  await mkdir(path.dirname(config.filePath), { recursive: true });
+  // Resolved first: Bun on Windows fails a recursive mkdir of "." (":memory:", a bare file name) with EEXIST.
+  await mkdir(path.dirname(path.resolve(config.filePath)), { recursive: true });
   let lastError: unknown;
   for (let attempt = 0; attempt < 8; attempt++) {
     try {
@@ -65,10 +60,10 @@ export const openSolidDatabase = async (config: Required<SolidConfig>) => {
 
 export const encodeSolidValue = (value: unknown): { type: SolidValueType; value: string | Buffer } => {
   if (Buffer.isBuffer(value)) return { type: "buffer", value };
+  if (value instanceof Uint8Array)
+    return { type: "buffer", value: Buffer.from(value.buffer, value.byteOffset, value.byteLength) };
   if (typeof value === "number") return { type: "number", value: String(value) };
   if (typeof value === "string") return { type: "string", value };
-  // Objects, arrays, booleans, null: stored as JSON so callers can round-trip
-  // structured values (e.g. refresh sessions) through the SQLite-backed cache.
   return { type: "json", value: JSON.stringify(value ?? null) };
 };
 

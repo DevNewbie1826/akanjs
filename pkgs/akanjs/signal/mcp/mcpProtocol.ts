@@ -1,0 +1,101 @@
+// `2026-07-28` is stateless (no `initialize`, session id or server stream). A legacy server may decline to issue
+// `Mcp-Session-Id`, so both legacy revisions — wire-identical for this POST-only surface — share the same handler.
+export const MCP_MODERN_VERSION = "2026-07-28";
+export const MCP_LEGACY_VERSION = "2025-11-25";
+export const MCP_LEGACY_PRIOR_VERSION = "2025-06-18";
+/** Newest first — `server/discover` and `initialize` both answer with this order, and `#negotiate` reads the ends. */
+export const MCP_SUPPORTED_VERSIONS = [MCP_MODERN_VERSION, MCP_LEGACY_VERSION, MCP_LEGACY_PRIOR_VERSION] as const;
+export type McpProtocolVersion = (typeof MCP_SUPPORTED_VERSIONS)[number];
+
+export type McpEra = "modern" | "legacy";
+
+export const MCP_META_PREFIX = "io.modelcontextprotocol/";
+export const MCP_META_PROTOCOL_VERSION = `${MCP_META_PREFIX}protocolVersion`;
+export const MCP_META_CLIENT_CAPABILITIES = `${MCP_META_PREFIX}clientCapabilities`;
+export const MCP_META_CLIENT_INFO = `${MCP_META_PREFIX}clientInfo`;
+export const MCP_META_SERVER_INFO = `${MCP_META_PREFIX}serverInfo`;
+
+// `-32020`..`-32099` is reserved by the spec; `-32021` is left out because this server requires no client capability.
+// `-32002` (resource not found) is retired in the modern revision: an unknown resource is `invalidParams`.
+export const McpErrorCode = {
+  parse: -32700,
+  invalidRequest: -32600,
+  methodNotFound: -32601,
+  invalidParams: -32602,
+  internal: -32603,
+  /** Implementation-defined (`-32000`..`-32019` is what JSON-RPC leaves to a server below MCP's reserved band). */
+  rateLimited: -32010,
+  headerMismatch: -32020,
+  unsupportedProtocolVersion: -32022,
+} as const;
+export type McpErrorCodeValue = (typeof McpErrorCode)[keyof typeof McpErrorCode];
+
+export interface McpJsonRpcRequest {
+  jsonrpc: "2.0";
+  id?: string | number | null;
+  method?: string;
+  params?: Record<string, unknown>;
+}
+
+export interface McpToolAnnotations {
+  readOnlyHint?: boolean;
+  destructiveHint?: boolean;
+  idempotentHint?: boolean;
+  openWorldHint?: boolean;
+}
+
+export interface McpTool {
+  name: string;
+  title?: string;
+  description?: string;
+  inputSchema: Record<string, unknown>;
+  outputSchema?: Record<string, unknown>;
+  annotations?: McpToolAnnotations;
+}
+
+export interface McpResourceTemplate {
+  uriTemplate: string;
+  name: string;
+  title?: string;
+  description?: string;
+  mimeType?: string;
+}
+
+export interface McpResource {
+  uri: string;
+  name: string;
+  title?: string;
+  description?: string;
+  mimeType?: string;
+}
+
+export interface McpPromptArgument {
+  name: string;
+  description?: string;
+  required?: boolean;
+}
+
+/** User-controlled: a client offers it as a slash command, so a person reads its `title` and `description`. */
+export interface McpPrompt {
+  name: string;
+  title?: string;
+  description?: string;
+  arguments?: McpPromptArgument[];
+}
+
+export interface McpTextContent {
+  type: "text";
+  text: string;
+}
+
+export interface McpToolResult {
+  content: McpTextContent[];
+  structuredContent?: unknown;
+  isError?: boolean;
+}
+
+export interface McpResourceContents {
+  uri: string;
+  mimeType: string;
+  text: string;
+}

@@ -1,3 +1,5 @@
+import type { SsrManifest } from "../ssrTypes";
+
 export interface BuildRouteResultPayload {
   manifestDelta: Record<string, { id: string; chunks: string[]; name: string; async: boolean }>;
   ssrManifestDelta: Record<string, Record<string, { id: string; chunks: string[]; name: string; async: boolean }>>;
@@ -7,15 +9,11 @@ export interface BuildRouteResultPayload {
   clientDepsByEntry?: Record<string, string[]>;
   routeId?: string;
   generation?: number;
+  /** The newest save batch whose files its client-entry discovery had taken in when it started. */
+  seenGeneration?: number;
 }
 
-/**
- * Marks a frontend payload that re-announces a freshly booted artifact rather than reporting an edit.
- * A recycled builder rebuilds every artifact from scratch, but a running backend read
- * `base-artifact.json` once at boot and never re-reads it, so the new state has to be pushed. The
- * host drops such a payload when the hashed output did not actually move, which keeps a clean
- * recycle invisible to connected browsers.
- */
+/** Re-announces a recycled builder's artifact (not an edit); the host drops it when the hashed output did not move. */
 export type BuilderStateReason = "builder-recycle";
 
 export interface CssPayload {
@@ -46,7 +44,7 @@ export interface DevChangePlan {
   reasonByFile: Record<string, string[]>;
 }
 
-export type BuildPhase = "scan" | "barrel" | "csr" | "pages" | "css" | "route" | "backend";
+export type BuildPhase = "scan" | "barrel" | "csr" | "ssr" | "pages" | "css" | "route" | "backend";
 
 export interface DevBuildStatus {
   generation: number;
@@ -54,15 +52,16 @@ export interface DevBuildStatus {
   ok: boolean;
   files: string[];
   message?: string;
+  /** The route a route build's status speaks for. */
+  scope?: string;
 }
-
-// --- backend → builder (request/response) -------------------------------
 
 export type BuilderReq = {
   type: "build-route";
   id: number;
   routeId: string;
   seeds: string[];
+  graphSeeds?: string[];
   knownEntries: string[];
   generation?: number;
 };
@@ -71,29 +70,28 @@ export type BuilderRes =
   | { type: "build-route-res"; id: number; ok: true; data: BuildRouteResultPayload }
   | { type: "build-route-res"; id: number; ok: false; error: string };
 
-/**
- * Dev CSR artifacts are only reachable through the opt-in `/__csr` and `?csr=true` routes (mobile
- * local dev points a device WebView at the latter), so the builder skips them until a request
- * actually needs one. The first such request arms the builder through this pair and waits for the
- * build, after which every save keeps CSR in sync.
- */
+/** Sent by the first `/__csr` or `?csr=true` request (a device WebView in mobile dev) to arm the lazy dev CSR build. */
 export type BuilderCsrReq = { type: "build-csr"; id: number; reason: string };
 
 export type BuilderCsrRes =
   | { type: "build-csr-res"; id: number; ok: true }
   | { type: "build-csr-res"; id: number; ok: false; error: string };
 
-// --- dev host → builder (control) ---------------------------------------
-
-/**
- * Asks the builder to finish its queued work and exit, which is the only way bundler memory is
- * returned to the OS (see `BuilderMetrics`). The host's existing restart path brings up a
- * replacement, so a graceful drain — rather than a kill — keeps a rebuild in flight from being
- * truncated.
- */
+/** Drain and exit (the only way bundler memory returns to the OS); draining, not killing, keeps a rebuild whole. */
 export type BuilderControl = { type: "builder-shutdown"; reason: string };
 
-// --- builder → backend (unsolicited events) -----------------------------
+/** Epoch-ms marks a save picks up on its way to the page, so a slow update says which hop it waited in. */
+export interface HmrTrace {
+  eventAt?: number; // first fs event of the watcher window
+  flushAt?: number; // the watcher handed the batch over
+  batchAt?: number; // the builder started on it (after its queue)
+  spawnAt?: number; // the build worker was spawned
+  workerStartAt?: number; // the worker process started
+  workerAt?: number; // the worker finished its imports
+  patchAt?: number; // the update (CSR patch or pages bundle) was on disk
+  sentAt?: number; // the build side sent the update
+  broadcastAt?: number; // the backend sent it to the tabs
+}
 
 export interface PagesBundlePayload {
   bundlePath: string;
@@ -101,29 +99,50 @@ export interface PagesBundlePayload {
   generation?: number;
   changedFiles?: string[];
   reason?: BuilderStateReason;
+  trace?: HmrTrace;
+  /** False when no changed file is one the server renders (a `"use client"` edit that kept its export names). */
+  serverTouched?: boolean;
 }
 
-/**
- * `Bun.build` retains native bundler arenas that `Bun.gc(true)` never reclaims — the JS heap stays flat
- * while RSS climbs. **How much comes back without exiting is platform-specific**: measured on Bun
- * 1.3.14, macOS returns none of it (0% after 60s idle) while Linux purges 46-59% after ~10-15s idle.
- * The dev host recycles past a ceiling to bound the macOS case.
- *
- * Because this is only reported when the builder's queues drain, `rssBytes` is a *peak* sample. On
- * Linux it goes stale within seconds, so the host re-reads the builder's RSS from the OS before acting
- * on it. See `local/optimize-resource/09-linux-retention-measurement.md`.
- */
+/** `Bun.build` keeps native arenas `Bun.gc(true)` never frees (macOS returns none when idle): hence recycling. */
 export interface BuilderMetrics {
+  /** A peak sampled when the queues drain; stale within seconds on Linux, so the host re-reads RSS from the OS. */
   rssBytes: number;
-  /** The builder's newest generation; 0 until it has processed a watch batch since spawning. */
+  /** The builder's newest generation; a replacement builder continues from the last one its host saw. */
   generation: number;
   /** Work items completed since this builder spawned, so a host can require real work before recycling. */
   workCount: number;
 }
 
+export interface CsrUpdatedPayload {
+  generation: number;
+  mode: "registry" | "artifact";
+  reload: boolean;
+  reason?: string;
+  patchUrl?: string;
+  changedIds?: string[];
+  trace?: HmrTrace;
+}
+
+/** A new generation of the SSR dev registry, where SSR pages load their client code from: a patch, or a reload. */
+export interface SsrUpdatedPayload {
+  generation: number;
+  reload: boolean;
+  reason?: string;
+  patchUrl?: string;
+  changedIds?: string[];
+  trace?: HmrTrace;
+  /** The save also changed what the server renders: the tabs get this patch with that batch's RSC refresh. */
+  hold?: boolean;
+  /** The watch batch this patch came from, which the `pages-updated` releasing it names as its generation. */
+  batchGeneration?: number;
+  epoch?: number;
+  /** The registry's first build: no tab holds a module of it, so there is nothing to send them. */
+  first?: boolean;
+}
+
 export type BuilderEvent =
-  // `buildId` is optional because no builder has ever sent one and nothing reads it: readiness is the
-  // whole signal, and the artifact's build id travels with `pages-updated`.
+  // No builder sends `buildId`: readiness is the whole signal, and the build id travels with `pages-updated`.
   | { type: "builder-ready"; buildId?: string }
   | { type: "backend-ready"; pid: number }
   | {
@@ -135,7 +154,31 @@ export type BuilderEvent =
     }
   | { type: "css-updated"; data: CssPayload }
   | { type: "pages-updated"; data: PagesBundlePayload }
+  | { type: "csr-updated"; data: CsrUpdatedPayload }
+  | { type: "ssr-updated"; data: SsrUpdatedPayload }
   | { type: "build-status"; data: DevBuildStatus }
-  | { type: "builder-metrics"; data: BuilderMetrics };
+  | { type: "builder-metrics"; data: BuilderMetrics }
+  /** The boot builds settled (the SSR registry's, and CSR's when the env arms it): their workers are a boot's peak. */
+  | { type: "boot-armed" };
 
 export type BuilderMessage = BuilderReq | BuilderRes | BuilderCsrReq | BuilderCsrRes | BuilderControl | BuilderEvent;
+
+export interface ClientManifestEntry {
+  id: string;
+  chunks: string[];
+  name: string;
+  async?: boolean;
+}
+
+export type ClientManifest = Record<string, ClientManifestEntry>;
+
+export interface BuildRouteClientResult {
+  manifestDelta: ClientManifest;
+  ssrManifestDelta: SsrManifest;
+  newEntries: string[];
+  discoveredEntries?: string[];
+  clientDeps: string[];
+  clientDepsByEntry?: Record<string, string[]>;
+  /** The newest save batch whose files its client-entry discovery had taken in when it started. */
+  seenGeneration?: number;
+}

@@ -2,28 +2,28 @@
 
 import { getEnv } from "akanjs/base";
 import {
-  clsx,
+  type CsrStackEntry,
+  cn,
   Device,
   debugFrame,
   getPathInfo,
-  type PathRoute,
+  type PageActivity,
   type ReactFont,
-  type RouteRender,
   router,
   useCsr,
   type WebAppManifest,
 } from "akanjs/client";
 import { st } from "akanjs/store";
 import { animated } from "akanjs/ui";
-import { useFetch } from "akanjs/webkit";
-import { type ComponentProps, createElement, memo, type ReactNode, type RefObject, useEffect, useRef } from "react";
+import { Activity, type ComponentProps, type ReactNode, type RefObject, useEffect, useMemo } from "react";
 import { createPortal } from "react-dom";
+import { NativeUpdates } from "../../webkit/nativeUpdates";
+import { RenderLayer } from "../../webkit/RenderLayer";
 
 import { FontFace } from "../FontFace";
 import { Load } from "../Load";
 import { Client, ClientPathWrapper } from "./Client";
-import { ManifestLink, type ProviderProps } from "./Common";
-import { getFrameCssVars } from "./frameCssVars";
+import { getFrameCssVars, ManifestLink, type ProviderProps } from "./Common";
 
 export const CSR = ({ children }: { children: ReactNode }) => {
   return <div></div>;
@@ -43,7 +43,6 @@ const CSRProvider = ({
   theme,
   prefix,
   children,
-  gaTrackingId,
   fonts,
   layoutStyle = "web",
   reconnect = getEnv().operationMode === "local",
@@ -75,14 +74,7 @@ const CSRProvider = ({
           </Client.Wrapper>
           <Client.Inner />
           <CSRInner />
-          <Client.Bridge
-            lang={lang}
-            env={env}
-            theme={theme}
-            prefix={prefix}
-            gaTrackingId={gaTrackingId}
-            wsConnect={wsConnect}
-          />
+          <Client.Bridge lang={lang} env={env} theme={theme} prefix={prefix} wsConnect={wsConnect} />
           <CSRBridge lang={lang} prefix={prefix} />
         </>
       )}
@@ -124,8 +116,9 @@ const CSRWrapper = ({
     topSafeArea,
     bottomSafeArea,
     pathRoutes,
+    stackEntries,
   } = useCsr();
-  const csrLoaded = st.use.csrLoaded();
+  const csrLoaded = st.use.csrLoaded({ agent: false });
   const { router: reactRouter } = useCsr();
   useEffect(() => {
     debugFrame("csrWrapper.mount", { appName, layoutStyle, pathCount: pathRoutes.length });
@@ -169,51 +162,54 @@ const CSRWrapper = ({
       <ManifestLink manifest={manifest} />
       <CSRFrameRoot
         id="frameRoot"
-        className={clsx(className, "h-screen w-full overflow-hidden", {
-          "fixed inset-0": layoutStyle === "mobile",
-          "akan-mobile-frame": layoutStyle === "mobile",
-          "bg-base-200": layoutStyle === "mobile",
-        })}
+        className={cn(
+          className,
+          "h-screen w-full overflow-hidden",
+          layoutStyle === "mobile" && "fixed inset-0",
+          layoutStyle === "mobile" && "akan-mobile-frame",
+          layoutStyle === "mobile" && "bg-muted",
+        )}
         rootRef={frameRootRef}
       >
         <PageLayerRoot />
         {csrLoaded
-          ? pathRoutes.map((pathRoute) => (
-              <CSRPageContainer key={pathRoute.path} pathRoute={pathRoute} prefix={prefix} layoutStyle={layoutStyle} />
+          ? stackEntries.map((entry) => (
+              <CSRPageContainer key={entry.key} entry={entry} prefix={prefix} layoutStyle={layoutStyle} />
             ))
           : null}
         <TopChromeLayer
           id="topSafeArea"
-          className={clsx("akan-frame-chrome fixed inset-x-0 top-0 max-w-screen bg-base-100", {})}
+          className={cn("akan-frame-chrome fixed inset-x-0 top-0 max-w-screen bg-background")}
           layerRef={topSafeAreaRef}
           style={topSafeArea?.containerStyle}
         />
         <TopChromeLayer
           id="topInsetContainer"
-          className={clsx("akan-frame-chrome fixed inset-x-0 isolate max-w-screen bg-base-100", {})}
+          className={cn("akan-frame-chrome fixed inset-x-0 isolate max-w-screen bg-background")}
           style={topInset?.containerStyle}
         >
           <CSRFrameSlotTargets slot="topInset" />
         </TopChromeLayer>
         <TopChromeLayer
           id="topLeftActionContainer"
-          className={clsx("akan-frame-chrome fixed top-0 isolate flex aspect-1 items-center justify-center", {})}
+          className={cn("akan-frame-chrome fixed top-0 isolate flex aspect-1 items-center justify-center")}
           style={topLeftAction?.containerStyle}
         >
           <CSRFrameSlotTargets slot="topLeftAction" />
         </TopChromeLayer>
         <BottomChromeLayer
           id="bottomInsetContainer"
-          className={clsx("akan-frame-chrome fixed inset-x-0 isolate max-w-screen overflow-hidden", {})}
+          className={cn("akan-frame-chrome fixed inset-x-0 isolate max-w-screen overflow-hidden")}
           style={bottomInset?.containerStyle}
         >
           <CSRFrameSlotTargets slot="bottomInset" />
         </BottomChromeLayer>
         <KeyboardLayer
           id="keyboardInsetContainer"
-          className={clsx("akan-frame-chrome fixed inset-x-0 isolate max-w-screen overflow-hidden", {
-            hidden: !frameLayout.keyboard.sticky,
-          })}
+          className={cn(
+            "akan-frame-chrome fixed inset-x-0 isolate max-w-screen overflow-hidden",
+            !frameLayout.keyboard.sticky && "hidden",
+          )}
           style={
             frameLayout.keyboard.visible
               ? {
@@ -223,12 +219,13 @@ const CSRWrapper = ({
               : bottomInset?.containerStyle
           }
           animationDuration={frameLayout.keyboard.animationDuration}
+          animationEasing={frameLayout.keyboard.animationEasing}
         >
           <CSRFrameSlotTargets slot="keyboardInset" />
         </KeyboardLayer>
         <BottomChromeLayer
           id="bottomSafeArea"
-          className="akan-frame-chrome fixed inset-x-0 max-w-screen bg-base-100"
+          className="akan-frame-chrome fixed inset-x-0 max-w-screen bg-background"
           layerRef={bottomSafeAreaRef}
           style={bottomSafeArea?.containerStyle}
         />
@@ -278,14 +275,17 @@ const KeyboardLayer = ({
   className,
   style,
   animationDuration,
+  animationEasing,
   children,
-}: FrameLayerProps & { animationDuration?: number }) => (
+}: FrameLayerProps & { animationDuration?: number; animationEasing?: string }) => (
   <animated.div
     id={id}
     className={className}
     style={{
       ...(style ?? {}),
-      transition: `top ${animationDuration ?? 285}ms ease-out, height ${animationDuration ?? 285}ms ease-out`,
+      transition: `top ${animationDuration ?? 420}ms ${animationEasing ?? "cubic-bezier(0.16, 1, 0.3, 1)"}, height ${
+        animationDuration ?? 420
+      }ms ${animationEasing ?? "cubic-bezier(0.16, 1, 0.3, 1)"}`,
       willChange: "top, height",
     }}
   >
@@ -296,82 +296,38 @@ const KeyboardLayer = ({
 type FrameSlotTarget = "topInset" | "topLeftAction" | "bottomInset" | "keyboardInset";
 
 const CSRFrameSlotTargets = ({ slot }: { slot: FrameSlotTarget }) => {
-  const {
-    history,
-    location: currentLocation,
-    prevLocation,
-    pendingLocation,
-    phase,
-    pathRoutes,
-    topInset,
-    topLeftAction,
-    bottomInset,
-  } = useCsr();
+  const { stackEntries, topInset, topLeftAction, bottomInset } = useCsr();
   return (
     <>
-      {pathRoutes.map((pathRoute) => {
-        const pageType: "current" | "prev" | "cached" | "pending" | null =
-          pathRoute === currentLocation.pathRoute
-            ? "current"
-            : pathRoute === prevLocation?.pathRoute
-              ? "prev"
-              : pathRoute === pendingLocation?.pathRoute && phase === "preparing"
-                ? "pending"
-                : pathRoute.pageState.cache && history.current.cachedLocationMap.has(pathRoute.path)
-                  ? "cached"
-                  : null;
-        const zIndex =
-          pageType === "current"
-            ? history.current.idx
-            : pageType === "prev"
-              ? (history.current.idxMap.get(prevLocation?.pathname ?? "") ?? 0)
-              : pageType === "pending"
-                ? history.current.idx + 1
-                : 0;
+      {stackEntries.map(({ key, location, pageType, zIndex }) => {
+        const slotInset = slot === "topInset" ? topInset : slot === "topLeftAction" ? topLeftAction : bottomInset;
         const style =
           pageType === "current"
-            ? slot === "topInset"
-              ? topInset?.contentStyle
-              : slot === "topLeftAction"
-                ? topLeftAction?.contentStyle
-                : slot === "bottomInset"
-                  ? bottomInset?.contentStyle
-                  : bottomInset?.contentStyle
+            ? slotInset?.contentStyle
             : pageType === "prev"
-              ? slot === "topInset"
-                ? topInset?.prevContentStyle
-                : slot === "topLeftAction"
-                  ? topLeftAction?.prevContentStyle
-                  : slot === "bottomInset"
-                    ? bottomInset?.prevContentStyle
-                    : bottomInset?.prevContentStyle
+              ? slotInset?.prevContentStyle
               : undefined;
-        const id =
-          slot === "topInset"
-            ? `topInsetContent-${pathRoute.path}`
-            : slot === "topLeftAction"
-              ? `topLeftActionContent-${pathRoute.path}`
-              : slot === "bottomInset"
-                ? `bottomInsetContent-${pathRoute.path}`
-                : `keyboardInsetContent-${pathRoute.path}`;
+        const id = `${slot}Content-${key}`;
         return (
           <animated.div
             key={id}
             id={id}
-            className={clsx({
-              "absolute top-0 left-0 isolate size-full": slot === "topInset",
-              "absolute left-0 isolate flex h-full items-center justify-center": slot === "topLeftAction",
-              "absolute inset-x-0 bottom-0 isolate h-full": slot === "bottomInset" || slot === "keyboardInset",
-              hidden: !pageType || pageType === "cached",
-              "pointer-events-none":
-                (slot === "topInset" && pageType !== "current") ||
+            inert={pageType !== "current"}
+            aria-hidden={pageType === "current" ? undefined : true}
+            className={cn(
+              slot === "topInset" && "absolute top-0 left-0 isolate size-full",
+              slot === "topLeftAction" && "absolute left-0 isolate flex h-full items-center justify-center",
+              (slot === "bottomInset" || slot === "keyboardInset") && "absolute inset-x-0 bottom-0 isolate h-full",
+              pageType === "cached" && "hidden",
+              ((slot === "topInset" && pageType !== "current") ||
                 (slot === "topLeftAction" && pageType !== "current") ||
-                (pageType === "prev" && (slot === "bottomInset" || slot === "keyboardInset")),
-              "pointer-events-none absolute opacity-0": pageType === "pending",
-            })}
+                (pageType === "prev" && (slot === "bottomInset" || slot === "keyboardInset"))) &&
+                "pointer-events-none",
+              pageType === "pending" && "pointer-events-none absolute opacity-0",
+            )}
             style={
               {
-                ...getFrameCssVars(pathRoute.pageState),
+                ...getFrameCssVars(location.pathRoute.pageState),
                 ...(style ?? {}),
                 zIndex: pageType === "pending" ? -1 : zIndex,
                 ...(pageType === "pending" ? { opacity: 0 } : {}),
@@ -418,158 +374,98 @@ const CSRBridge = ({ lang, prefix = "" }: CSRBridgeProps) => {
 CSR.Bridge = CSRBridge;
 
 interface CSRPageContainerProps {
-  pathRoute: PathRoute;
+  entry: CsrStackEntry;
   prefix?: string;
   layoutStyle?: "mobile" | "web";
 }
-const CSRPageContainer = ({ pathRoute, prefix, layoutStyle }: CSRPageContainerProps) => {
+const CSRPageContainer = ({ entry, prefix, layoutStyle }: CSRPageContainerProps) => {
+  const csr = useCsr();
   const {
-    history,
     location: currentLocation,
     page: currentPage,
     pageContentRef: currentPageContentRef,
     pageClassName: currentPageClassName,
     pageBind: currentPageBind,
-    prevLocation,
-    pendingLocation,
-    phase,
     prevPage,
     prevPageContentRef,
-  } = useCsr();
-  const pageType: "current" | "prev" | "cached" | "pending" | null =
-    pathRoute === currentLocation.pathRoute
-      ? "current"
-      : pathRoute === prevLocation?.pathRoute
-        ? "prev"
-        : pathRoute === pendingLocation?.pathRoute && phase === "preparing"
-          ? "pending"
-          : pathRoute.pageState.cache && history.current.cachedLocationMap.has(pathRoute.path)
-            ? "cached"
-            : null;
-  if (!pageType) return null;
+  } = csr;
+  const { key, location, pageType, zIndex } = entry;
+  const { pathRoute } = location;
+  const renders = useMemo(
+    () => [...pathRoute.renderLayouts, pathRoute.renderPage],
+    [pathRoute.renderLayouts, pathRoute.renderPage],
+  );
+  useEffect(() => {
+    if (pageType === "current") NativeUpdates.confirm();
+  }, [pageType]);
   const pageContainers = document.getElementById("pageContainers");
   if (!pageContainers) return null;
-  const { location, page, pageContentRef, pageClassName, pageBind, zIndex } =
+  const { page, pageContentRef, pageClassName, pageBind } =
     pageType === "current"
       ? {
-          location: currentLocation,
           page: currentPage,
           pageContentRef: currentPageContentRef,
           pageClassName: currentPageClassName,
           pageBind: currentPageBind,
-          zIndex: history.current.idx,
         }
       : pageType === "prev"
-        ? {
-            location: prevLocation,
-            page: prevPage,
-            pageContentRef: prevPageContentRef,
-            pageClassName: "",
-            pageBind: () => ({}),
-            zIndex: history.current.idxMap.get(prevLocation?.pathname ?? "") ?? 0,
-          }
-        : pageType === "pending"
-          ? {
-              location: pendingLocation,
-              page: null,
-              pageContentRef: null,
-              pageClassName: "",
-              pageBind: () => ({}),
-              zIndex: history.current.idx + 1,
-            }
-          : {
-              location: history.current.cachedLocationMap.get(pathRoute.path),
-              page: null,
-              pageContentRef: null,
-              pageClassName: "",
-              pageBind: () => ({}),
-              zIndex: 0,
-            };
-  if (!location) return null;
+        ? { page: prevPage, pageContentRef: prevPageContentRef, pageClassName: "", pageBind: () => ({}) }
+        : { page: null, pageContentRef: null, pageClassName: "", pageBind: () => ({}) };
+  //? A page nobody sees keeps its state and DOM but not its effects: a cached page, the page a transition-less switch
+  //? left once it settled, and the page under the current one while the app is in the background. Otherwise the page
+  //? under an animated transition stays live, since a swipe back shows it.
+  const activity: PageActivity =
+    pageType === "cached" ||
+    (pageType === "prev" &&
+      (csr.isBackgrounded || (currentLocation.pathRoute.pageState.transition === "none" && csr.phase === "idle")))
+      ? "hidden"
+      : pageType;
   return (
-    <>
+    <Activity mode={activity === "hidden" ? "hidden" : "visible"}>
       {createPortal(
         <animated.div
-          id={`pageContainer-${pathRoute.path}`}
+          id={`pageContainer-${key}`}
+          data-path={pathRoute.path}
+          inert={pageType !== "current"}
+          aria-hidden={pageType === "current" ? undefined : true}
           style={{
             ...(page?.containerStyle ?? {}),
             ...(pageType === "pending"
               ? { opacity: 0, pointerEvents: "none", transform: "translate3d(100vw, 0, 0)", zIndex: -1 }
               : { zIndex }),
           }}
-          className={clsx("absolute top-0 left-0 isolate w-screen", {
-            absolute: pageType !== "current",
-            hidden: pageType === "cached",
-            "pointer-events-none": pageType === "prev" || pageType === "pending",
-          })}
+          className={cn(
+            "absolute top-0 left-0 isolate w-screen",
+            pageType !== "current" && "absolute",
+            pageType === "cached" && "hidden",
+            (pageType === "prev" || pageType === "pending") && "pointer-events-none",
+          )}
         >
           <ClientPathWrapper
             id="pageContent"
             wrapperRef={pageContentRef}
             bind={pageBind}
-            className={clsx("akan-page-content relative isolate w-full overflow-x-hidden bg-base-100 shadow-inner", {
-              "relative isolate overflow-x-hidden bg-base-100 shadow-inner": pageType === "current",
-              "pointer-events-none isolate h-screen w-screen overflow-hidden":
-                pageType === "prev" || pageType === "pending",
-              [pageClassName]: pathRoute.pageState.gesture,
-            })}
+            className={cn(
+              "akan-page-content relative isolate w-full overflow-x-hidden bg-background shadow-inner",
+              pageType === "current" && "relative isolate overflow-x-hidden bg-background shadow-inner",
+              (pageType === "prev" || pageType === "pending") &&
+                "pointer-events-none isolate h-screen w-screen overflow-hidden",
+              pathRoute.pageState.gesture && pageClassName,
+            )}
             style={page?.contentStyle}
             pageType={pageType}
+            pageKey={key}
+            activity={activity}
             location={location}
             prefix={prefix}
           >
-            <RenderLayer
-              renders={[...pathRoute.renderLayouts, pathRoute.renderPage]}
-              index={0}
-              params={location.params}
-              searchParams={location.searchParams}
-            />
+            <RenderLayer renders={renders} index={0} params={location.params} searchParams={location.searchParams} />
           </ClientPathWrapper>
         </animated.div>,
         pageContainers,
       )}
-    </>
+    </Activity>
   );
 };
-
-interface RenderLayerProps {
-  renders: RouteRender[];
-  index: number;
-  params: Record<string, string>;
-  searchParams: Record<string, string | string[]>;
-}
-const RenderLayer = memo(({ renders, index, params, searchParams }: RenderLayerProps) => {
-  const isLast = index >= renders.length - 1;
-  const children = isLast ? (
-    <></>
-  ) : (
-    <RenderLayer renders={renders} index={index + 1} params={params} searchParams={searchParams} />
-  );
-  const routeRender = renders[index];
-  const isAsyncRender = isAsyncRouteRender(routeRender);
-  const resultRef = useRef<ReactNode | Promise<ReactNode> | null>(null);
-  if (isAsyncRender && resultRef.current === null) {
-    resultRef.current = routeRender?.render({ children, params, searchParams } as never) ?? null;
-  }
-  const { fulfilled, value: Component } = useFetch(resultRef.current);
-  if (!routeRender) return null;
-  if (!isAsyncRender) return createElement(routeRender.render as never, { children, params, searchParams } as never);
-  if (!fulfilled || !Component) return <>{composeLoadingFallback(renders.slice(index), params)}</>;
-  return <>{Component}</>;
-});
-
-function isAsyncRouteRender(routeRender?: RouteRender): boolean {
-  return Boolean(routeRender?.isAsync || routeRender?.render.constructor.name === "AsyncFunction");
-}
-
-function composeLoadingFallback(renders: RouteRender[], params: Record<string, string>): ReactNode {
-  let element: ReactNode = null;
-  for (let i = renders.length - 1; i >= 0; i--) {
-    const Loading = renders[i]?.Loading;
-    if (!Loading) continue;
-    element = Loading({ params, children: element } as never) as ReactNode;
-  }
-  return element;
-}
 
 export default CSRProvider;

@@ -11,6 +11,23 @@ async function renderToText(node: ReactNode): Promise<string> {
   return new Response(await renderToReadableStream(node)).text();
 }
 
+const pageInput = ({ pathRoute, params }: NonNullable<ReturnType<typeof RouteTreeBuilder.match>>) => ({
+  pathRoute,
+  params,
+  searchParams: {},
+});
+
+const buildDocsApiRoutes = () =>
+  new RouteTreeBuilder({
+    "./__root_layout.tsx": async () => ({
+      default: ({ children }: { children: ReactNode }) => <main>root:{children}</main>,
+    }),
+    "./docs/_layout.tsx": async () => ({
+      default: ({ children }: { children: ReactNode }) => <section>docs:{children}</section>,
+    }),
+    "./docs/api.tsx": async () => ({ default: () => <article>api</article> }),
+  }).build();
+
 function containsElementType(node: ReactNode, type: unknown): boolean {
   if (Array.isArray(node)) return node.some((child) => containsElementType(child, type));
   if (!isValidElement(node)) return false;
@@ -71,14 +88,8 @@ describe("RouteTreeBuilder implicit locale", () => {
 
       const bar = RouteTreeBuilder.match("/ko/foo/bar", routes);
       const baz = RouteTreeBuilder.match("/ko/foo/baz", routes);
-      expect(
-        bar &&
-          (await RouteElementComposer.resolveHead({ pathRoute: bar.pathRoute, params: bar.params, searchParams: {} })),
-      ).toBe("foo-root");
-      expect(
-        baz &&
-          (await RouteElementComposer.resolveHead({ pathRoute: baz.pathRoute, params: baz.params, searchParams: {} })),
-      ).toBe("baz-page");
+      expect(bar && (await RouteElementComposer.resolveHead(pageInput(bar)))).toBe("foo-root");
+      expect(baz && (await RouteElementComposer.resolveHead(pageInput(baz)))).toBe("baz-page");
     } finally {
       process.env.AKAN_PUBLIC_BASE_PATHS = prevBasePaths;
     }
@@ -95,14 +106,7 @@ describe("RouteTreeBuilder implicit locale", () => {
     }).build();
     const matched = RouteTreeBuilder.match("/ko/foo", routes);
 
-    expect(
-      matched &&
-        (await RouteElementComposer.resolveHead({
-          pathRoute: matched.pathRoute,
-          params: matched.params,
-          searchParams: {},
-        })),
-    ).toBe("root");
+    expect(matched && (await RouteElementComposer.resolveHead(pageInput(matched)))).toBe("root");
   });
 
   test("resolves SSR frame state from layout and page config chain", async () => {
@@ -136,275 +140,45 @@ describe("RouteTreeBuilder implicit locale", () => {
     });
   });
 
-  test("allows generated internal root layouts to expose head and metadata channels", async () => {
+  test("renders nothing when the generated internal root layout has no head", async () => {
     const routes = new RouteTreeBuilder({
       "./__root_layout.tsx": async () => ({
         default: ({ children }: { children: ReactNode }) => children,
         generateHead: () => null,
-        generateMetadata: () => ({}),
       }),
       "./foo.tsx": async () => ({ default: () => null }),
     }).build();
     const matched = RouteTreeBuilder.match("/ko/foo", routes);
     if (!matched) throw new Error("route did not match");
 
-    const head = await RouteElementComposer.resolveHead({
-      pathRoute: matched.pathRoute,
-      params: matched.params,
-      searchParams: {},
-    });
+    const head = await RouteElementComposer.resolveHead(pageInput(matched));
 
     await expect(renderToText(head)).resolves.toBe("");
   });
 
-  test("resolves declarative metadata exports into head elements", async () => {
+  test("uses the nearest head without merging parent heads", async () => {
     const routes = new RouteTreeBuilder({
       "./__root_layout.tsx": async () => ({
         default: ({ children }: { children: ReactNode }) => children,
-        metadata: { title: "Root", description: "Root description" },
-      }),
-      "./docs.tsx": async () => ({
-        default: () => null,
-        generateMetadata: ({ params, searchParams }) => ({
-          title: `Docs ${params.lang}`,
-          description: `Section ${searchParams.section}`,
-          robots: "index,follow",
-          openGraph: { title: "OG Docs", images: ["/og.png"] },
-          twitter: { card: "summary_large_image", title: "Twitter Docs", images: ["/twitter.png", "/twitter-2.png"] },
-          alternates: {
-            canonical: "https://example.com/docs",
-            languages: { ko: "https://example.com/ko/docs", en: "https://example.com/en/docs" },
-          },
-        }),
-      }),
-    }).build();
-    const matched = RouteTreeBuilder.match("/ko/docs", routes);
-    if (!matched) throw new Error("route did not match");
-
-    const head = await RouteElementComposer.resolveHead({
-      pathRoute: matched.pathRoute,
-      params: matched.params,
-      searchParams: { section: "api" },
-    });
-    const resolvedHead = await RouteElementComposer.resolveHeadWithMetadata({
-      pathRoute: matched.pathRoute,
-      params: matched.params,
-      searchParams: { section: "api" },
-    });
-    const html = await renderToText(head);
-
-    expect(resolvedHead.hasExplicitLanguageAlternates).toBe(true);
-    expect(resolvedHead.headSnapshot?.version).toBe(1);
-    expect(resolvedHead.headSnapshot?.nodes[0]).toEqual({ tag: "title", text: "Docs ko" });
-    expect(resolvedHead.headSnapshot?.nodes[1]).toEqual({
-      tag: "meta",
-      attrs: { name: "description", content: "Section api" },
-    });
-    expect(html).toContain("Docs ko</title>");
-    expect(html).toContain('data-akan-head="route"');
-    expect(html).toContain('data-akan-head-key="title:0"');
-    expect(html).toContain('name="description"');
-    expect(html).toContain('content="Section api"');
-    expect(html).toContain('name="robots"');
-    expect(html).toContain('content="index,follow"');
-    expect(html).toContain('property="og:title"');
-    expect(html).toContain('content="OG Docs"');
-    expect(html).toContain('property="og:image"');
-    expect(html).toContain('content="/og.png"');
-    expect(html).toContain('name="twitter:card"');
-    expect(html).toContain('content="summary_large_image"');
-    expect(html).toContain('name="twitter:image"');
-    expect(html).toContain('content="/twitter.png"');
-    expect(html).toContain('content="/twitter-2.png"');
-    expect(html).toContain('rel="canonical"');
-    expect(html).toContain('href="https://example.com/docs"');
-    expect(html).toContain('hrefLang="ko"');
-    expect(html).toContain('href="https://example.com/ko/docs"');
-    expect(html).toContain('hrefLang="en"');
-    expect(html).toContain('href="https://example.com/en/docs"');
-    expect(html).not.toContain("Root description");
-  });
-
-  test("resolves query-dependent metadata snapshots from target search params", async () => {
-    const routes = new RouteTreeBuilder({
-      "./__root_layout.tsx": async () => ({
-        default: ({ children }: { children: ReactNode }) => children,
-      }),
-      "./docs.tsx": async () => ({
-        default: () => null,
-        generateMetadata: ({ searchParams }) => {
-          const page = String(searchParams.page ?? "1");
-          return {
-            title: `Docs page ${page}`,
-            description: `Listing page ${page}`,
-            alternates: { canonical: `https://example.com/docs?page=${page}` },
-          };
-        },
-      }),
-    }).build();
-    const matched = RouteTreeBuilder.match("/ko/docs", routes);
-    if (!matched) throw new Error("route did not match");
-
-    const first = await RouteElementComposer.resolveHeadWithMetadata({
-      pathRoute: matched.pathRoute,
-      params: matched.params,
-      searchParams: { page: "1" },
-    });
-    const second = await RouteElementComposer.resolveHeadWithMetadata({
-      pathRoute: matched.pathRoute,
-      params: matched.params,
-      searchParams: { page: "2" },
-    });
-
-    expect(first.headSnapshot?.nodes).toContainEqual({ tag: "title", text: "Docs page 1" });
-    expect(first.headSnapshot?.nodes).toContainEqual({
-      tag: "link",
-      attrs: { rel: "canonical", href: "https://example.com/docs?page=1" },
-    });
-    expect(second.headSnapshot?.nodes).toContainEqual({ tag: "title", text: "Docs page 2" });
-    expect(second.headSnapshot?.nodes).toContainEqual({
-      tag: "meta",
-      attrs: { name: "description", content: "Listing page 2" },
-    });
-    expect(second.headSnapshot?.nodes).toContainEqual({
-      tag: "link",
-      attrs: { rel: "canonical", href: "https://example.com/docs?page=2" },
-    });
-  });
-
-  test("renders empty metadata exports as empty head fragments", async () => {
-    const routes = new RouteTreeBuilder({
-      "./__root_layout.tsx": async () => ({
-        default: ({ children }: { children: ReactNode }) => children,
-        metadata: { title: "Root" },
-      }),
-      "./empty-static.tsx": async () => ({
-        default: () => null,
-        metadata: {},
-      }),
-      "./empty-dynamic.tsx": async () => ({
-        default: () => null,
-        generateMetadata: () => ({}),
-      }),
-    }).build();
-    const staticMatch = RouteTreeBuilder.match("/ko/empty-static", routes);
-    const dynamicMatch = RouteTreeBuilder.match("/ko/empty-dynamic", routes);
-    if (!staticMatch || !dynamicMatch) throw new Error("route did not match");
-
-    const staticHead = await RouteElementComposer.resolveHead({
-      pathRoute: staticMatch.pathRoute,
-      params: staticMatch.params,
-      searchParams: {},
-    });
-    const dynamicHead = await RouteElementComposer.resolveHead({
-      pathRoute: dynamicMatch.pathRoute,
-      params: dynamicMatch.params,
-      searchParams: {},
-    });
-
-    await expect(renderToText(staticHead)).resolves.toBe("");
-    await expect(renderToText(dynamicHead)).resolves.toBe("");
-  });
-
-  test("does not treat unknown plain head objects as metadata", async () => {
-    const routes = new RouteTreeBuilder({
-      "./__root_layout.tsx": async () => ({
-        default: ({ children }: { children: ReactNode }) => children,
-      }),
-      "./bad-head-object.tsx": async () => ({
-        default: () => null,
-        generateHead: () => ({ custom: "value" }) as never,
-      }),
-    }).build();
-    const matched = RouteTreeBuilder.match("/ko/bad-head-object", routes);
-    if (!matched) throw new Error("route did not match");
-
-    const head = await RouteElementComposer.resolveHead({
-      pathRoute: matched.pathRoute,
-      params: matched.params,
-      searchParams: {},
-    });
-    const resolvedHead = await RouteElementComposer.resolveHeadWithMetadata({
-      pathRoute: matched.pathRoute,
-      params: matched.params,
-      searchParams: {},
-    });
-
-    expect(head as unknown).toEqual({ custom: "value" });
-    expect(resolvedHead.headSnapshot).toBeUndefined();
-  });
-
-  test("keeps automatic language alternates enabled for canonical-only metadata", async () => {
-    const routes = new RouteTreeBuilder({
-      "./__root_layout.tsx": async () => ({
-        default: ({ children }: { children: ReactNode }) => children,
-      }),
-      "./canonical.tsx": async () => ({
-        default: () => null,
-        metadata: { alternates: { canonical: "https://example.com/canonical" } },
-      }),
-    }).build();
-    const matched = RouteTreeBuilder.match("/ko/canonical", routes);
-    if (!matched) throw new Error("route did not match");
-
-    const resolvedHead = await RouteElementComposer.resolveHeadWithMetadata({
-      pathRoute: matched.pathRoute,
-      params: matched.params,
-      searchParams: {},
-    });
-
-    expect(resolvedHead.hasExplicitLanguageAlternates).toBe(false);
-    expect(await renderToText(resolvedHead.node)).toContain('rel="canonical"');
-  });
-
-  test("detects explicit language alternates from generated wrapper head metadata objects", async () => {
-    const routes = new RouteTreeBuilder({
-      "./__root_layout.tsx": async () => ({
-        default: ({ children }: { children: ReactNode }) => children,
-      }),
-      "./wrapped-languages.tsx": async () => ({
-        default: () => null,
-        generateHead: () =>
-          ({
-            alternates: { languages: { ko: "https://example.com/ko/wrapped" } },
-          }) as never,
-      }),
-    }).build();
-    const matched = RouteTreeBuilder.match("/ko/wrapped-languages", routes);
-    if (!matched) throw new Error("route did not match");
-
-    const resolvedHead = await RouteElementComposer.resolveHeadWithMetadata({
-      pathRoute: matched.pathRoute,
-      params: matched.params,
-      searchParams: {},
-    });
-
-    expect(resolvedHead.hasExplicitLanguageAlternates).toBe(true);
-    expect(await renderToText(resolvedHead.node)).toContain('href="https://example.com/ko/wrapped"');
-  });
-
-  test("uses nearest metadata without merging parent metadata", async () => {
-    const routes = new RouteTreeBuilder({
-      "./__root_layout.tsx": async () => ({
-        default: ({ children }: { children: ReactNode }) => children,
-        metadata: {
-          title: "Root",
-          description: "Root description",
-          openGraph: { siteName: "Root Site", images: ["/root-og.png"] },
-          alternates: { canonical: "https://example.com/root" },
-        },
+        head: (
+          <>
+            <title>Root</title>
+            <link rel="icon" href="/root.ico" />
+          </>
+        ),
       }),
       "./docs/_layout.tsx": async () => ({
         default: ({ children }: { children: ReactNode }) => children,
-        metadata: {
-          title: "Docs Layout",
-          description: "Docs layout description",
-          openGraph: { siteName: "Docs Site" },
-        },
+        head: (
+          <>
+            <title>Docs Layout</title>
+            <meta name="description" content="Docs layout description" />
+          </>
+        ),
       }),
       "./docs/guide.tsx": async () => ({
         default: () => null,
-        metadata: { title: "Guide" },
+        head: <title>Guide</title>,
       }),
       "./docs/reference.tsx": async () => ({
         default: () => null,
@@ -414,30 +188,16 @@ describe("RouteTreeBuilder implicit locale", () => {
     const reference = RouteTreeBuilder.match("/ko/docs/reference", routes);
     if (!guide || !reference) throw new Error("route did not match");
 
-    const guideHtml = await renderToText(
-      await RouteElementComposer.resolveHead({
-        pathRoute: guide.pathRoute,
-        params: guide.params,
-        searchParams: {},
-      }),
-    );
-    const referenceHtml = await renderToText(
-      await RouteElementComposer.resolveHead({
-        pathRoute: reference.pathRoute,
-        params: reference.params,
-        searchParams: {},
-      }),
-    );
+    const guideHtml = await renderToText(await RouteElementComposer.resolveHead(pageInput(guide)));
+    const referenceHtml = await renderToText(await RouteElementComposer.resolveHead(pageInput(reference)));
 
     expect(guideHtml).toContain("Guide</title>");
     expect(guideHtml).not.toContain("Docs layout description");
-    expect(guideHtml).not.toContain("Docs Site");
-    expect(guideHtml).not.toContain("/root-og.png");
+    expect(guideHtml).not.toContain("/root.ico");
     expect(referenceHtml).toContain("Docs Layout</title>");
     expect(referenceHtml).toContain("Docs layout description");
-    expect(referenceHtml).toContain("Docs Site");
+    expect(referenceHtml).not.toContain("/root.ico");
   });
-
   test("supports route groups, repeated search params, and cached lazy modules", async () => {
     let loadCount = 0;
     const routes = new RouteTreeBuilder({
@@ -455,22 +215,8 @@ describe("RouteTreeBuilder implicit locale", () => {
       sort: "latest",
     });
 
-    expect(
-      matched &&
-        (await RouteElementComposer.resolveHead({
-          pathRoute: matched.pathRoute,
-          params: matched.params,
-          searchParams: {},
-        })),
-    ).toBe("about");
-    expect(
-      matched &&
-        (await RouteElementComposer.resolveHead({
-          pathRoute: matched.pathRoute,
-          params: matched.params,
-          searchParams: {},
-        })),
-    ).toBe("about");
+    expect(matched && (await RouteElementComposer.resolveHead(pageInput(matched)))).toBe("about");
+    expect(matched && (await RouteElementComposer.resolveHead(pageInput(matched)))).toBe("about");
     expect(loadCount).toBe(1);
     expect(RouteTreeBuilder.getCacheStats()).toMatchObject({
       moduleCount: 2,
@@ -493,68 +239,25 @@ describe("RouteTreeBuilder implicit locale", () => {
     }).build();
     const matched = RouteTreeBuilder.match("/ko/bad", routes);
 
-    expect(
-      matched &&
-        RouteElementComposer.resolveHead({ pathRoute: matched.pathRoute, params: matched.params, searchParams: {} }),
-    ).rejects.toThrow('[route-convention] unsupported export "loader"');
+    expect(matched && RouteElementComposer.resolveHead(pageInput(matched))).rejects.toThrow(
+      '[route-convention] unsupported export "loader"',
+    );
 
     const routesWithBadFallback = new RouteTreeBuilder({
       "./bad-fallback.tsx": async () => ({ default: () => null, NotFound: () => null }) as never,
     }).build();
     const badFallback = RouteTreeBuilder.match("/ko/bad-fallback", routesWithBadFallback);
-    expect(
-      badFallback &&
-        RouteElementComposer.resolveHead({
-          pathRoute: badFallback.pathRoute,
-          params: badFallback.params,
-          searchParams: {},
-        }),
-    ).rejects.toThrow('[route-convention] unsupported export "NotFound"');
+    expect(badFallback && RouteElementComposer.resolveHead(pageInput(badFallback))).rejects.toThrow(
+      '[route-convention] unsupported export "NotFound"',
+    );
 
-    const routesWithConflictingHead = new RouteTreeBuilder({
-      "./bad-head.tsx": async () => ({ default: () => null, head: "x", metadata: { title: "x" } }) as never,
+    const routesWithMetadata = new RouteTreeBuilder({
+      "./with-metadata.tsx": async () => ({ default: () => null, metadata: { title: "x" } }) as never,
     }).build();
-    const badHead = RouteTreeBuilder.match("/ko/bad-head", routesWithConflictingHead);
-    expect(
-      badHead &&
-        RouteElementComposer.resolveHead({
-          pathRoute: badHead.pathRoute,
-          params: badHead.params,
-          searchParams: {},
-        }),
-    ).rejects.toThrow("head/generateHead and metadata/generateMetadata cannot both be exported");
-
-    const routesWithConflictingMetadata = new RouteTreeBuilder({
-      "./bad-metadata.tsx": async () =>
-        ({
-          default: () => null,
-          metadata: { title: "x" },
-          generateMetadata: () => ({ title: "y" }),
-        }) as never,
-    }).build();
-    const badMetadata = RouteTreeBuilder.match("/ko/bad-metadata", routesWithConflictingMetadata);
-    expect(
-      badMetadata &&
-        RouteElementComposer.resolveHead({
-          pathRoute: badMetadata.pathRoute,
-          params: badMetadata.params,
-          searchParams: {},
-        }),
-    ).rejects.toThrow("metadata and generateMetadata cannot both be exported");
-
-    const routesWithConflictingGenerate = new RouteTreeBuilder({
-      "./bad-generate.tsx": async () =>
-        ({ default: () => null, generateHead: () => "x", generateMetadata: () => ({ title: "x" }) }) as never,
-    }).build();
-    const badGenerate = RouteTreeBuilder.match("/ko/bad-generate", routesWithConflictingGenerate);
-    expect(
-      badGenerate &&
-        RouteElementComposer.resolveHead({
-          pathRoute: badGenerate.pathRoute,
-          params: badGenerate.params,
-          searchParams: {},
-        }),
-    ).rejects.toThrow("head/generateHead and metadata/generateMetadata cannot both be exported");
+    const withMetadata = RouteTreeBuilder.match("/ko/with-metadata", routesWithMetadata);
+    expect(withMetadata && RouteElementComposer.resolveHead(pageInput(withMetadata))).rejects.toThrow(
+      '[route-convention] unsupported export "metadata"',
+    );
   });
 
   test("composes nearest layout NotFound and Error fallbacks", async () => {
@@ -622,30 +325,11 @@ describe("RouteTreeBuilder implicit locale", () => {
   });
 
   test("composes route suffix renders", async () => {
-    const routes = new RouteTreeBuilder({
-      "./__root_layout.tsx": async () => ({
-        default: ({ children }: { children: ReactNode }) => <main>root:{children}</main>,
-      }),
-      "./docs/_layout.tsx": async () => ({
-        default: ({ children }: { children: ReactNode }) => <section>docs:{children}</section>,
-      }),
-      "./docs/api.tsx": async () => ({ default: () => <article>api</article> }),
-    }).build();
-    const matched = RouteTreeBuilder.match("/ko/docs/api", routes);
+    const matched = RouteTreeBuilder.match("/ko/docs/api", buildDocsApiRoutes());
     if (!matched) throw new Error("route did not match");
 
-    const suffix = RouteElementComposer.composeSuffix({
-      pathRoute: matched.pathRoute,
-      params: matched.params,
-      searchParams: {},
-      patchStartIndex: 2,
-    });
-    const invalidSuffix = RouteElementComposer.composeSuffix({
-      pathRoute: matched.pathRoute,
-      params: matched.params,
-      searchParams: {},
-      patchStartIndex: 99,
-    });
+    const suffix = RouteElementComposer.composeSuffix({ ...pageInput(matched), patchStartIndex: 2 });
+    const invalidSuffix = RouteElementComposer.composeSuffix({ ...pageInput(matched), patchStartIndex: 99 });
 
     expect(await renderToText(suffix)).toContain("api");
     expect(await renderToText(suffix)).not.toContain("docs:");
@@ -655,36 +339,14 @@ describe("RouteTreeBuilder implicit locale", () => {
   test("wraps full page renders in a guarded segment outlet without wrapping suffix renders", () => {
     const previous = process.env.AKAN_PUBLIC_RSC_PARTIAL_COMMIT;
     try {
-      const routes = new RouteTreeBuilder({
-        "./__root_layout.tsx": async () => ({
-          default: ({ children }: { children: ReactNode }) => <main>root:{children}</main>,
-        }),
-        "./docs/_layout.tsx": async () => ({
-          default: ({ children }: { children: ReactNode }) => <section>docs:{children}</section>,
-        }),
-        "./docs/api.tsx": async () => ({ default: () => <article>api</article> }),
-      }).build();
-      const matched = RouteTreeBuilder.match("/ko/docs/api", routes);
+      const matched = RouteTreeBuilder.match("/ko/docs/api", buildDocsApiRoutes());
       if (!matched) throw new Error("route did not match");
 
       process.env.AKAN_PUBLIC_RSC_PARTIAL_COMMIT = "0";
-      const guardOff = RouteElementComposer.compose({
-        pathRoute: matched.pathRoute,
-        params: matched.params,
-        searchParams: {},
-      });
+      const guardOff = RouteElementComposer.compose(pageInput(matched));
       process.env.AKAN_PUBLIC_RSC_PARTIAL_COMMIT = "1";
-      const guardOn = RouteElementComposer.compose({
-        pathRoute: matched.pathRoute,
-        params: matched.params,
-        searchParams: {},
-      });
-      const suffix = RouteElementComposer.composeSuffix({
-        pathRoute: matched.pathRoute,
-        params: matched.params,
-        searchParams: {},
-        patchStartIndex: 2,
-      });
+      const guardOn = RouteElementComposer.compose(pageInput(matched));
+      const suffix = RouteElementComposer.composeSuffix({ ...pageInput(matched), patchStartIndex: 2 });
 
       expect(containsElementType(guardOff, AkanSegmentOutletReference)).toBe(false);
       expect(containsElementType(guardOn, AkanSegmentOutletReference)).toBe(true);
@@ -701,11 +363,9 @@ describe("RouteTreeBuilder _overrides", () => {
   const DefaultModal: AkanModalComponent = ({ title }) => <div data-skin="default">{title}</div>;
   const BrandModal: AkanModalComponent = ({ title }) => <div data-skin="brand">{title}</div>;
   const InnerModal: AkanModalComponent = ({ title }) => <div data-skin="inner">{title}</div>;
-  // The page renders through the real "Modal" override slot, exactly like a shipped `<Modal>` call site.
   const Widget = createOverridable("Modal", DefaultModal);
 
-  // Mirrors the build: a `_overrides.tsx` manifest's default is `override({ ... })` (a plain slot map), served
-  // through a generated `"use client"` wrapper whose default mounts the provider with that map.
+  // Mirrors the generated "use client" wrapper: its default mounts UiOverrideProvider with the manifest's slot map.
   const overridesWrapperModule = (slots: { Modal: AkanModalComponent }) => {
     const value = override(slots);
     return {
@@ -727,9 +387,7 @@ describe("RouteTreeBuilder _overrides", () => {
   async function renderMatched(routes: ReturnType<typeof buildOverrideTree>, pathname: string): Promise<string> {
     const matched = RouteTreeBuilder.match(pathname, routes);
     if (!matched) throw new Error(`route did not match: ${pathname}`);
-    return renderToText(
-      RouteElementComposer.compose({ pathRoute: matched.pathRoute, params: matched.params, searchParams: {} }),
-    );
+    return renderToText(RouteElementComposer.compose(pageInput(matched)));
   }
 
   test("a root _overrides.tsx activates the override for the whole subtree", async () => {
@@ -744,5 +402,67 @@ describe("RouteTreeBuilder _overrides", () => {
     expect(html).toContain('data-skin="inner"');
     expect(html).not.toContain('data-skin="brand"');
     expect(html).toContain("PANEL");
+  });
+
+  // Assert the resolved skin, not provider presence: in the regression the provider existed, inside the root layout.
+  const shellLayoutModule = (title: string) => ({
+    default: ({ children }: { children: ReactNode }) => (
+      <>
+        <Widget onCancel={() => {}} open title={title} />
+        {children}
+      </>
+    ),
+  });
+
+  test("a root layout's own UI resolves through the manifest, not past it", async () => {
+    const routes = new RouteTreeBuilder({
+      "./__root_layout.tsx": async () => shellLayoutModule("SHELL"),
+      "./_overrides.tsx": async () => overridesWrapperModule({ Modal: BrandModal }),
+      "./foo.tsx": async () => ({ default: () => null }),
+    }).build();
+    const html = await renderMatched(routes, "/ko/foo");
+    expect(html).toContain("SHELL");
+    expect(html).toContain('data-skin="brand"');
+    expect(html).not.toContain('data-skin="default"');
+  });
+
+  test("crossing a nested _overrides.tsx keeps every render above it, so only the new branch remounts", async () => {
+    const routes = new RouteTreeBuilder({
+      "./__root_layout.tsx": async () => shellLayoutModule("SHELL"),
+      "./_overrides.tsx": async () => overridesWrapperModule({ Modal: BrandModal }),
+      "./(ws)/_layout.tsx": async () => ({ default: ({ children }: { children: ReactNode }) => children }),
+      "./(ws)/chat.tsx": async () => ({ default: () => <Widget open onCancel={() => {}} title="CHAT" /> }),
+      "./(ws)/pageBlock/_overrides.tsx": async () => overridesWrapperModule({ Modal: InnerModal }),
+      "./(ws)/pageBlock/edit.tsx": async () => ({ default: () => <Widget open onCancel={() => {}} title="EDIT" /> }),
+    }).build();
+    const stackOf = (pathname: string) => {
+      const matched = RouteTreeBuilder.match(pathname, routes);
+      if (!matched) throw new Error(`route did not match: ${pathname}`);
+      return [...matched.pathRoute.renderRootLayouts, ...matched.pathRoute.renderLayouts];
+    };
+    const chatStack = stackOf("/ko/chat");
+    const editStack = stackOf("/ko/pageBlock/edit");
+    expect(editStack.slice(0, chatStack.length)).toEqual(chatStack);
+    expect(editStack).toHaveLength(chatStack.length + 1);
+
+    const chatHtml = await renderMatched(routes, "/ko/chat");
+    expect(chatHtml).toContain('data-skin="brand"');
+    expect(chatHtml).not.toContain('data-skin="inner"');
+    const editHtml = await renderMatched(routes, "/ko/pageBlock/edit");
+    expect(editHtml).toMatch(/data-skin="brand">SHELL/);
+    expect(editHtml).toMatch(/data-skin="inner">EDIT/);
+  });
+
+  test("a route-group layout is a root layout too, and its UI resolves the same way", async () => {
+    const routes = new RouteTreeBuilder({
+      "./__root_layout.tsx": async () => ({ default: ({ children }: { children: ReactNode }) => children }),
+      "./_overrides.tsx": async () => overridesWrapperModule({ Modal: BrandModal }),
+      "./(canvas)/_layout.tsx": async () => shellLayoutModule("CANVAS"),
+      "./(canvas)/board.tsx": async () => ({ default: () => null }),
+    }).build();
+    const html = await renderMatched(routes, "/ko/board");
+    expect(html).toContain("CANVAS");
+    expect(html).toContain('data-skin="brand"');
+    expect(html).not.toContain('data-skin="default"');
   });
 });

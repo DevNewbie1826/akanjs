@@ -10,6 +10,7 @@ import {
   type PrimitiveScalar,
 } from "akanjs/base";
 import { ConstantRegistry } from "akanjs/constant";
+import { databaseStateNames } from "./databaseStateNames";
 
 export type StateInitializer = () => unknown;
 export type StateInitializerMap = Record<string, StateInitializer>;
@@ -40,7 +41,14 @@ export interface ComputedMeta {
   equals: (a: any, b: any) => boolean;
 }
 
+export interface DraftMeta {
+  refName: string;
+  formKey: string;
+  draftKey: string;
+}
+
 export interface StateDerivedMeta {
+  drafts: Record<string, DraftMeta>;
   persistSession: Record<string, PersistSessionMeta>;
   search: Record<string, SearchMeta>;
   computed: Record<string, ComputedMeta>;
@@ -142,7 +150,20 @@ export interface DerivedStateBuilder<WritableState> {
   };
 }
 
+const draftMetaByRefName = new Map<string, DraftMeta>();
+
+// Memoized: `mergeDerivedMeta` decides a conflict by identity, and a lib and an app store register one model twice.
+export const draftMetaOf = (refName: string): DraftMeta => {
+  const cached = draftMetaByRefName.get(refName);
+  if (cached) return cached;
+  const names = databaseStateNames(refName);
+  const meta: DraftMeta = { refName, formKey: names.modelForm, draftKey: names.modelDraft };
+  draftMetaByRefName.set(refName, meta);
+  return meta;
+};
+
 export const createEmptyDerivedMeta = (): StateDerivedMeta => ({
+  drafts: {},
   persistSession: {},
   search: {},
   computed: {},
@@ -153,20 +174,23 @@ export const mergeDerivedMeta = (...metas: (StateDerivedMeta | undefined)[]): St
   const merged = createEmptyDerivedMeta();
   for (const meta of metas) {
     if (!meta) continue;
+    mergeMetaRecord(merged.drafts, meta.drafts);
     mergeMetaRecord(merged.persistSession, meta.persistSession);
     mergeMetaRecord(merged.search, meta.search);
     mergeMetaRecord(merged.computed, meta.computed);
-    for (const key of meta.derivedKeys) {
-      if (merged.derivedKeys.has(key)) throw new Error(`Duplicate derived state key: ${key}`);
-      merged.derivedKeys.add(key);
-    }
   }
+  // Rebuilt from the two records rather than unioned, so a cleanly merged entry is never read as a duplicate.
+  for (const key of [...Object.keys(merged.search), ...Object.keys(merged.computed)]) merged.derivedKeys.add(key);
   return merged;
 };
 
+// The same object twice is a lib store merged again (merging copies references); a different one is a real conflict.
 const mergeMetaRecord = <T>(target: Record<string, T>, source: Record<string, T>) => {
   for (const [key, value] of Object.entries(source)) {
-    if (key in target) throw new Error(`Duplicate state metadata key: ${key}`);
+    if (key in target) {
+      if (Object.is(target[key], value)) continue;
+      throw new Error(`Duplicate state metadata key: ${key}`);
+    }
     target[key] = value;
   }
 };

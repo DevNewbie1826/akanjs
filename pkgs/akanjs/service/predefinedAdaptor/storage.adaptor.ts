@@ -1,5 +1,5 @@
 import { renameSync } from "node:fs";
-import type { BaseEnv } from "akanjs/base";
+import { getApiPrefix, getEnv } from "akanjs/base";
 import { adapt } from "../adapt";
 
 export interface DownloadRequest {
@@ -52,26 +52,36 @@ export interface StorageAdaptor {
   deleteDataByPath(path: string): Promise<boolean>;
 }
 
-export interface BlobStorageOptions extends BaseEnv {
+export interface BlobStorageOptions {
   blobStorage?: { baseDir?: string; privateBaseDir?: string; urlPrefix?: string };
 }
 
 export class BlobStorage
   extends adapt("blobStorage", ({ env }) => ({
     root: env(
-      ({ appName, blobStorage = { baseDir: "local", urlPrefix: "/api/localFile/getBlob" } }: BlobStorageOptions) =>
-        `${process.env.AKAN_WORKSPACE_ROOT ?? "."}/${blobStorage.baseDir ?? "local"}/${appName}/backend`,
+      ({ blobStorage = { baseDir: "local" } }: BlobStorageOptions) =>
+        `${process.env.AKAN_WORKSPACE_ROOT ?? "."}/${blobStorage.baseDir ?? "local"}/${getEnv().appName}/backend`,
     ),
     privateRoot: env(
-      ({ appName, blobStorage = { privateBaseDir: "local" } }: BlobStorageOptions) =>
-        `${process.env.AKAN_WORKSPACE_ROOT ?? "."}/${blobStorage.privateBaseDir ?? "local"}/${appName}/server-private`,
+      ({ blobStorage = { privateBaseDir: "local" } }: BlobStorageOptions) =>
+        `${process.env.AKAN_WORKSPACE_ROOT ?? "."}/${blobStorage.privateBaseDir ?? "local"}/${getEnv().appName}/server-private`,
     ),
+    // A moved prefix applies to new writes only: a blob URL is stored on the row that references it.
     urlPrefix: env(
-      ({ blobStorage = { urlPrefix: "/api/localFile/getBlob" } }: BlobStorageOptions) => blobStorage.urlPrefix,
+      ({ blobStorage }: BlobStorageOptions) => blobStorage?.urlPrefix ?? `${getApiPrefix()}/localFile/getBlob`,
     ),
   }))
   implements StorageAdaptor
 {
+  /** Throws for a deployed `multiple`/`cluster` app on local disk unless `AKAN_STORAGE_SHARED=true` marks it shared. */
+  static assertShared(storage: string) {
+    const { databaseMode, environment, operationMode } = getEnv();
+    if (!databaseMode || databaseMode === "single" || environment === "local" || operationMode === "local") return;
+    if (["1", "true"].includes(process.env.AKAN_STORAGE_SHARED ?? "")) return;
+    throw new Error(
+      `${storage} keeps files on this instance's own disk, which the other instances of a ${databaseMode} deployment cannot read. Configure object storage, or mount one volume on every instance and set AKAN_STORAGE_SHARED=true.`,
+    );
+  }
   #localPathToUrl(path: string) {
     return `${this.urlPrefix}/${path}`;
   }
@@ -92,6 +102,7 @@ export class BlobStorage
     return paths.map((path) => this.#localPathToUrl(path));
   }
   async uploadDataFromLocal({ path, localPath, meta, access = "public" }: UploadRequest) {
+    BlobStorage.assertShared("BlobStorage");
     const filePath = access === "private" ? `${this.privateRoot}/${path}` : `${this.root}/${path}`;
     await Bun.write(filePath, Bun.file(localPath));
     if (meta) await Bun.write(`${filePath}.meta`, JSON.stringify(meta));
@@ -105,6 +116,7 @@ export class BlobStorage
     uploadSuccess,
     access = "public",
   }: UploadFromStreamRequest) {
+    BlobStorage.assertShared("BlobStorage");
     const filePath = access === "private" ? `${this.privateRoot}/${path}` : `${this.root}/${path}`;
     try {
       await Bun.write(filePath, new Response(body));
@@ -120,6 +132,7 @@ export class BlobStorage
     return { localPath: renamePath ?? localPath };
   }
   async copyData({ copyPath, pastePath, host }: CopyRequest) {
+    BlobStorage.assertShared("BlobStorage");
     await Bun.write(`${this.root}/${pastePath}`, Bun.file(`${this.root}/${copyPath}`));
     return pastePath;
   }

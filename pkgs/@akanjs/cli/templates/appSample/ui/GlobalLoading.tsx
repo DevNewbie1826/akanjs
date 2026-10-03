@@ -5,7 +5,8 @@ export default function getContent(scanInfo: AppInfo | LibInfo | null, dict: { a
     filename: "GlobalLoading.tsx",
     content: `"use client";
 
-import { clsx } from "akanjs/client";
+import { cn } from "akanjs/client";
+import { Image } from "akanjs/ui";
 
 // ===== GlobalLoading.tsx =====
 // Convention: ui/ folder — reusable visual components. PascalCase .tsx, "use client" directive.
@@ -19,9 +20,9 @@ interface GlobalLoadingProps {
 
 export const GlobalLoading = ({ className, message = "Loading..." }: GlobalLoadingProps) => {
   return (
-    <div className={clsx("flex flex-col items-center justify-center gap-4 py-32", className)}>
-      <span className="loading loading-spinner loading-lg text-primary" />
-      <span className="text-base-content/60 text-sm">{message}</span>
+    <div className={cn("flex flex-col items-center justify-center gap-4 py-32", className)}>
+      <Image alt="" className="size-12 animate-bounce" height={96} src="/jelly/star.webp" width={96} />
+      <span className="text-foreground/60 text-sm">{message}</span>
     </div>
   );
 };

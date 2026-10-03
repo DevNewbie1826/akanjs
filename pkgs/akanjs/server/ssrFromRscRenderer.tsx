@@ -1,8 +1,14 @@
+//? The package ships no types; an app or lib program reaches this file without the ambient declarations otherwise.
+/// <reference path="./types/react-server-dom-webpack.d.ts" />
 import { Readable } from "node:stream";
+import { getApiPrefix, getWsPrefix } from "akanjs/base";
+import { Logger } from "akanjs/common";
 import { type AkanRequestStore, type AkanTheme, pushRequestFallback, requestStorage } from "akanjs/fetch";
 import type { ReactNode } from "react";
 import { renderToReadableStream } from "react-dom/server.browser";
 import { createFromNodeStream } from "react-server-dom-webpack/client.node";
+import { parsePositiveInt } from "./cachePolicy";
+import { concatBytes } from "./rscHttp";
 import type { SsrChunkRegistryStats, SsrFromRscInput, SsrLateRedirect } from "./ssrTypes";
 
 const DEFAULT_SSR_CHUNK_REGISTRY_MAX_ENTRIES = 1024;
@@ -43,9 +49,7 @@ export class SsrChunkRegistry<T> {
     let entry = uniqueKeys
       .map((key) => this.#entriesByKey.get(key))
       .find((item): item is SsrChunkRegistryEntry<T> => Boolean(item));
-    if (!entry) {
-      entry = { keys: new Set(), lruKey: uniqueKeys[0] as string, value };
-    }
+    entry ??= { keys: new Set(), lruKey: uniqueKeys[0] as string, value };
     entry.value = value;
 
     for (const key of uniqueKeys) {
@@ -95,7 +99,7 @@ export function encodeInlineRscChunk(chunk: Uint8Array): InlineRscChunk {
   }
 }
 
-export function htmlEscapeJsonString(value: string): string {
+function htmlEscapeJsonString(value: string): string {
   return JSON.stringify(value)
     .replace(/</g, "\\u003c")
     .replace(/>/g, "\\u003e")
@@ -129,13 +133,6 @@ function sanitizeFlightRows(
   const redirectErrorRowRe = /^([0-9a-z]+):E(\{[^\n]*"digest":"AKAN_REDIRECT(?:;[^"]*)?"[^\n]*\})(\n?)$/;
   const debugInfoRowRe = /^[0-9a-z]+:D/;
   let buffered: Uint8Array<ArrayBuffer> = new Uint8Array(0);
-
-  const concatBytes = (left: Uint8Array, right: Uint8Array): Uint8Array<ArrayBuffer> => {
-    const combined = new Uint8Array(left.byteLength + right.byteLength);
-    combined.set(left, 0);
-    combined.set(right, left.byteLength);
-    return combined;
-  };
 
   const sanitizeRow = (row: Uint8Array): Uint8Array => {
     let text: string;
@@ -178,6 +175,8 @@ function sanitizeFlightRows(
   );
 }
 
+// RSDW hints each stylesheet as `:HL[href,"stylesheet"]`, which the browser preloads with an invalid
+// as="stylesheet" (Chromium warns); only the browser-bound tee is rewritten to "style", the SSR one stays React's.
 export function sanitizeFlightForClientStream(stream: ReadableStream<Uint8Array>): ReadableStream<Uint8Array> {
   return sanitizeFlightRows(stream, { rewriteStylesheetHints: true });
 }
@@ -215,8 +214,7 @@ export class ExpectedLateRedirectStderrSuppressor {
 
   static start(lateControl?: Promise<SsrLateRedirect | null>): ExpectedLateRedirectStderrSuppressor | null {
     if (!lateControl) return null;
-    // This is a process-wide stderr hook, so keep it out of production unless
-    // explicitly requested for diagnosis.
+    // A process-wide stderr hook, so production only gets it when asked for diagnosis.
     if (process.env.NODE_ENV === "production" && process.env.AKAN_SUPPRESS_LATE_REDIRECT_STDERR !== "1") return null;
     const suppressor = new ExpectedLateRedirectStderrSuppressor(lateControl);
     ExpectedLateRedirectStderrSuppressor.#active.add(suppressor);
@@ -354,7 +352,11 @@ export function interleaveRscScriptsWithHtml(
   const bootstrapDetector = new InlineBootstrapDetector();
   const pendingRscScripts: Uint8Array[] = [];
   const pendingControlScripts: Uint8Array[] = [];
-  const maxPendingRscScripts = SsrFromRscRendererConfig.maxPendingInlineRscScripts(options.maxPendingRscScripts);
+  const explicitMax = options.maxPendingRscScripts;
+  const maxPendingRscScripts =
+    explicitMax !== undefined && Number.isFinite(explicitMax) && explicitMax > 0
+      ? Math.floor(explicitMax)
+      : (parsePositiveInt(process.env.AKAN_MAX_PENDING_INLINE_RSC_SCRIPTS) ?? DEFAULT_MAX_PENDING_INLINE_RSC_SCRIPTS);
   const queueDrainResolvers: Array<() => void> = [];
   const scriptAvailableResolvers: Array<() => void> = [];
   let errored = false;
@@ -412,7 +414,7 @@ export function interleaveRscScriptsWithHtml(
       const pumpRscScripts = async () => {
         rscReader = rscClientStream.getReader();
         try {
-          while (true) {
+          for (;;) {
             const { value, done } = await rscReader.read();
             if (done || errored) break;
             await waitForRscQueueDrain();
@@ -447,7 +449,7 @@ export function interleaveRscScriptsWithHtml(
 
         htmlReader = htmlStream.getReader();
         try {
-          while (true) {
+          for (;;) {
             const { value, done } = await htmlReader.read();
             if (done || errored) break;
             controller.enqueue(value);
@@ -475,8 +477,8 @@ export function interleaveRscScriptsWithHtml(
         controller.close();
       };
 
+      const requestContext = options.requestStore ?? options.request;
       const runPump = () => {
-        const requestContext = options.requestStore ?? options.request;
         const cleanup = requestContext ? pushRequestFallback(requestContext) : undefined;
         return pump()
           .catch(fail)
@@ -485,7 +487,6 @@ export function interleaveRscScriptsWithHtml(
             options.onComplete?.();
           });
       };
-      const requestContext = options.requestStore ?? options.request;
       if (requestContext && requestStorage) void requestStorage.run(requestContext, runPump);
       else void runPump();
     },
@@ -495,14 +496,6 @@ export function interleaveRscScriptsWithHtml(
       options.onComplete?.();
     },
   });
-}
-
-class SsrFromRscRendererConfig {
-  static maxPendingInlineRscScripts(explicit?: number): number {
-    if (explicit !== undefined && Number.isFinite(explicit) && explicit > 0) return Math.floor(explicit);
-    const parsed = Number.parseInt(process.env.AKAN_MAX_PENDING_INLINE_RSC_SCRIPTS ?? "", 10);
-    return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_MAX_PENDING_INLINE_RSC_SCRIPTS;
-  }
 }
 
 class InlineBootstrapDetector {
@@ -540,11 +533,7 @@ export class SsrFromRscRenderer {
     ssrChunkEvictionCount: 0,
   };
 
-  // Inline bootstrap that runs as a classic script BEFORE any <script type="module">.
-  // - Installs the webpack runtime shims that react-server-dom-webpack/client.browser
-  //   needs at module initialization time.
-  // - Creates a tiny queue so <script>self.__RSC_PUSH__(...)</script> tags
-  //   emitted after the HTML shell can be buffered until rscClient picks them up.
+  // A classic script, so it runs before every module script: RSDW client.browser needs these shims at module init.
   static readonly #clientBootstrap = `(function(){
   var registry = new Map();
   function load(id) {
@@ -568,6 +557,15 @@ export class SsrFromRscRenderer {
   self.__RSC_CLOSE__ = function(){ self.__RSC_CLOSED__ = true; };
 })();`;
 
+  // Not a bundle constant (only AKAN_PUBLIC_* is inlined, at build time) nor a React prop (FetchClient fixes its
+  // origin at module init): the classic bootstrap is the one thing that runs ahead of every module script.
+  static #prefixBootstrap() {
+    const api = getApiPrefix();
+    const ws = getWsPrefix();
+    if (api === "/api" && ws === "/ws") return "";
+    return `\nself.__AKAN_PREFIX__ = ${JSON.stringify({ api, ws })};`;
+  }
+
   static readonly #themeInitScript = `<script>(function(){
   try {
     var m = document.cookie.match(/(?:^|;\\s*)theme=([^;]+)/);
@@ -581,13 +579,13 @@ export class SsrFromRscRenderer {
     SsrFromRscRenderer.#installWebpackShims();
   }
 
+  static readonly #logger = new Logger("SsrFromRscRenderer");
+
   static getChunkRegistryStats(): SsrChunkRegistryStats {
     return { ...SsrFromRscRenderer.#chunkRegistryStats };
   }
 
   async render(input: SsrFromRscInput): Promise<ReadableStream<Uint8Array>> {
-    // Split the RSC stream: one branch drives the server-side SSR render, the
-    // other is relayed to the client as inline <script> tags for hydration.
     const [rscForSsr, rscForClient] = input.rscStream.tee();
 
     const ssrNodeStream = Readable.fromWeb(sanitizeFlightForSsrStream(rscForSsr) as never);
@@ -597,23 +595,24 @@ export class SsrFromRscRenderer {
       input.lateControl,
     );
 
-    const bootstrap = input.extraBootstrapInline
-      ? `${SsrFromRscRenderer.#clientBootstrap}\n${input.extraBootstrapInline}`
-      : SsrFromRscRenderer.#clientBootstrap;
+    const base = `${SsrFromRscRenderer.#clientBootstrap}${SsrFromRscRenderer.#prefixBootstrap()}`;
+    const bootstrap = input.extraBootstrapInline ? `${base}\n${input.extraBootstrapInline}` : base;
 
-    // Default to shell-first streaming: `renderToReadableStream` resolves once
-    // the shell (everything outside Suspense, including any `Loading` fallback)
-    // is ready, and rejects if the shell itself errors — so shell-scoped
-    // redirects/errors are still catchable before a byte is sent. Only `block`
-    // routes await `allReady`, buffering the whole document (which suppresses the
-    // fallback) so a non-redirect error in slow content can yield a clean page.
+    // renderToReadableStream resolves at shell-ready and rejects on a shell error, so shell redirects stay catchable;
+    // only `block` routes await allReady, trading the Loading fallback for a clean page on a late non-redirect error.
     const waitForAllReady = input.waitForAllReady || process.env.AKAN_SSR_WAIT_FOR_ALL_READY === "1";
     const renderHtml = async () => {
       const root = await thenable;
       const stream = await renderToReadableStream(root, {
         bootstrapScriptContent: bootstrap,
+        onError: (error) => SsrFromRscRenderer.#reportRenderError(error, input),
       });
       if (waitForAllReady) await stream.allReady;
+      else {
+        SsrFromRscRenderer.holdPostShellErrors(stream, (error) =>
+          SsrFromRscRenderer.#reportRenderError(error, input, "post-shell"),
+        );
+      }
       return stream;
     };
     const requestContext = input.requestStore ?? input.request;
@@ -627,16 +626,16 @@ export class SsrFromRscRenderer {
       injectThemeInitScript: input.injectThemeInitScript,
     });
 
-    return SsrFromRscRenderer.#appendRscScriptsAfterHtml(
-      withHeadScripts,
-      SsrFromRscRenderer.#sanitizeFlightForClient(rscForClient),
-      input.bootstrapModules,
-      input.request,
-      input.requestStore,
-      input.lateControl,
-      () => stderrSuppressor?.stop(),
-      input.onCancel,
-    );
+    // Splice only at chunk boundaries (Fizz may split inside SVG paths or attributes), and append the bootstrap module
+    // scripts here: one React emitted mid-stream could run cached before $RC() restores Suspense segments.
+    return interleaveRscScriptsWithHtml(withHeadScripts, sanitizeFlightForClientStream(rscForClient), {
+      bootstrapModuleScripts: SsrFromRscRenderer.#createBootstrapModuleScriptTags(input.bootstrapModules),
+      lateControl: input.lateControl,
+      onComplete: () => stderrSuppressor?.stop(),
+      onCancel: input.onCancel,
+      request: input.request,
+      requestStore: input.requestStore,
+    });
   }
 
   static #installWebpackShims(): void {
@@ -648,26 +647,19 @@ export class SsrFromRscRenderer {
     if (g.__rsc_ssr_shims_installed__) return;
     g.__rsc_ssr_shims_installed__ = true;
 
-    // SSR-side webpack runtime shims. We use dynamic `import()` rather than
-    // `require()` because client component chunks may transitively use
-    // top-level await, which Bun's `require()` refuses to load.
-    //
-    // `chunks`/`id` entries in the ssrManifest are absolute filesystem paths
-    // to server-importable client chunks. These may differ from the browser
-    // chunks referenced by the Flight client manifest because the browser build
-    // can rely on import maps while this SSR pass is loaded directly by Bun.
-    // HMR cache-busting is filename-based: each rebuild emits a new
-    // content-hashed chunk filename, which means a new import
-    // specifier, which bypasses Bun's module cache naturally. The
-    // `?v=<digits>` stripping below is defensive for any caller that still
-    // appends a version query to keep the pre-existing registry keys stable.
-    const registry = new SsrChunkRegistry<Record<string, unknown>>(SsrFromRscRenderer.#getSsrChunkRegistryMaxEntries());
+    // import(), not require(): client chunks may use top-level await, which Bun's require() refuses.
+    // XXX Bounds key tracking, not memory: Bun's ESM registry keeps an evicted module for the process lifetime, so
+    // `ssrChunkRegistrySize` is not bytes held and only recycling the process reclaims SSR chunk memory.
+    const registry = new SsrChunkRegistry<Record<string, unknown>>(
+      parsePositiveInt(process.env.AKAN_SSR_CHUNK_REGISTRY_MAX_ENTRIES) ?? DEFAULT_SSR_CHUNK_REGISTRY_MAX_ENTRIES,
+    );
     g.__webpack_chunk_load__ = async (chunkId: string) => {
       if (registry.get(chunkId)) {
         SsrFromRscRenderer.#chunkRegistryStats.ssrChunkCacheHitCount += 1;
         return;
       }
       const mod = (await import(chunkId)) as Record<string, unknown>;
+      // HMR busts by content-hashed filename; this strip only keeps a legacy `?v=` caller's keys stable.
       const canonical = chunkId.replace(/\?v=\d+$/, "");
       registry.set([chunkId, canonical], mod);
       SsrFromRscRenderer.#chunkRegistryStats.ssrChunkLoadCount += 1;
@@ -676,11 +668,35 @@ export class SsrFromRscRenderer {
     };
     g.__webpack_require__ = (id: string) => {
       const mod = registry.get(id);
-      if (!mod) {
-        throw new Error(`[ssrFromRsc] module not loaded yet: ${id}`);
-      }
+      if (!mod) throw new Error(`[ssrFromRsc] module not loaded yet: ${id}`);
       return mod;
     };
+  }
+
+  // React rejects allReady on a post-shell fatal error but handles it itself only on the shell-error path; unheld,
+  // it reaches "unhandledRejection" and takes the whole federation replica down over one render.
+  static holdPostShellErrors(stream: { allReady: Promise<void> }, report: (error: unknown) => void): void {
+    void stream.allReady.catch(report);
+  }
+
+  static #reportRenderError(error: unknown, input: SsrFromRscInput, phase = "render"): void {
+    const description = error instanceof Error ? (error.stack ?? error.message) : String(error);
+    if (SsrFromRscRenderer.#isExpectedRequestAbort(error)) {
+      SsrFromRscRenderer.#logger.debug(`[SSR] ${phase} aborted: ${description}`);
+      return;
+    }
+    const path = input.request ? new URL(input.request.url).pathname : "unknown";
+    SsrFromRscRenderer.#logger.error(`[SSR] ${phase} failed path=${path}: ${description}`);
+  }
+
+  static #isExpectedRequestAbort(error: unknown): boolean {
+    if (!(error instanceof Error)) return false;
+    return (
+      error.name === "AbortError" ||
+      error.name === "AkanRedirectError" ||
+      error.message === "Connection closed." ||
+      error.message.includes("The connection was closed")
+    );
   }
 
   static #suppressExpectedLateRedirectError(
@@ -701,24 +717,8 @@ export class SsrFromRscRenderer {
     return error.message === "Connection closed." || error.name === "AkanRedirectError";
   }
 
-  static #getSsrChunkRegistryMaxEntries(): number {
-    const parsed = Number.parseInt(process.env.AKAN_SSR_CHUNK_REGISTRY_MAX_ENTRIES ?? "", 10);
-    return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_SSR_CHUNK_REGISTRY_MAX_ENTRIES;
-  }
-
-  /**
-   * Splice bootstrap-only head scripts immediately after the `<head>` opening
-   * tag in the outgoing HTML stream.
-   *
-   * We do this as a stream transform (rather than as a React child inside
-   * `<head>`) so importmaps are acquired before any modulepreload can start.
-   * The spec is strict: once the browser starts a module script fetch for a
-   * preload, the document's "allow-import-maps" bit flips to false and no
-   * further importmap can be acquired.
-   *
-   * The transform operates on UTF-8 bytes until it has spliced the tag, then
-   * becomes a pure passthrough to avoid any further per-chunk overhead.
-   */
+  // A stream splice, not a React <head> child: once any module fetch starts, the spec flips the document's
+  // "allow-import-maps" bit and no later importmap is acquired.
   static #injectHeadScriptsIntoHead(
     stream: ReadableStream<Uint8Array>,
     options: {
@@ -750,7 +750,7 @@ export class SsrFromRscRenderer {
       if (!htmlTheme) return html;
       return html.replace(htmlOpenRe, (tag) => {
         if (/\sdata-theme\s*=/.test(tag)) return tag;
-        return tag.replace(/>$/, ` data-theme="${SsrFromRscRenderer.#escapeHtmlAttr(htmlTheme)}">`);
+        return tag.replace(/>$/, ` data-theme="${escapeHtmlAttr(htmlTheme)}">`);
       });
     };
 
@@ -777,8 +777,7 @@ export class SsrFromRscRenderer {
             if (tail) controller.enqueue(encoder.encode(tail));
             return;
           }
-          // `<head>` never appeared — e.g. error shell. Emit buffered bytes
-          // verbatim so we don't swallow the document.
+          // No <head> (e.g. an error shell): emit the buffer rather than swallow the document.
           const tail = decoder.decode();
           const rest = withHtmlTheme(buffered + tail);
           if (rest) controller.enqueue(encoder.encode(rest));
@@ -787,61 +786,11 @@ export class SsrFromRscRenderer {
     );
   }
 
-  static #escapeHtmlAttr(value: string): string {
-    return value.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  static #createBootstrapModulePreloadTags(bootstrapModules: string[] = []): string {
+    return bootstrapModules.map((src) => `<link rel="modulepreload" href="${escapeHtmlAttr(src)}">`).join("");
   }
 
-  static #createBootstrapModulePreloadTags(bootstrapModules?: string[]): string {
-    if (!bootstrapModules?.length) return "";
-    return bootstrapModules
-      .map((src) => `<link rel="modulepreload" href="${SsrFromRscRenderer.#escapeHtmlAttr(src)}">`)
-      .join("");
-  }
-
-  static #createBootstrapModuleScriptTags(bootstrapModules?: string[]): string {
-    if (!bootstrapModules?.length) return "";
-    return bootstrapModules
-      .map((src) => `<script type="module" src="${SsrFromRscRenderer.#escapeHtmlAttr(src)}"></script>`)
-      .join("");
-  }
-
-  // React-server-dom-webpack/server emits a Flight hint of the form
-  // `:HL["<href>","stylesheet"]\n` for every `<link rel="stylesheet">` in the
-  // server tree. That string is forwarded verbatim to the browser which then
-  // calls `ReactDOM.preload(href, "stylesheet")`, creating an invalid
-  // `<link rel="preload" as="stylesheet">` (valid preload `as` is `"style"`).
-  // The SSR-side Fizz dispatcher happens to tolerate this, but Chromium logs
-  // `<link rel=preload> must have a valid "as" value`. Rewrite the hint for
-  // the browser-bound stream to use the spec-correct `"style"`; the SSR-bound
-  // tee is left untouched so we don't alter React's server behavior.
-  static #sanitizeFlightForClient(stream: ReadableStream<Uint8Array>): ReadableStream<Uint8Array> {
-    return sanitizeFlightForClientStream(stream);
-  }
-
-  static #appendRscScriptsAfterHtml(
-    htmlStream: ReadableStream<Uint8Array>,
-    rscClientStream: ReadableStream<Uint8Array>,
-    bootstrapModules?: string[],
-    request?: Request,
-    requestStore?: AkanRequestStore,
-    lateControl?: Promise<SsrLateRedirect | null>,
-    onComplete?: () => void,
-    onCancel?: (reason?: unknown) => void,
-  ): ReadableStream<Uint8Array> {
-    const bootstrapModuleScripts = SsrFromRscRenderer.#createBootstrapModuleScriptTags(bootstrapModules);
-    // Interleave only at HTML chunk boundaries. Fizz may split arbitrary bytes
-    // inside SVG paths or attributes, so we never splice scripts into a chunk.
-    //
-    // Do not let React emit async bootstrap module scripts in the middle of the
-    // Fizz stream. Cached modules can otherwise execute before `$RC(...)`
-    // restores streamed Suspense segments into the DOM.
-    return interleaveRscScriptsWithHtml(htmlStream, rscClientStream, {
-      bootstrapModuleScripts,
-      lateControl,
-      onComplete,
-      onCancel,
-      request,
-      requestStore,
-    });
+  static #createBootstrapModuleScriptTags(bootstrapModules: string[] = []): string {
+    return bootstrapModules.map((src) => `<script type="module" src="${escapeHtmlAttr(src)}"></script>`).join("");
   }
 }

@@ -1,10 +1,11 @@
-import type { MergedValues, PromiseOrObject } from "akanjs/base";
+import type { MergedValues } from "akanjs/base";
 import { Logger } from "akanjs/common";
 import type { DocumentModel, QueryOf } from "akanjs/constant";
-import type { CacheAdaptor, CacheSetOptions } from "akanjs/service";
+import type { CacheAdaptor, CacheSetOptions, CacheValue } from "akanjs/service";
 import type { DataLoader } from "./dataLoader";
+import type { DocumentUpdateInput } from "./documentQuery";
 import type { ExtractQuery, ExtractSort, FilterInstance } from "./filterMeta";
-import type { CRUDEventType, Mdl, SaveEventType } from "./into";
+import type { Mdl, SaveEventListener, SaveEventType, UpdateResult } from "./into";
 import type { DataInputOf, FindQueryOption, ListQueryOption } from "./types";
 
 export class CacheDatabase<T = unknown> {
@@ -15,16 +16,57 @@ export class CacheDatabase<T = unknown> {
   ) {
     this.logger = new Logger(`${refName}Cache`);
   }
-  async set(topic: string, key: string, value: string | number | Buffer, option: CacheSetOptions = {}) {
+  async set(topic: string, key: string, value: CacheValue, option: CacheSetOptions = {}) {
     await this.cache.set(this.refName, `${topic}:${key}`, value, option);
   }
-  async get<T extends string | number | Buffer>(topic: string, key: string): Promise<T | undefined> {
+  async get<T extends CacheValue = CacheValue>(topic: string, key: string): Promise<T | undefined> {
     return await this.cache.get<T>(this.refName, `${topic}:${key}`);
   }
   async delete(topic: string, key: string) {
     await this.cache.delete(this.refName, `${topic}:${key}`);
   }
+  async getDel<T extends CacheValue = CacheValue>(topic: string, key: string): Promise<T | undefined> {
+    return await this.cache.getDel<T>(this.refName, `${topic}:${key}`);
+  }
+  async setIfAbsent(topic: string, key: string, value: CacheValue, option: CacheSetOptions = {}) {
+    return await this.cache.setIfAbsent(this.refName, `${topic}:${key}`, value, option);
+  }
+  async incr(topic: string, key: string, by = 1, option: CacheSetOptions = {}) {
+    return await this.cache.incr(this.refName, `${topic}:${key}`, by, option);
+  }
+  async hset(topic: string, key: string, subKey: string, value: CacheValue, option: CacheSetOptions = {}) {
+    await this.cache.hset(this.refName, `${topic}:${key}`, subKey, value, option);
+  }
+  async hget<T extends CacheValue = CacheValue>(topic: string, key: string, subKey: string): Promise<T | undefined> {
+    return await this.cache.hget<T>(this.refName, `${topic}:${key}`, subKey);
+  }
+  async hdelete(topic: string, key: string, subKey: string) {
+    await this.cache.hdelete(this.refName, `${topic}:${key}`, subKey);
+  }
+  async hkeys(topic: string, key: string) {
+    return await this.cache.hkeys(this.refName, `${topic}:${key}`);
+  }
+  async hentries<T extends CacheValue = CacheValue>(topic: string, key: string): Promise<[string, T][]> {
+    return await this.cache.hentries<T>(this.refName, `${topic}:${key}`);
+  }
+  async hclear(topic: string, key: string) {
+    await this.cache.hclear(this.refName, `${topic}:${key}`);
+  }
+  async hgetDel<T extends CacheValue = CacheValue>(topic: string, key: string, subKey: string): Promise<T | undefined> {
+    return await this.cache.hgetDel<T>(this.refName, `${topic}:${key}`, subKey);
+  }
+  async hsetIfAbsent(topic: string, key: string, subKey: string, value: CacheValue, option: CacheSetOptions = {}) {
+    return await this.cache.hsetIfAbsent(this.refName, `${topic}:${key}`, subKey, value, option);
+  }
+  async hincr(topic: string, key: string, subKey: string, by = 1, option: CacheSetOptions = {}) {
+    return await this.cache.hincr(this.refName, `${topic}:${key}`, subKey, by, option);
+  }
 }
+/** What `update<Filter>` returns: the patch cannot trail a filter's optional args, so it lands on `.set()`. */
+export interface UpdateChain<Doc = any> {
+  set(update: DocumentUpdateInput<Doc>): Promise<UpdateResult>;
+}
+
 type QueryMethodOfKey<
   CapitalizedK extends string,
   Doc,
@@ -53,6 +95,15 @@ type QueryMethodOfKey<
   [K in `insight${CapitalizedK}`]: (...args: _Args) => Promise<Insight>;
 } & {
   [K in `query${CapitalizedK}`]: (...args: _Args) => _QueryOfDoc;
+} & {
+  // No queryOption: a query-level write has no sort or page to apply, it hits everything that matches.
+  [K in `remove${CapitalizedK}`]: (...args: _Args) => Promise<UpdateResult>;
+} & {
+  [K in `removeOne${CapitalizedK}`]: (...args: _Args) => Promise<UpdateResult>;
+} & {
+  [K in `update${CapitalizedK}`]: (...args: _Args) => UpdateChain<Doc>;
+} & {
+  [K in `updateOne${CapitalizedK}`]: (...args: _Args) => UpdateChain<Doc>;
 };
 type QueryMethodMap<Query, Doc, Insight, _FindQueryOption, _ListQueryOption, _QueryOfDoc> = {
   [K in keyof Query]: K extends string
@@ -80,14 +131,14 @@ export type QueryMethodPart<
   _ListQueryOption = ListQueryOption<Sort, Obj>,
   _QueryOfDoc = QueryOf<Doc>,
 > = MergedValues<QueryMethodMap<Query, Doc, Insight, _FindQueryOption, _ListQueryOption, _QueryOfDoc>>;
-type DatabaseModelWithQuerySort<
-  T extends string,
-  Input,
-  Doc,
-  Obj,
-  Insight,
-  Query,
-  Sort,
+export type DatabaseInstanceWithQuerySort<
+  T extends string = string,
+  Input = any,
+  Doc = any,
+  Obj = any,
+  Insight = any,
+  Query = ExtractQuery<FilterInstance>,
+  Sort = ExtractSort<FilterInstance>,
   _CapitalizedRefName extends string = Capitalize<T>,
   _QueryOfDoc = QueryOf<Doc>,
   _DocumentObj = DocumentModel<Obj>,
@@ -105,6 +156,10 @@ type DatabaseModelWithQuerySort<
   __create: (data: _DataInput) => Promise<Doc>;
   __update: (id: string, data: Partial<Doc>) => Promise<Doc>;
   __remove: (id: string) => Promise<Doc>;
+  __removeMany: (query: _QueryOfDoc) => Promise<UpdateResult>;
+  __removeOne: (query: _QueryOfDoc) => Promise<UpdateResult>;
+  __updateMany: (query: _QueryOfDoc, update: DocumentUpdateInput<Doc>) => Promise<UpdateResult>;
+  __updateOne: (query: _QueryOfDoc, update: DocumentUpdateInput<Doc>) => Promise<UpdateResult>;
   __list(query: _QueryOfDoc, queryOption?: _ListQueryOption): Promise<Doc[]>;
   __listIds(query: _QueryOfDoc, queryOption?: _ListQueryOption): Promise<string[]>;
   __find(query: _QueryOfDoc, queryOption?: _FindQueryOption): Promise<Doc | null>;
@@ -115,8 +170,8 @@ type DatabaseModelWithQuerySort<
   __count(query: _QueryOfDoc): Promise<number>;
   __insight(query: _QueryOfDoc): Promise<Insight>;
   clone(data: _DataInput & { id: string }): Promise<Doc>;
-  listenPre: (type: SaveEventType, listener: (doc: Doc, type: CRUDEventType) => PromiseOrObject<void>) => () => void;
-  listenPost: (type: SaveEventType, listener: (doc: Doc, type: CRUDEventType) => PromiseOrObject<void>) => () => void;
+  listenPre: (type: SaveEventType, listener: SaveEventListener<Doc>) => () => void;
+  listenPost: (type: SaveEventType, listener: SaveEventListener<Doc>) => () => void;
 } & {
   [key in _CapitalizedRefName]: Mdl<Doc, Obj, _DocumentObj>;
 } & {
@@ -136,36 +191,6 @@ type DatabaseModelWithQuerySort<
 } & {
   [K in `remove${_CapitalizedRefName}`]: (id: string) => Promise<Doc>;
 } & QueryMethodPart<Query, Sort, Obj, Doc, Insight, _FindQueryOption, _ListQueryOption, _QueryOfDoc>;
-
-export type DatabaseInstanceWithQuerySort<
-  T extends string = string,
-  Input = any,
-  Doc = any,
-  Obj = any,
-  Insight = any,
-  Query = ExtractQuery<FilterInstance>,
-  Sort = ExtractSort<FilterInstance>,
-  _CapitalizedRefName extends string = Capitalize<T>,
-  _QueryOfDoc = QueryOf<Doc>,
-  _DocumentObj = DocumentModel<Obj>,
-  _DataInput = DataInputOf<Input, _DocumentObj>,
-  _FindQueryOption = FindQueryOption<Sort, Obj>,
-  _ListQueryOption = ListQueryOption<Sort, Obj>,
-> = DatabaseModelWithQuerySort<
-  T,
-  Input,
-  Doc,
-  Obj,
-  Insight,
-  Query,
-  Sort,
-  _CapitalizedRefName,
-  _QueryOfDoc,
-  _DocumentObj,
-  _DataInput,
-  _FindQueryOption,
-  _ListQueryOption
->;
 
 export type DatabaseInstance<
   T extends string = string,

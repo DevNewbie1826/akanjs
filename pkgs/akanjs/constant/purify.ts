@@ -31,21 +31,25 @@ type Purified<O> = O extends BaseObject
       : O extends object
         ? PurifiedModel<O>
         : O;
-type PurifiedWithObjectToId<T, StateKeys extends keyof GetStateObject<T> = keyof GetStateObject<T>> = {
-  [K in StateKeys as null extends T[K] ? never : K]: Purified<T[K]>;
-} & {
-  [K in StateKeys as null extends T[K] ? K : never]?: Purified<T[K]> | undefined;
-};
-export type PurifiedModel<T> = T extends (infer S)[]
-  ? PurifiedModel<S>[]
-  : T extends string | number | boolean | Dayjs | File
+type PurifiedWithObjectToId<T, StateKeys extends keyof GetStateObject<T> = keyof GetStateObject<T>> =
+  // key remapping collapses unknown/any to {}
+  unknown extends T
     ? T
-    : T extends Map<infer K, infer V>
-      ? Map<K, PurifiedModel<V>>
-      : PurifiedWithObjectToId<T>;
-
-// An `[Upload]` body purifies to `File[]`, but the browser only ever hands you a `FileList`
-// (`input.files`, `dataTransfer.files`). `HttpClient.makeBody` spreads both, so declare both.
+    : {
+        [K in StateKeys as null extends T[K] ? never : K]: Purified<T[K]>;
+      } & {
+        [K in StateKeys as null extends T[K] ? K : never]?: Purified<T[K]> | undefined;
+      };
+export type PurifiedModel<T> = unknown extends T
+  ? T
+  : T extends (infer S)[]
+    ? PurifiedModel<S>[]
+    : T extends string | number | boolean | Dayjs | File
+      ? T
+      : T extends Map<infer K, infer V>
+        ? Map<K, PurifiedModel<V>>
+        : PurifiedWithObjectToId<T>;
+// An `[Upload]` body purifies to `File[]`, but the browser hands a `FileList`; `HttpClient.makeBody` spreads both.
 export type UploadableClientArg<T> = [T] extends [File[]] ? File[] | FileList : T;
 
 export type PurifyFunc<Input, _DefaultInput = DefaultOf<Input>, _PurifiedInput = PurifiedModel<Input>> = (
@@ -62,14 +66,12 @@ export type PurifyFuncV2<
 
 const getPurifyFn = (modelRef: Cls): ((value: unknown) => unknown) => {
   const [valueRef] = getNonArrayModel(modelRef);
-  const purifyFn = PrimitiveRegistry.has(valueRef)
+  return PrimitiveRegistry.has(valueRef)
     ? (value: unknown) => (valueRef as unknown as typeof PrimitiveScalar)._serialize(value as never)
     : (value: unknown) => value as object;
-  return purifyFn;
 };
 
 const purify = (field: FieldProps, key: string, value: unknown, self: Record<string, unknown>): unknown => {
-  // 1. Check Data Validity
   if (
     field.nullable &&
     (value === null ||
@@ -101,18 +103,17 @@ const purify = (field: FieldProps, key: string, value: unknown, self: Record<str
     throw new Error(`Invalid Date Value (Default) in ${key} for value ${value}`);
   if ([String, ID].includes(field.modelRef as unknown as StringConstructor | typeof ID) && (value === "" || !value))
     throw new Error(`Invalid String Value (Default) in ${key} for value ${value}`);
+  if (field.enum && !field.enum.has(value as never))
+    throw new Error(`Invalid Enum Value in ${key}: ${String(value)} is not one of ${field.enum.values.join(", ")}`);
   if (field.validate && !field.validate(value, self))
     throw new Error(`Invalid Value (Failed to pass validation) / ${value} in ${key}`);
   if (!field.nullable && !value && value !== 0 && value !== false && (field.modelRef as Cls) !== Any)
     throw new Error(`Invalid Value (Nullable) in ${key} for value ${value}`);
-
-  // 2. Convert Value
-  const purifyFn = getPurifyFn(field.modelRef);
-  return purifyFn(value);
+  return getPurifyFn(field.modelRef)(value);
 };
 
-export const makePurify = <I>(modelRef: ConstantModelRef<I>): PurifyFunc<I> => {
-  const fn = ((self: Record<string, unknown>, isChild?: boolean): unknown => {
+export const makePurify = <I>(modelRef: ConstantModelRef<I>): PurifyFunc<I> =>
+  ((self: Record<string, unknown>, isChild?: boolean): unknown => {
     try {
       if (isChild && !ConstantRegistry.isScalar(modelRef)) {
         const id = self.id as string;
@@ -120,10 +121,8 @@ export const makePurify = <I>(modelRef: ConstantModelRef<I>): PurifyFunc<I> => {
         return id;
       }
       const result: Record<string, unknown> = {};
-      Object.entries(modelRef[FIELD_META]).forEach(([key, field]) => {
-        const value = self[key] as object;
-        result[key] = purify(field.getProps(), key, value, self) as object;
-      });
+      for (const [key, field] of Object.entries(modelRef[FIELD_META]))
+        result[key] = purify(field.getProps(), key, self[key], self);
       return result;
     } catch (err) {
       if (isChild) throw new Error(err as string);
@@ -131,5 +130,3 @@ export const makePurify = <I>(modelRef: ConstantModelRef<I>): PurifyFunc<I> => {
       return null;
     }
   }) as PurifyFunc<I>;
-  return fn;
-};

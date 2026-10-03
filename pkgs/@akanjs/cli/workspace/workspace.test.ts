@@ -1,25 +1,45 @@
 import { afterEach, describe, expect, mock, test } from "bun:test";
+import path from "node:path";
 import { CommandContainer, getArgMetas, getTargetMetas } from "@akanjs/devkit/commandDecorators";
 import { AppExecutor, LibExecutor, PkgExecutor, WorkspaceExecutor } from "@akanjs/devkit/executors";
+import { Linter } from "@akanjs/devkit/linter";
 import {
-  cleanupCliTempWorkspace,
   createCallRecorder,
   createFakeExecutor,
   createTempApp,
+  tempRoots,
   writeJson,
   writeText,
-} from "../testHelpers";
+} from "@akanjs/devkit/testHelpers";
 import { WorkspaceCommand } from "./workspace.command";
-import { WorkspaceRunner } from "./workspace.runner";
+import { defaultMaxDiagnostics, WorkspaceRunner } from "./workspace.runner";
 import { WorkspaceScript } from "./workspace.script";
 
-const tempRoots: string[] = [];
+const originalCwd = process.cwd();
+const originalFetch = globalThis.fetch;
 
-afterEach(async () => {
+const stubNpmLatest = (latest = "1.0.0") => {
+  globalThis.fetch = mock(
+    async () =>
+      new Response(
+        JSON.stringify({
+          "dist-tags": { latest },
+        }),
+      ),
+  ) as never;
+};
+
+afterEach(() => {
   CommandContainer.clear();
   mock.restore();
-  await Promise.all(tempRoots.splice(0).map((root) => cleanupCliTempWorkspace(root)));
+  globalThis.fetch = originalFetch;
+  try {
+    process.chdir(originalCwd);
+  } catch {
+    // A timed-out createWorkspace can leave cwd on a deleted temp dir.
+  }
 });
+const track = tempRoots();
 
 describe("WorkspaceCommand", () => {
   test("normalizes workspace/app names and delegates createWorkspace", async () => {
@@ -133,7 +153,7 @@ describe("WorkspaceScript", () => {
       expect(recorder.calls.find((call) => call.name === "createApplication")?.args).toEqual([
         "demo",
         workspace,
-        { libs: ["util", "shared"] },
+        { libs: ["util", "shared"], sample: true },
       ]);
       expect(recorder.calls.find((call) => call.name === "agent")?.args).toEqual([
         workspace,
@@ -218,10 +238,13 @@ describe("WorkspaceScript", () => {
       recorder.record("generateAgentRules", ...args);
       return [{ filePath: "/workspace/AGENTS.md", content: "" }];
     };
+    script.agentScript.agent = async (...args: unknown[]) => {
+      recorder.record("agent", ...args);
+    };
 
     await script.generateAgentRules(workspace as never, { overwrite: true, cursorRules: false });
 
-    expect(recorder.names()).toEqual(["workspace.spinning", "generateAgentRules", "spinner.succeed"]);
+    expect(recorder.names()).toEqual(["workspace.spinning", "generateAgentRules", "agent", "spinner.succeed"]);
     expect(recorder.calls.find((call) => call.name === "generateAgentRules")?.args).toEqual([
       workspace,
       { overwrite: true, cursorRules: false },
@@ -232,90 +255,82 @@ describe("WorkspaceScript", () => {
 describe("WorkspaceRunner", () => {
   test("uses the provided akan version", async () => {
     const runner = new WorkspaceRunner();
-    const cwd = process.cwd();
-    const { root } = await createTempApp("seed");
-    tempRoots.push(root);
+    stubNpmLatest();
+    const { root } = track(await createTempApp("seed"));
     process.chdir(root);
-    try {
-      await runner.createWorkspace("repo", "demo", {
-        dirname: "generated",
-        init: false,
-        akanVersion: "2.0.0-beta.0",
-      });
+    await runner.createWorkspace("repo", "demo", {
+      dirname: "generated",
+      init: false,
+      akanVersion: "2.0.0-beta.0",
+    });
 
-      const workspacePackageJson = (await Bun.file(`${root}/generated/repo/package.json`).json()) as {
-        scripts: Record<string, string>;
-        dependencies: Record<string, string>;
-        devDependencies: Record<string, string>;
-      };
-      expect(workspacePackageJson.scripts).toMatchObject({
-        "setup:agent": "akan agent install all --force",
-        "agent:doctor": "akan doctor --strict --format json",
-        "agent:mcp:plan": "akan mcp-install all --mode plan --force",
-        "agent:sample:service": "akan create-service billing demo --format json",
-        "agent:sample:module": "akan create-module project demo --page=true --format json",
-        "agent:sample:field":
-          "akan add-field --app demo --module project --field budget --type Int --default 0 --format json",
-        "agent:sample:status":
-          "akan add-enum-field --app demo --module project --field status --values draft,active,archived --default draft --format json",
-        "agent:sample:workflow:plan":
-          "akan workflow plan add-field --app demo --module task --field priority --type enum --values low,medium,high --default medium --format json --out .akan/workflows/plans/task-priority.json",
-        "agent:sample:workflow:dry-run":
-          "akan workflow apply .akan/workflows/plans/task-priority.json --dry-run --format json",
-      });
-      expect(workspacePackageJson.dependencies.akanjs).toBe("2.0.0-beta.0");
-      expect(workspacePackageJson.dependencies).toMatchObject({
-        "@react-spring/web": expect.any(String),
-        "@use-gesture/react": expect.any(String),
-        chance: expect.any(String),
-        croner: expect.any(String),
-        react: expect.any(String),
-        "react-dom": expect.any(String),
-        "react-icons": expect.any(String),
-        "react-refresh": expect.any(String),
-        "react-server-dom-webpack": expect.any(String),
-        "react-spring": expect.any(String),
-        scheduler: expect.any(String),
-        tailwindcss: expect.any(String),
-      });
-      expect(workspacePackageJson.dependencies).not.toHaveProperty("typescript");
-      expect(workspacePackageJson.devDependencies).toMatchObject({
-        "@biomejs/biome": expect.any(String),
-        "@types/bun": expect.any(String),
-        typescript: expect.any(String),
-      });
-      expect(workspacePackageJson.dependencies).not.toHaveProperty("@capacitor/core");
-      expect(workspacePackageJson.dependencies).not.toHaveProperty("@capacitor/cli");
-      expect(workspacePackageJson.dependencies).not.toHaveProperty("@libsql/client");
-      expect(workspacePackageJson.dependencies).not.toHaveProperty("postgres");
-      expect(workspacePackageJson.dependencies).not.toHaveProperty("ioredis");
-      expect(workspacePackageJson.dependencies).not.toHaveProperty("bullmq");
-      expect(workspacePackageJson.dependencies).not.toHaveProperty("protobufjs");
-      expect(workspacePackageJson.dependencies).not.toHaveProperty("@playwright/test");
-      expect(workspacePackageJson.dependencies).not.toHaveProperty("cordova-plugin-purchase");
-      expect(workspacePackageJson.dependencies).not.toHaveProperty("capacitor-plugin-safe-area");
-    } finally {
-      process.chdir(cwd);
-    }
+    const workspacePackageJson = (await Bun.file(`${root}/generated/repo/package.json`).json()) as {
+      scripts: Record<string, string>;
+      dependencies: Record<string, string>;
+      devDependencies: Record<string, string>;
+    };
+    expect(workspacePackageJson.scripts).toMatchObject({
+      "setup:agent": "akan agent install all --force",
+      "agent:doctor": "akan doctor --strict --format json",
+      "agent:mcp:plan": "akan mcp-install all --mode plan --force",
+      "agent:sample:service": "akan create-service billing demo --format json",
+      "agent:sample:module": "akan create-module project demo --page=true --format json",
+      "agent:sample:field":
+        "akan add-field --app demo --module project --field budget --type Int --default 0 --format json",
+      "agent:sample:status":
+        "akan add-enum-field --app demo --module project --field status --values draft,active,archived --default draft --format json",
+      "agent:sample:workflow:plan":
+        "akan workflow plan add-field --app demo --module task --field priority --type enum --values low,medium,high --default medium --format json --out .akan/workflows/plans/task-priority.json",
+      "agent:sample:workflow:dry-run":
+        "akan workflow apply .akan/workflows/plans/task-priority.json --dry-run --format json",
+    });
+    expect(workspacePackageJson.dependencies.akanjs).toBe("2.0.0-beta.0");
+    expect(workspacePackageJson.dependencies).toMatchObject({
+      "@react-spring/web": expect.any(String),
+      "@use-gesture/react": expect.any(String),
+      chance: expect.any(String),
+      react: expect.any(String),
+      "react-dom": expect.any(String),
+      "react-icons": expect.any(String),
+      "react-refresh": expect.any(String),
+      "react-server-dom-webpack": expect.any(String),
+      "react-spring": expect.any(String),
+      scheduler: expect.any(String),
+      tailwindcss: expect.any(String),
+    });
+    expect(workspacePackageJson.dependencies).not.toHaveProperty("typescript");
+    expect(workspacePackageJson.devDependencies).toMatchObject({
+      "@biomejs/biome": expect.any(String),
+      "@types/bun": expect.any(String),
+      typescript: expect.any(String),
+    });
+    expect(workspacePackageJson.dependencies).not.toHaveProperty("@capacitor/core");
+    expect(workspacePackageJson.dependencies).not.toHaveProperty("@capacitor/cli");
+    expect(workspacePackageJson.dependencies).not.toHaveProperty("@libsql/client");
+    expect(workspacePackageJson.dependencies).not.toHaveProperty("postgres");
+    expect(workspacePackageJson.dependencies).not.toHaveProperty("ioredis");
+    expect(workspacePackageJson.dependencies).not.toHaveProperty("bullmq");
+    expect(workspacePackageJson.dependencies).not.toHaveProperty("protobufjs");
+    expect(workspacePackageJson.dependencies).not.toHaveProperty("@playwright/test");
+    expect(workspacePackageJson.dependencies).not.toHaveProperty("cordova-plugin-purchase");
+    expect(workspacePackageJson.dependencies).not.toHaveProperty("capacitor-plugin-safe-area");
   });
 
   test("generates agent rule files without overwriting by default", async () => {
     const runner = new WorkspaceRunner();
-    const { root, workspace } = await createTempApp("demo");
-    tempRoots.push(root);
+    const { root, workspace } = track(await createTempApp("demo"));
 
     await runner.generateAgentRules(workspace);
     const agentsGuide = await Bun.file(`${root}/AGENTS.md`).text();
     const cursorRules = await Bun.file(`${root}/.cursor/rules/akan.mdc`).text();
     const claudeGuide = await Bun.file(`${root}/CLAUDE.md`).text();
     expect(claudeGuide).toContain("@AGENTS.md");
+    // The template carries the comment rule too, so a workspace scaffolded without `agent install` still has it.
+    expect(claudeGuide).toContain("## Comments — Overrides Your Default");
     expect(agentsGuide).toContain("repo Agent Guide");
-    expect(agentsGuide).toContain("Prefer Akan MCP workflows before direct source edits");
-    expect(agentsGuide).toContain("apply_workflow({ planPath })");
-    expect(agentsGuide).toContain("validationTarget");
-    expect(agentsGuide).toContain("create-module` plan/apply first, then `add-field");
-    expect(agentsGuide).toContain("akan mcp --mode plan");
-    expect(agentsGuide).toContain("akan repair generated");
+    // The conventions inside the managed block are rendered by `akan agent install`, which the script composes.
+    expect(agentsGuide).toContain("<!-- akan:agent:start -->");
+    expect(agentsGuide).toContain("<!-- akan:agent:end -->");
     // The Cursor rule is a thin reference to AGENTS.md, not a duplicate of its content.
     expect(cursorRules).toContain("alwaysApply: true");
     expect(cursorRules).toContain("single source of truth");
@@ -331,32 +346,17 @@ describe("WorkspaceRunner", () => {
 
   test("writes local registry config before installing generated workspace dependencies", async () => {
     const runner = new WorkspaceRunner();
-    const cwd = process.cwd();
-    const originalFetch = globalThis.fetch;
-    const { root } = await createTempApp("seed");
-    tempRoots.push(root);
+    stubNpmLatest();
+    const { root } = track(await createTempApp("seed"));
     process.chdir(root);
-    globalThis.fetch = mock(
-      async () =>
-        new Response(
-          JSON.stringify({
-            "dist-tags": { latest: "1.0.0" },
-          }),
-        ),
-    ) as never;
-    try {
-      await runner.createWorkspace("repo", "demo", {
-        dirname: "generated",
-        init: false,
-        akanVersion: "2.0.0-beta.0",
-        registryUrl: "http://127.0.0.1:4873/",
-      });
+    await runner.createWorkspace("repo", "demo", {
+      dirname: "generated",
+      init: false,
+      akanVersion: "2.0.0-beta.0",
+      registryUrl: "http://127.0.0.1:4873/",
+    });
 
-      await expect(Bun.file(`${root}/generated/repo/.npmrc`).text()).resolves.toBe("registry=http://127.0.0.1:4873/\n");
-    } finally {
-      globalThis.fetch = originalFetch;
-      process.chdir(cwd);
-    }
+    await expect(Bun.file(`${root}/generated/repo/.npmrc`).text()).resolves.toBe("registry=http://127.0.0.1:4873/\n");
   });
 
   test("invokes biome check with optional write flag", async () => {
@@ -367,24 +367,46 @@ describe("WorkspaceRunner", () => {
     workspace.spawn = spawn;
 
     await runner.lint(exec as never, workspace as never, { fix: true });
-    expect(spawn).toHaveBeenCalledWith("./node_modules/.bin/biome", [
+    expect(spawn).toHaveBeenCalledWith(`./node_modules/.bin/${Linter.biomeBinName}`, [
       "check",
       "--write",
       "--no-errors-on-unmatched",
+      `--max-diagnostics=${defaultMaxDiagnostics}`,
       "/workspace/apps/demo",
     ]);
 
-    await runner.lint(exec as never, workspace as never, { fix: false });
-    expect(spawn).toHaveBeenLastCalledWith("./node_modules/.bin/biome", [
+    await runner.lint(exec as never, workspace as never, { fix: false, maxDiagnostics: 0 });
+    expect(spawn).toHaveBeenLastCalledWith(`./node_modules/.bin/${Linter.biomeBinName}`, [
       "check",
       "--no-errors-on-unmatched",
+      "--max-diagnostics=none",
       "/workspace/apps/demo",
     ]);
   });
 
+  test("pins the biome config so a malformed one is reported at its own line", async () => {
+    const runner = new WorkspaceRunner();
+    const { root } = track(await createTempApp("demo"));
+    const workspace = createFakeExecutor("workspace");
+    workspace.workspaceRoot = root;
+    const spawn = mock(async () => "");
+    workspace.spawn = spawn;
+    await Bun.write(`${root}/biome.jsonc`, "{}\n");
+
+    await runner.lint({ cwdPath: `${root}/apps/demo` } as never, workspace as never, { fix: false });
+
+    expect(spawn).toHaveBeenCalledWith(`./node_modules/.bin/${Linter.biomeBinName}`, [
+      "check",
+      "--no-errors-on-unmatched",
+      `--max-diagnostics=${defaultMaxDiagnostics}`,
+      "--config-path",
+      path.join(root, "biome.jsonc"),
+      `${root}/apps/demo`,
+    ]);
+  });
+
   test("discovers apps/libs/packages through workspace executors", async () => {
-    const { root, workspace } = await createTempApp("demo");
-    tempRoots.push(root);
+    const { root, workspace } = track(await createTempApp("demo"));
     await writeJson(`${root}/libs/shared/akan.config.ts`, {});
     await writeJson(`${root}/pkgs/@sample/tool/package.json`, {
       name: "@sample/tool",
@@ -403,8 +425,7 @@ describe("WorkspaceRunner", () => {
 
 describe("Scan convention validation", () => {
   test("rejects files that do not follow the <module>.<type>.(ts|tsx) convention", async () => {
-    const { root, app } = await createTempApp("demo");
-    tempRoots.push(root);
+    const { app } = track(await createTempApp("demo"));
 
     await writeText(`${app.cwdPath}/lib/task/task.constant.ts`, "export const TaskStatus = {};\n");
     await writeText(`${app.cwdPath}/lib/task/TaskHelpComponent.tsx`, "export const TaskHelp = () => null;\n");
@@ -415,8 +436,7 @@ describe("Scan convention validation", () => {
   });
 
   test("rejects UI files with wrong module name prefix", async () => {
-    const { root, app } = await createTempApp("demo");
-    tempRoots.push(root);
+    const { app } = track(await createTempApp("demo"));
 
     await writeText(`${app.cwdPath}/lib/task/task.constant.ts`, "export const TaskStatus = {};\n");
     await writeText(`${app.cwdPath}/lib/task/WrongName.Zone.tsx`, "export const WrongZone = () => null;\n");
@@ -427,8 +447,7 @@ describe("Scan convention validation", () => {
   });
 
   test("rejects non-UI files with wrong module name prefix", async () => {
-    const { root, app } = await createTempApp("demo");
-    tempRoots.push(root);
+    const { app } = track(await createTempApp("demo"));
 
     await writeText(`${app.cwdPath}/lib/task/task.constant.ts`, "export const TaskStatus = {};\n");
     await writeText(`${app.cwdPath}/lib/task/wrongName.constant.ts`, "export const Wrong = {};\n");
@@ -439,8 +458,7 @@ describe("Scan convention validation", () => {
   });
 
   test("allows properly named files in domain folders", async () => {
-    const { root, app } = await createTempApp("demo");
-    tempRoots.push(root);
+    const { app } = track(await createTempApp("demo"));
 
     await writeText(`${app.cwdPath}/lib/task/task.constant.ts`, "export const TaskStatus = {};\n");
     await writeText(`${app.cwdPath}/lib/task/task.dictionary.ts`, "export const TaskDict = {};\n");

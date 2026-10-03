@@ -1,11 +1,11 @@
-import { afterEach, describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import os from "node:os";
+import { describe, expect, test } from "bun:test";
+import { readFile, rm } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { RoutesManifest } from "akanjs/server";
+import { tempDirs, writeText as write } from "../testHelpers";
 import { CsrArtifactBuilder } from "./csrArtifactBuilder";
-import { CssCompiler, isIgnoredNodeModuleSource } from "./cssCompiler";
+import { CssCompiler, declaredCustomProperties, isIgnoredNodeModuleSource } from "./cssCompiler";
 import { CssImportResolver } from "./cssImportResolver";
 import { DevChangePlanner } from "./devChangePlanner";
 import { DevGeneratedIndexSync } from "./devGeneratedIndexSync";
@@ -13,35 +13,21 @@ import { HmrChangeClassifier } from "./hmrChangeClassifier";
 import { PagesBundleBuilder } from "./pagesBundleBuilder";
 import { PagesEntrySourceGenerator } from "./pagesEntrySourceGenerator";
 import { RoutesManifestArtifactSerializer } from "./routesManifestArtifactSerializer";
-import { prepareCssAsset } from "./ssrBaseArtifactBuilder";
+import { prepareCssAsset, SsrBaseArtifactBuilder } from "./ssrBaseArtifactBuilder";
 
-const tempRoots: string[] = [];
-
-const makeTempRoot = async () => {
-  const root = await mkdtemp(path.join(os.tmpdir(), "akan-devkit-frontend-"));
-  tempRoots.push(root);
-  return root;
-};
-
-const write = async (filePath: string, content: string) => {
-  await mkdir(path.dirname(filePath), { recursive: true });
-  await writeFile(filePath, content);
-};
-
-afterEach(async () => {
-  await Promise.all(tempRoots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
-});
+const makeTempRoot = tempDirs("akan-devkit-frontend-");
 
 describe("PagesEntrySourceGenerator", () => {
   const toSpecifier = (absPath: string) => path.resolve(absPath).split(path.sep).join("/");
+  const indexAbs = path.resolve("/repo/apps/demo/page/_index.tsx");
+  const adminAbs = path.resolve("/repo/apps/demo/page/admin.tsx");
+  const entries = [
+    { key: "./_index.tsx", moduleAbsPath: indexAbs },
+    { key: "./admin.tsx", moduleAbsPath: adminAbs },
+  ];
 
   test("generates dynamic import source using forward-slash module paths", () => {
-    const indexAbs = path.resolve("/repo/apps/demo/page/_index.tsx");
-    const adminAbs = path.resolve("/repo/apps/demo/page/admin.tsx");
-    const source = PagesEntrySourceGenerator.generate([
-      { key: "./_index.tsx", moduleAbsPath: indexAbs },
-      { key: "./admin.tsx", moduleAbsPath: adminAbs },
-    ]);
+    const source = PagesEntrySourceGenerator.generate(entries);
 
     expect(source).toBe(
       [
@@ -54,13 +40,8 @@ describe("PagesEntrySourceGenerator", () => {
     );
   });
 
-  test("generates static import source for single-file CSR bundles", () => {
-    const indexAbs = path.resolve("/repo/apps/demo/page/_index.tsx");
-    const adminAbs = path.resolve("/repo/apps/demo/page/admin.tsx");
-    const source = PagesEntrySourceGenerator.generateStatic([
-      { key: "./_index.tsx", moduleAbsPath: indexAbs },
-      { key: "./admin.tsx", moduleAbsPath: adminAbs },
-    ]);
+  test("generates static import source for single-file CSR bundles", async () => {
+    const source = await PagesEntrySourceGenerator.generateStatic(entries);
 
     expect(source).toBe(
       [
@@ -88,7 +69,7 @@ describe("PagesEntrySourceGenerator", () => {
     await write(expressionPath, "export default async () => null;");
     await write(namedExportPath, "async function NamedExport() { return null; }\nexport { NamedExport as default };");
 
-    const source = PagesEntrySourceGenerator.generateStatic([
+    const source = await PagesEntrySourceGenerator.generateStatic([
       { key: "./_index.tsx", moduleAbsPath: indexPath },
       { key: "./admin.tsx", moduleAbsPath: adminPath },
       { key: "./typed.tsx", moduleAbsPath: typedPath },
@@ -113,7 +94,9 @@ describe("PagesBundleBuilder", () => {
     await write(entry, ['import "./styles.css";', "export const marker = 1;", ""].join("\n"));
     await write(
       css,
-      ['@plugin "daisyui" {', "  themes: false;", "}", "@theme {", "  --color-primary: red;", "}", ""].join("\n"),
+      ['@plugin "tailwind-scrollbar" {', "  themes: false;", "}", "@theme {", "  --color-primary: red;", "}", ""].join(
+        "\n",
+      ),
     );
 
     const result = await Bun.build({
@@ -121,7 +104,7 @@ describe("PagesBundleBuilder", () => {
       outdir,
       target: "bun",
       format: "esm",
-      plugins: [PagesBundleBuilder.createServerCssStubPlugin()],
+      plugins: [PagesBundleBuilder.createCssStubPlugin()],
     });
 
     expect(result.success).toBe(true);
@@ -176,18 +159,109 @@ describe("CsrArtifactBuilder", () => {
     expect(inlined).not.toContain("src=");
   });
 
-  test("creates inline stylesheet and strips external stylesheet links", () => {
-    const html =
-      '<head><link rel="stylesheet" href="/_akan/styles/akanjs.css" data-akan-css="active" /><link rel="stylesheet" href="./generated.css" /></head>';
-    const stripped = CsrArtifactBuilder.stripBundledStylesheetLinks(html);
+  test("creates inline stylesheet with the closing tag escaped", () => {
     const style = CsrArtifactBuilder.createInlineStyle("body::before{content:'</style>';}");
 
-    expect(stripped).toBe("<head></head>");
     expect(style).toBe("<style data-akan-css=\"active\">\nbody::before{content:'<\\/style>';}\n</style>");
+  });
+
+  test("injects into the real head even when an inline bundle quotes body and head tags", () => {
+    const bundle = 'console.info("<body>", "</head>", "<!--");';
+    const html = [
+      "<!doctype html>",
+      "<html>",
+      "<head>",
+      `<script type="module">${bundle}</script>`,
+      "</head>",
+      '<body><div id="root"></div></body>',
+      "</html>",
+    ].join("\n");
+
+    const first = CsrArtifactBuilder.injectBeforeHeadEnd(html, "<style>a{}</style>");
+    const second = CsrArtifactBuilder.injectBeforeHeadEnd(first, "<style>b{}</style>");
+
+    expect(second.startsWith("<!doctype html>")).toBe(true);
+    expect(second.indexOf("<style>a{}</style>")).toBeGreaterThan(second.indexOf(bundle));
+    expect(second.indexOf("<style>b{}</style>")).toBeGreaterThan(second.indexOf("<style>a{}</style>"));
+    expect(second.indexOf("<style>b{}</style>")).toBeLessThan(second.indexOf("\n</head>"));
+  });
+
+  test("never prepends: without a head the snippet lands before body, else at the end", () => {
+    expect(CsrArtifactBuilder.injectBeforeHeadEnd("<html><body></body></html>", "<style></style>")).toBe(
+      "<html><style></style>\n<body></body></html>",
+    );
+    expect(CsrArtifactBuilder.injectBeforeHeadEnd("<div></div>", "<style></style>")).toBe(
+      "<div></div>\n<style></style>",
+    );
+  });
+
+  test("gives each basePath its own routes plus the routes outside every basePath", () => {
+    const entries = [
+      { key: "./_layout.tsx", moduleAbsPath: "/repo/page/_layout.tsx" },
+      { key: "./(sign)/signin.tsx", moduleAbsPath: "/repo/page/(sign)/signin.tsx" },
+      {
+        key: "./office/__root_layout.tsx",
+        moduleAbsPath: "/repo/.akan/generated/root-layouts/office__root_layout.tsx",
+      },
+      { key: "./office/_index.tsx", moduleAbsPath: "/repo/page/office/_index.tsx" },
+      {
+        key: "./(user)/soft/__root_layout.tsx",
+        moduleAbsPath: "/repo/.akan/generated/root-layouts/soft__root_layout.tsx",
+      },
+      { key: "./(user)/soft/home.tsx", moduleAbsPath: "/repo/page/(user)/soft/home.tsx" },
+    ];
+    const basePaths = ["office", "soft"];
+
+    expect(CsrArtifactBuilder.pageEntriesForBasePath(entries, "office", basePaths).map((entry) => entry.key)).toEqual([
+      "./_layout.tsx",
+      "./(sign)/signin.tsx",
+      "./office/__root_layout.tsx",
+      "./office/_index.tsx",
+    ]);
+    expect(CsrArtifactBuilder.pageEntriesForBasePath(entries, "soft", basePaths).map((entry) => entry.key)).toEqual([
+      "./_layout.tsx",
+      "./(sign)/signin.tsx",
+      "./(user)/soft/__root_layout.tsx",
+      "./(user)/soft/home.tsx",
+    ]);
+    expect(CsrArtifactBuilder.pageEntriesForBasePath(entries, "", [])).toEqual(entries);
+  });
+
+  test("keeps route stylesheets out of the browser bundle so the HTML links no CSS", async () => {
+    const root = await makeTempRoot();
+    const htmlPath = path.join(root, "src/index.html");
+    await write(
+      htmlPath,
+      '<!doctype html><html><head></head><body><script type="module" src="./index.csr.tsx"></script></body></html>',
+    );
+    await write(path.join(root, "src/index.csr.tsx"), 'import "./styles.css";\nconsole.info("boot");\n');
+    await write(path.join(root, "src/styles.css"), ":root { --foreground: #fff; }\n");
+
+    const result = await Bun.build({
+      target: "browser",
+      entrypoints: [htmlPath],
+      root: path.join(root, "src"),
+      outdir: path.join(root, "out"),
+      plugins: [PagesBundleBuilder.createCssStubPlugin()],
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.outputs.some((output) => output.path.endsWith(".css"))).toBe(false);
+    expect(await readFile(path.join(root, "out/index.html"), "utf8")).not.toContain("stylesheet");
   });
 });
 
 describe("SsrBaseArtifactBuilder", () => {
+  test("a dev artifact serves every web surface, and a build the one akan.config.ts keeps", () => {
+    for (const web of [
+      { ssr: true, csr: false },
+      { ssr: false, csr: false },
+    ]) {
+      expect(SsrBaseArtifactBuilder.servedWeb("start", web)).toEqual({ ssr: true, csr: true });
+      expect(SsrBaseArtifactBuilder.servedWeb("build", web)).toEqual(web);
+    }
+  });
+
   test("minifies CSS assets only for production builds", async () => {
     const css = [
       ".card {",
@@ -250,13 +324,14 @@ describe("RoutesManifestArtifactSerializer", () => {
 describe("HmrChangeClassifier", () => {
   test("classifies code, css, config, and ignored files", () => {
     const classifier = new HmrChangeClassifier();
-    expect(classifier.classify("/repo/apps/demo/page/_index.tsx")).toBe("code");
-    expect(classifier.classify("/repo/apps/demo/page/styles.css")).toBe("css");
-    expect(classifier.classify("/repo/apps/demo/akan.config.ts")).toBe("config");
-    expect(classifier.classify("/repo/apps/demo/.DS_Store")).toBe("ignore");
-    expect(classifier.classify(`/repo/apps/demo/node_modules/pkg/index.ts`)).toBe("ignore");
-    expect(classifier.classify(`/repo/apps/demo/.akan/generated/page.tsx`)).toBe("ignore");
-    expect(classifier.classify("/repo/apps/demo/public/logo.png")).toBe("ignore");
+    const app = path.resolve("/repo/apps/demo");
+    expect(classifier.classify(path.join(app, "page/_index.tsx"))).toBe("code");
+    expect(classifier.classify(path.join(app, "page/styles.css"))).toBe("css");
+    expect(classifier.classify(path.join(app, "akan.config.ts"))).toBe("config");
+    expect(classifier.classify(path.join(app, ".DS_Store"))).toBe("ignore");
+    expect(classifier.classify(path.join(app, "node_modules/pkg/index.ts"))).toBe("ignore");
+    expect(classifier.classify(path.join(app, ".akan/generated/page.tsx"))).toBe("ignore");
+    expect(classifier.classify(path.join(app, "public/logo.png"))).toBe("ignore");
   });
 });
 
@@ -311,16 +386,16 @@ describe("DevGeneratedIndexSync", () => {
 
 describe("DevChangePlanner", () => {
   test("classifies server, client, shared, and generated barrel changes", () => {
-    const root = "/repo";
+    const root = path.resolve("/repo");
     const planner = new DevChangePlanner({ workspaceRoot: root });
-    const generatedIndex = `${root}/libs/shared/common/index.ts`;
+    const generatedIndex = path.join(root, "libs/shared/common/index.ts");
     const plan = planner.plan({
       generation: 7,
       files: [
-        `${root}/libs/shared/lib/admin/admin.service.ts`,
-        `${root}/libs/shared/lib/admin/Admin.Template.tsx`,
-        `${root}/libs/shared/lib/admin/admin.constant.ts`,
-        `${root}/libs/shared/common/foo.ts`,
+        path.join(root, "libs/shared/lib/admin/admin.service.ts"),
+        path.join(root, "libs/shared/lib/admin/Admin.Template.tsx"),
+        path.join(root, "libs/shared/lib/admin/admin.constant.ts"),
+        path.join(root, "libs/shared/common/foo.ts"),
       ],
       kinds: ["code"],
       generatedFiles: [generatedIndex],
@@ -346,21 +421,22 @@ describe("DevChangePlanner", () => {
   });
 
   test("recycles builder for macro-backed dictionary and signal metadata changes", () => {
-    const root = "/repo";
+    const root = path.resolve("/repo");
     const planner = new DevChangePlanner({ workspaceRoot: root });
+    const dictionaryFile = path.join(root, "apps/demo/lib/_demo/demo.dictionary.ts");
     const dictionaryPlan = planner.plan({
       generation: 3,
-      files: [`${root}/apps/demo/lib/_demo/demo.dictionary.ts`],
+      files: [dictionaryFile],
       kinds: ["code"],
     });
     const signalPlan = planner.plan({
       generation: 4,
-      files: [`${root}/libs/shared/lib/admin/admin.signal.ts`],
+      files: [path.join(root, "libs/shared/lib/admin/admin.signal.ts")],
       kinds: ["code"],
     });
 
     expect(dictionaryPlan.actions).toEqual(["rebuild-client", "restart-backend", "restart-builder"]);
-    expect(dictionaryPlan.reasonByFile[`${root}/apps/demo/lib/_demo/demo.dictionary.ts`]).toContain("runtime-metadata");
+    expect(dictionaryPlan.reasonByFile[dictionaryFile]).toContain("runtime-metadata");
     expect(signalPlan.actions).toContain("restart-builder");
   });
 });
@@ -389,6 +465,20 @@ describe("CssImportResolver", () => {
     expect(await resolver.resolve("@libs/ui/missing", root)).toBeNull();
   });
 
+  test("never substitutes the package stylesheet for a subpath that does not exist", async () => {
+    const root = await makeTempRoot();
+    await write(
+      path.join(root, "node_modules/vendor/package.json"),
+      JSON.stringify({ name: "vendor", style: "index.css" }),
+    );
+    await write(path.join(root, "node_modules/vendor/index.css"), ".vendor {}\n");
+
+    const resolver = new CssImportResolver(root, {});
+
+    expect(await resolver.resolve("vendor", root)).toBe(path.join(root, "node_modules/vendor/index.css"));
+    expect(await resolver.resolve("vendor/ui/tokens.css", root)).toBeNull();
+  });
+
   test("resolves css from single-package Akan workspace subpaths", async () => {
     const root = await makeTempRoot();
     await write(path.join(root, "pkgs/akanjs/ui/styles.css"), "body {}\n");
@@ -402,6 +492,14 @@ describe("CssImportResolver", () => {
 });
 
 describe("CssCompiler", () => {
+  const cssCompilerFor = (root: string, cwdPath: string, app: object = {}) =>
+    new CssCompiler({
+      workspace: { workspaceRoot: root },
+      cwdPath,
+      getTsConfig: async () => ({ compilerOptions: { paths: {} } }),
+      ...app,
+    } as never);
+
   test("scans installed akanjs sources while ignoring other node_modules", async () => {
     expect(isIgnoredNodeModuleSource("/repo/node_modules/react/index.js")).toBe(true);
     expect(isIgnoredNodeModuleSource("/repo/node_modules/akanjs/ui/Button.tsx")).toBe(false);
@@ -415,15 +513,74 @@ describe("CssCompiler", () => {
     await write(cssPath, `@import ${JSON.stringify(tailwindCssPath)};\n@source "./**/*";\n`);
     await write(uiSource, 'export const Button = () => <button className="text-fuchsia-500" />;\n');
 
-    const compiler = new CssCompiler({
-      workspace: { workspaceRoot: root },
-      // The candidate cache lands under `<cwdPath>/.akan/cache`, so point it at this test's temp root
-      // rather than wherever the suite happens to run from.
-      cwdPath: root,
-      getTsConfig: async () => ({ compilerOptions: { paths: {} } }),
-    } as never);
+    // The candidate cache lands under `<cwdPath>/.akan/cache`, so keep it inside this test's temp root.
+    const compiler = cssCompilerFor(root, root);
     const css = await compiler.compileCss([cssPath], []);
 
     expect(css).toContain(".text-fuchsia-500");
+  });
+
+  test("reads declarations that prove a stylesheet arrived, ignoring theme variables that may not", () => {
+    expect(declaredCustomProperties(":root { --kakao: #fee500; --naver: #1ec800; }")).toEqual(["--kakao", "--naver"]);
+    expect(declaredCustomProperties("@theme inline {\n  --color-brand: var(--brand);\n}\n")).toEqual([]);
+    expect(declaredCustomProperties("@theme { --color-x: initial; }\n:root { --brand: #111; }")).toEqual(["--brand"]);
+    expect(declaredCustomProperties(".a { color: var(--kakao); }")).toEqual([]);
+    expect(declaredCustomProperties(":root{--a:#111}\n@media (min-width:1px){:root{--a:#222;--b:#333}}")).toEqual([
+      "--a",
+      "--b",
+    ]);
+  });
+
+  test("fails loudly on a stylesheet import that resolves to nothing", async () => {
+    const root = await makeTempRoot();
+    const cssPath = path.join(root, "apps/demo/page/styles.css");
+    await write(cssPath, '@import "../../../libs/shared/ui/tokens.css";\n');
+
+    const compiler = cssCompilerFor(root, path.join(root, "apps/demo"));
+
+    await expect(compiler.compileCss([cssPath], [])).rejects.toThrow(
+      /failed to resolve stylesheet import "\.\.\/\.\.\/\.\.\/libs\/shared\/ui\/tokens\.css"/,
+    );
+  });
+
+  test("reports every @import per base path so the written asset can be checked against it", async () => {
+    const root = await makeTempRoot();
+    const appDir = path.join(root, "apps/demo");
+    await write(path.join(appDir, "page/_index.tsx"), 'import "./styles.css";\nexport default () => null;\n');
+    await write(path.join(appDir, "page/styles.css"), '@import "../../../libs/shared/ui/brand.css";\n');
+    await write(path.join(root, "libs/shared/ui/brand.css"), ":root { --kakao: #fee500; --naver: #1ec800; }\n");
+
+    const compiler = cssCompilerFor(root, appDir, {
+      getPageKeys: async () => ["./_index.tsx"],
+      getConfig: async () => ({ barrelImports: [], basePaths: [] }),
+    });
+    const cssByBasePath = await compiler.getCssByBasePath();
+
+    expect(cssByBasePath[""]).toContain("--kakao");
+    expect(compiler.importedStylesheetsByBasePath[""]).toEqual([
+      { cssPath: path.join(root, "libs/shared/ui/brand.css"), declaredNames: ["--kakao", "--naver"] },
+    ]);
+  });
+
+  test("compiles lib-owned tokens ahead of the app stylesheets that may override them", async () => {
+    const root = await makeTempRoot();
+    const appDir = path.join(root, "apps/demo");
+    await write(
+      path.join(appDir, "page/_index.tsx"),
+      'import "./styles.css";\nimport { Card } from "@libs/shared/ui";\nexport default () => <Card />;\n',
+    );
+    await write(path.join(appDir, "page/styles.css"), ":root { --brand: #111111; }\n");
+    await write(path.join(root, "libs/shared/ui/index.ts"), "export const Card = () => null;\n");
+    await write(path.join(root, "libs/shared/ui/tokens.css"), ":root { --kakao: #fee500; }\n");
+    await write(path.join(root, "libs/unused/ui/tokens.css"), ":root { --unused: #000000; }\n");
+
+    const compiler = cssCompilerFor(root, appDir, {
+      getPageKeys: async () => ["./_index.tsx"],
+      getConfig: async () => ({ barrelImports: [] }),
+      getTsConfig: async () => ({ compilerOptions: { paths: { "@libs/*": ["./libs/*"] } } }),
+    });
+    const { cssPaths } = await compiler.discoverCssAndSources();
+
+    expect(cssPaths).toEqual([path.join(root, "libs/shared/ui/tokens.css"), path.join(appDir, "page/styles.css")]);
   });
 });

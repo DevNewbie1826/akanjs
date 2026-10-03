@@ -7,15 +7,22 @@ import type {
   ApplicationBuildResult,
 } from "./applicationBuildReporter";
 import type { App } from "./commandDecorators";
-import { AllRoutesBuilder, CsrArtifactBuilder, precompressArtifacts, SsrBaseArtifactBuilder } from "./frontendBuild";
+import {
+  AllRoutesBuilder,
+  CsrArtifactBuilder,
+  FontPruner,
+  precompressArtifacts,
+  SsrBaseArtifactBuilder,
+} from "./frontendBuild";
 import { Spinner } from "./spinner";
+import { createServerEnvPlugin } from "./transforms/serverEnvPlugin";
 
 export interface TypecheckOptions {
   clean?: boolean;
   incremental?: boolean;
 }
 
-export type BuildPhaseId = "prepare" | "typecheck" | "backend" | "ssr" | "csr" | "compress" | "metadata";
+export type BuildPhaseId = "prepare" | "typecheck" | "backend" | "ssr" | "csr" | "assets" | "compress" | "metadata";
 
 export type BuildPhaseResult = ApplicationBuildPhaseResult & { id: BuildPhaseId };
 export type BuildResult = ApplicationBuildResult;
@@ -23,6 +30,8 @@ export type BuildProgressReporter = ApplicationBuildProgressReporter;
 export interface ApplicationBuildRunnerOptions {
   fast?: boolean;
   reporter?: BuildProgressReporter;
+  /** The backend env the build is for, when it is not the workspace's own (a mobile or desktop build's `--env`). */
+  environment?: string;
 }
 export interface BuildOptions {
   spinner?: boolean;
@@ -37,6 +46,7 @@ const BUILD_PHASE_EMOJIS: Record<BuildPhaseId, string> = {
   backend: "📦",
   ssr: "🧭",
   csr: "🎨",
+  assets: "✂️",
   compress: "🗜️",
   metadata: "📝",
 };
@@ -53,10 +63,13 @@ const SSR_RENDER_EXTERNALS = [
   "react-server-dom-webpack/client.browser",
 ] as const;
 
+// Mangling renames classes, and `this.constructor.name` names loggers, exceptions and guards; `minify.keepNames`
+// is a no-op as of Bun 1.4.2.
+export const AKAN_BACKEND_MINIFY = { whitespace: true, syntax: true, identifiers: false } as const;
+
 export const AKAN_OPTIONAL_BACKEND_EXTERNALS = [
   "@libsql/client",
   "bullmq",
-  "croner",
   "ioredis",
   "postgres",
   "protobufjs",
@@ -66,45 +79,55 @@ export class ApplicationBuildRunner {
   #app: App;
   #fast: boolean;
   #reporter?: BuildProgressReporter;
+  #environment?: string;
+  #spinner?: boolean;
   #startedAt = Date.now();
   #phases: BuildPhaseResult[] = [];
 
-  constructor(app: App, { fast = false, reporter }: ApplicationBuildRunnerOptions = {}) {
+  constructor(app: App, { fast = false, reporter, environment }: ApplicationBuildRunnerOptions = {}) {
     this.#app = app;
     this.#fast = fast;
     this.#reporter = reporter;
+    this.#environment = environment;
   }
 
   async build({ spinner = false }: BuildOptions = {}): Promise<BuildResult> {
     // serial build is needed because of Bun.build is unstable for parallel build
-    const phaseOptions = { spinner };
-    await this.#runPhase("prepare", "Preparing output directory", () => this.#app.prepareCommand("build"), undefined, {
-      spinner,
-    });
-    if (!this.#fast) await this.#runPhase("typecheck", "Typechecking", () => this.typecheck(), undefined, phaseOptions);
+    this.#spinner = spinner;
+    const { web, assets } = await this.#app.getConfig();
+    await this.#runPhase("prepare", "Preparing output directory", () => this.#app.prepareCommand("build"));
+    if (!this.#fast) await this.#runPhase("typecheck", "Typechecking", () => this.typecheck());
     await this.#runPhase(
       "backend",
       "Compiling backend",
       () => this.#buildBackend(),
       (result) => `${result.entrypoints} entrypoints, ${result.outputs} outputs`,
-      phaseOptions,
     );
     await this.#runPhase(
       "ssr",
       "Building SSR route artifacts",
-      () => this.#buildSsr(),
+      async () => (web.ssr ? await this.#buildSsr() : null),
       (result) =>
         result
           ? `${result.allRoutes.manifest.routeIds.length} routes, ${result.allRoutes.manifest.knownEntries.length} entries`
-          : "skipped",
-      phaseOptions,
+          : web.ssr
+            ? "skipped"
+            : "disabled by akan.config.ts web.ssr",
     );
     await this.#runPhase(
       "csr",
       "Building CSR assets",
-      () => this.#buildCsr(),
-      (result) => result?.outputDir ?? "skipped",
-      phaseOptions,
+      async () => (web.csr ? await new CsrArtifactBuilder(this.#app, "build").build() : null),
+      (result) => result?.outputDir ?? (web.csr ? "skipped" : "disabled by akan.config.ts web.csr"),
+    );
+    await this.#runPhase(
+      "assets",
+      "Trimming unread static assets",
+      async () => (assets.pruneFonts ? await new FontPruner(this.#app, assets).prune() : null),
+      (result) =>
+        result
+          ? `${result.removed.length} font file(s) dropped, ${ApplicationBuildRunner.formatBytes(result.freedBytes)} freed; ${result.kept.length} kept`
+          : "disabled by akan.config.ts assets.pruneFonts",
     );
     await this.#runPhase(
       "compress",
@@ -112,13 +135,10 @@ export class ApplicationBuildRunner {
       () => precompressArtifacts(this.#app),
       (result) =>
         result.files > 0
-          ? `${result.files} files, ${ApplicationBuildRunner.formatBytes(result.inputBytes)} -> ${ApplicationBuildRunner.formatBytes(result.outputBytes)}`
+          ? `${result.files} files, ${ApplicationBuildRunner.formatBytes(result.inputBytes)} -> gzip ${ApplicationBuildRunner.formatBytes(result.outputBytes)} / br ${ApplicationBuildRunner.formatBytes(result.brotliBytes)}`
           : "no files",
-      phaseOptions,
     );
-    await this.#runPhase("metadata", "Writing production metadata", () => this.#buildAppMeta(), undefined, {
-      spinner,
-    });
+    await this.#runPhase("metadata", "Writing production metadata", () => this.buildAppMeta());
     return {
       phases: this.#phases,
       durationMs: Date.now() - this.#startedAt,
@@ -130,7 +150,7 @@ export class ApplicationBuildRunner {
   async typecheck(options: TypecheckOptions = {}) {
     const { clean = false, incremental = true } = options;
     await this.#app.getPageKeys({ refresh: true });
-    const { typecheckDir, tsconfigPath } = await this.#writeTypecheckTsconfig({ incremental });
+    const { typecheckDir, tsconfigPath } = await this.#writeTypecheckTsconfig(incremental);
     if (clean) await rm(path.join(typecheckDir, "tsconfig.tsbuildinfo"), { force: true });
     await this.#checkProjectInChildProcess(tsconfigPath);
   }
@@ -140,19 +160,17 @@ export class ApplicationBuildRunner {
     label: string,
     task: () => Promise<T>,
     summarize?: (result: T) => string | undefined,
-    options: BuildPhaseRunOptions = {},
   ) {
     this.#reporter?.phaseStart?.({ id, label });
     const phaseStartedAt = Date.now();
-    const spinner = options.spinner
+    const spinner = this.#spinner
       ? new Spinner(label, { prefix: `${BUILD_PHASE_EMOJIS[id]} ${id}` }).start()
       : undefined;
     try {
       const result = await task();
       const phase = { id, label, durationMs: Date.now() - phaseStartedAt, summary: summarize?.(result) };
       this.#phases.push(phase);
-      const summary = phase.summary ? `: ${phase.summary}` : "";
-      spinner?.succeed(`${label}${summary}`);
+      spinner?.succeed(`${label}${phase.summary ? `: ${phase.summary}` : ""}`);
       this.#reporter?.phaseDone?.(phase);
       return result;
     } catch (error) {
@@ -162,66 +180,94 @@ export class ApplicationBuildRunner {
     }
   }
 
-  async #buildAppMeta() {
+  async buildAppMeta() {
     const akanConfig = await this.#app.getConfig();
+    const dockerfile = akanConfig.dockerfileFor(this.#environment ?? akanConfig.baseDevEnv.env);
     await Promise.all([
       this.#app.dist.writeJson("package.json", akanConfig.getProductionPackageJson()),
-      this.#app.dist.writeFile(`${this.#app.dist.cwdPath}/Dockerfile`, akanConfig.docker.content),
+      this.#app.dist.writeFile(`${this.#app.dist.cwdPath}/Dockerfile`, dockerfile),
+      this.#app.dist.writeJson("akan.build.json", {
+        buildId: await this.#resolveBuildId(),
+        akanVersion: akanConfig.akanVersion,
+        builtAt: new Date().toISOString(),
+      }),
     ]);
   }
 
+  //* Read back at runtime as `buildId` on the ops channel; a deployment's own AKAN_BUILD_ID still wins over it there.
+  async #resolveBuildId() {
+    const fromEnv = process.env.AKAN_BUILD_ID?.trim();
+    if (fromEnv) return fromEnv;
+    const root = this.#app.workspace.workspaceRoot;
+    const sha = Bun.spawnSync(["git", "rev-parse", "--short=12", "HEAD"], { cwd: root, stderr: "ignore" });
+    if (sha.exitCode !== 0) return null;
+    const dirty = Bun.spawnSync(["git", "status", "--porcelain", "--untracked-files=no"], {
+      cwd: root,
+      stderr: "ignore",
+    });
+    const suffix = dirty.exitCode === 0 && dirty.stdout.toString().trim() ? "-dirty" : "";
+    return `${sha.stdout.toString().trim()}${suffix}`;
+  }
+
   async #buildBackend() {
-    const akanConfig = await this.#app.getConfig();
-    const backendExternals = [
-      ...new Set([...akanConfig.externalLibs, ...SSR_RENDER_EXTERNALS, ...AKAN_OPTIONAL_BACKEND_EXTERNALS]),
-    ];
+    const { externalLibs, web, baseDevEnv, branches } = await this.#app.getConfig();
     const backendEntryPoints = [`${this.#app.cwdPath}/main.ts`, `${this.#app.cwdPath}/server.ts`];
     for (const entrypoint of backendEntryPoints) {
       if (!(await Bun.file(entrypoint).exists())) throw new Error(`Backend entrypoint not found: ${entrypoint}`);
     }
-    const backendResult = await this.#buildOrThrow("backend", {
-      entrypoints: backendEntryPoints,
+    const sharedConfig = {
       outdir: this.#app.dist.cwdPath,
       target: "bun",
-      minify: true,
+      minify: AKAN_BACKEND_MINIFY,
       naming: { entry: "[name].[ext]", chunk: "chunk-[hash].[ext]" },
-      define: { "process.env.NODE_ENV": JSON.stringify("production") },
-      plugins: backendExternals.length > 0 ? [this.#createExternalSpecifiersPlugin(backendExternals)] : [],
-    });
-    const rscWorkerResult = await this.#buildOrThrow("rsc-worker", {
-      entrypoints: [this.#resolveRscWorkerBuildEntry()],
-      outdir: this.#app.dist.cwdPath,
-      target: "bun",
-      minify: true,
-      naming: { entry: "[name].[ext]", chunk: "chunk-[hash].[ext]" },
-      conditions: ["react-server"],
       // `akan build` must embed production react-server-dom regardless of the shell's NODE_ENV.
       define: { "process.env.NODE_ENV": JSON.stringify("production") },
-      plugins: backendExternals.length > 0 ? [this.#createExternalSpecifiersPlugin(backendExternals)] : [],
+    } satisfies Omit<Bun.BuildConfig, "entrypoints">;
+    const serverEnvPlugin = createServerEnvPlugin({
+      envDir: path.join(this.#app.cwdPath, "env"),
+      //? The root .env wins over the shell in baseDevEnv, so a `--env` build names its own; a desktop app runs it.
+      environment: this.#environment ?? baseDevEnv.env,
+      environments: ["local", "testing", ...branches],
     });
+    const backendConfig = {
+      ...sharedConfig,
+      plugins: [this.#createExternalSpecifiersPlugin(externalLibs), serverEnvPlugin],
+    };
+    //* Built apart so main.js keeps its own module copies; splitting moves lazy vendor `import()`s out of the boot parse.
+    const [mainResult, serverResult] = [
+      await this.#buildOrThrow("backend", { ...backendConfig, entrypoints: [backendEntryPoints[0]] }),
+      await this.#buildOrThrow("backend", { ...backendConfig, entrypoints: [backendEntryPoints[1]], splitting: true }),
+    ];
+    // Nothing spawns the RSC worker without SSR, so an api-only image does not carry it.
+    const rscWorkerResult = web.ssr
+      ? await this.#buildOrThrow("rsc-worker", {
+          ...backendConfig,
+          entrypoints: [this.#resolveRscWorkerBuildEntry()],
+          conditions: ["react-server"],
+        })
+      : null;
     const consoleRuntimeResult = await this.#buildOrThrow("console-runtime", {
+      ...sharedConfig,
       entrypoints: [this.#resolveConsoleRuntimeBuildEntry()],
-      outdir: this.#app.dist.cwdPath,
-      target: "bun",
-      minify: true,
       naming: { entry: "console-runtime.[ext]", chunk: "chunk-[hash].[ext]" },
-      define: { "process.env.NODE_ENV": JSON.stringify("production") },
     });
     await this.#writeConsoleShim();
+    const results = [mainResult, serverResult, rscWorkerResult, consoleRuntimeResult];
     return {
-      entrypoints: backendEntryPoints.length + 2,
-      outputs: backendResult.outputs.length + rscWorkerResult.outputs.length + consoleRuntimeResult.outputs.length + 1,
+      entrypoints: backendEntryPoints.length + (rscWorkerResult ? 2 : 1),
+      outputs: results.reduce((sum, result) => sum + (result?.outputs.length ?? 0), 1),
     };
   }
 
   async #writeConsoleShim() {
     await Bun.write(
       path.join(this.#app.dist.cwdPath, "console.js"),
-      `import { cnst, db, dict, option, server, sig, srv } from "./server.js";
-import { assertAkanConsoleAllowed, startAkanConsole } from "./console-runtime.js";
+      `process.env.AKAN_COMMAND_TYPE = "console";
+const { cnst, db, dict, option, server, sig, srv } = await import("./server.js");
+const { assertAkanConsoleAllowed, startAkanConsole } = await import("./console-runtime.js");
 
 const run = async () => {
-  assertAkanConsoleAllowed(server.env);
+  assertAkanConsoleAllowed();
   await server.start({ listen: false, web: false });
   try {
     await startAkanConsole(server, { globals: { cnst, db, dict, option, sig, srv } });
@@ -254,10 +300,6 @@ void run().catch((error) => {
     }
   }
 
-  async #buildCsr() {
-    return await new CsrArtifactBuilder(this.#app, "build").build();
-  }
-
   async #buildSsr() {
     const pageKeys = await this.#app.getPageKeys();
     if (pageKeys.length === 0) {
@@ -269,7 +311,7 @@ void run().catch((error) => {
     return { base, allRoutes };
   }
 
-  async #writeTypecheckTsconfig({ incremental = true }: TypecheckOptions = {}) {
+  async #writeTypecheckTsconfig(incremental: boolean) {
     const typecheckDir = path.join(this.#app.cwdPath, ".akan", "typecheck");
     await mkdir(typecheckDir, { recursive: true });
     //* TypeScript's `include` globs do not cross a symlink, so synced lib pages need their real path.
@@ -338,11 +380,10 @@ void run().catch((error) => {
     return result;
   }
 
-  #createExternalSpecifiersPlugin(specifiers: readonly string[]): BunPlugin {
-    const uniqueSpecifiers = [...new Set(specifiers)];
-    const escaped = uniqueSpecifiers.map((specifier) => specifier.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+  #createExternalSpecifiersPlugin(externalLibs: readonly string[]): BunPlugin {
+    const specifiers = new Set([...externalLibs, ...SSR_RENDER_EXTERNALS, ...AKAN_OPTIONAL_BACKEND_EXTERNALS]);
+    const escaped = [...specifiers].map((specifier) => specifier.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
     const filter = new RegExp(`^(${escaped.join("|")})(?:/.*)?$`);
-
     return {
       name: "akan-backend-externalize-specifiers",
       setup(build) {
@@ -351,9 +392,5 @@ void run().catch((error) => {
     };
   }
 
-  static formatBytes(bytes: number): string {
-    if (bytes < 1024) return `${bytes}B`;
-    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
-    return `${(bytes / 1024 / 1024).toFixed(1)}MB`;
-  }
+  static formatBytes = FontPruner.formatBytes;
 }

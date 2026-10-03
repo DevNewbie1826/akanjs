@@ -1,4 +1,4 @@
-import { pathGet } from "akanjs/common";
+import { interpolateTranslation, parseAkanI18nEnv, pathGetLoose } from "akanjs/common";
 
 export interface Dictionary {
   [key: string]: {
@@ -11,18 +11,12 @@ export interface AllDictionary {
 
 interface TranslatorState {
   langDictionaryMap: Map<string, Dictionary>;
-  // Tracks dictionary objects already merged into the map. The seeded snapshot
-  // (`allDictionary[lang]`) is a stable reference within a build, so repeat seeds skip the merge.
+  // A seeded snapshot is one reference per build, so a repeat seed skips the merge.
   seededDicts: WeakSet<object>;
-  // Tracks dictionary snapshots already installed via replace. Replacing is snapshot semantics, but
-  // the same object may be passed repeatedly while rendering the same build.
   replacedDicts: WeakSet<object>;
-  // Browser-only source of truth for the active locale (set by ClientWrapper from the server-resolved
-  // `lang`). Never written on the server (concurrent requests share this state), where locale stays
-  // request-scoped via getPageInfo/x-locale.
+  // Browser-only: never written on the server, where concurrent requests share this state.
   activeLocale?: string;
-  // Browser-only copy of the server-resolved route path. This keeps the first client render aligned
-  // with SSR; after hydration, usePage can derive the path from window.location again.
+  // Browser-only copy of the server-resolved path, so the first client render matches SSR.
   activePath?: string;
 }
 
@@ -40,6 +34,7 @@ const getTranslatorState = (): TranslatorState => {
 };
 
 export class Translator {
+  static readonly #filledDicts = new WeakMap<AllDictionary, Map<string, Dictionary>>();
   constructor(dictionary: Record<string, Record<string, Record<string, unknown>>>) {
     Object.entries(dictionary).forEach(([lang, dict]) => {
       Translator.seed(lang, dict as Dictionary);
@@ -66,14 +61,46 @@ export class Translator {
     delete getTranslatorState().activePath;
   }
   static translateByLocale(lang: string, key: string, param?: Record<string, string | number>): string {
-    const dictionary = getTranslatorState().langDictionaryMap.get(lang);
-    if (!dictionary) return key;
-    const msg = (pathGet(key, dictionary, ".", { t: key }) as { t: string }).t;
-    return param ? msg.replace(/{([^}]+)}/g, (_, key: string) => param[key] as string) : msg;
+    const msg = Translator.#lookup(lang, key) ?? Translator.#lookupDefault(lang, key) ?? key;
+    return interpolateTranslation(msg, param);
   }
-  // Synchronously merge a single locale's dictionary into the shared map.
-  // Idempotent: re-seeding the same locale merges keys without dropping existing ones, and re-seeding
-  // the exact same snapshot object is skipped for performance.
+  static #lookup(lang: string, key: string) {
+    const dictionary = getTranslatorState().langDictionaryMap.get(lang);
+    if (!dictionary) return undefined;
+    const node = pathGetLoose(key, dictionary, ".") as { t?: unknown } | null;
+    return typeof node?.t === "string" ? node.t : undefined;
+  }
+  // A locale no lib dictionary wrote falls back to the default locale's text: the dotted key as prose is always wrong.
+  static #lookupDefault(lang: string, key: string) {
+    const { defaultLocale } = parseAkanI18nEnv();
+    return defaultLocale === lang ? undefined : Translator.#lookup(defaultLocale, key);
+  }
+  // An SSR client is seeded with one locale only, so `#lookupDefault` has nothing to reach there: ship the text inside it.
+  static withDefaultLocale(allDictionary: AllDictionary, lang: string): Dictionary | undefined {
+    const { defaultLocale } = parseAkanI18nEnv();
+    const fallback = allDictionary[defaultLocale];
+    if (lang === defaultLocale || !fallback) return allDictionary[lang];
+    const filledByLocale = Translator.#filledDicts.get(allDictionary) ?? new Map<string, Dictionary>();
+    Translator.#filledDicts.set(allDictionary, filledByLocale);
+    const filled =
+      filledByLocale.get(lang) ?? (Translator.#fillGaps(allDictionary[lang] ?? {}, fallback) as Dictionary);
+    filledByLocale.set(lang, filled);
+    return filled;
+  }
+  static #fillGaps(own: Record<string, unknown>, fallback: Record<string, unknown>): Record<string, unknown> {
+    const filled = { ...own };
+    for (const [key, value] of Object.entries(fallback)) {
+      const ownValue = filled[key];
+      if (ownValue === undefined) filled[key] = value;
+      else if (Translator.#isNode(ownValue) && Translator.#isNode(value))
+        filled[key] = Translator.#fillGaps(ownValue, value);
+    }
+    return filled;
+  }
+  static #isNode(value: unknown): value is Record<string, unknown> {
+    return typeof value === "object" && value !== null && !Array.isArray(value);
+  }
+  // Merges without dropping existing keys; the same snapshot object is skipped.
   static seed(lang: string, dict: Dictionary | undefined) {
     if (!dict) return;
     const state = getTranslatorState();

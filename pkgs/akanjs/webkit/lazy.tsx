@@ -1,18 +1,14 @@
 import type { ComponentType, ReactNode } from "react";
-// `useState` / `useEffect` are NOT exported from `react.react-server.js`
-// (the build Bun resolves `react` to under `--conditions react-server`).
-// Named-importing them here would crash RSC worker evaluation with
-// "Export named 'useEffect' not found". They're only ever called on the
-// browser anyway (the `ssr: false` gate below is the only path that calls
-// them, and it short-circuits on the server), so we dereference them
-// through a namespace import — the namespace itself is always importable,
-// and the lookup only happens when the gated Wrapper actually renders.
+// `react.react-server.js` (Bun's `react` under `--conditions react-server`) lacks the hooks and `Suspense`: a named
+// import crashes RSC worker evaluation, so they are read off the namespace only when a wrapper using them renders.
 import * as React from "react";
 import { forwardRef, lazy as reactLazy } from "react";
 
 const isServer = typeof window === "undefined";
 
-type LazyOption = { ssr?: boolean; loading?: () => ReactNode };
+/** `suspense`: a late chunk suspends only itself, not the route. Opt-in: under streaming the boundary's subtree
+ * leaves the shell, which SEO snapshots, prerendering and pre-hydration E2E read. */
+type LazyOption = { ssr?: boolean; suspense?: boolean; loading?: () => ReactNode };
 type LazyProps = Record<string, unknown>;
 type LoadedOf<Loaded> = Loaded extends { default: infer T } ? T : Loaded;
 type LazyModule = { default: ComponentType<LazyProps> };
@@ -22,7 +18,7 @@ const normalizeLazyModule = <Loaded,>(loaded: Loaded): LazyModule => {
   return { default: loaded as ComponentType<LazyProps> };
 };
 
-/** React lazy wrapper with Akan's `ssr: false` server stub and client mount gate. */
+/** `ssr: false` renders `loading` on the server and mounts the component only after hydration. */
 export const lazy = <Loaded,>(loader: () => Promise<Loaded>, option?: LazyOption): LoadedOf<Loaded> => {
   const ssrFalse = option?.ssr === false;
   const renderFallback = (): ReactNode => (option?.loading ? option.loading() : null);
@@ -34,7 +30,15 @@ export const lazy = <Loaded,>(loader: () => Promise<Loaded>, option?: LazyOption
   const LazyInner = reactLazy(async () => normalizeLazyModule(await loader()));
 
   if (!ssrFalse) {
-    const Wrapper = forwardRef<unknown, LazyProps>((props, ref) => <LazyInner {...props} ref={ref as never} />);
+    const Wrapper = forwardRef<unknown, LazyProps>((props, ref) =>
+      option?.suspense ? (
+        <React.Suspense fallback={renderFallback()}>
+          <LazyInner {...props} ref={ref as never} />
+        </React.Suspense>
+      ) : (
+        <LazyInner {...props} ref={ref as never} />
+      ),
+    );
     Wrapper.displayName = "LazyWrapper";
     return Wrapper as unknown as LoadedOf<Loaded>;
   }
@@ -43,7 +47,11 @@ export const lazy = <Loaded,>(loader: () => Promise<Loaded>, option?: LazyOption
     const [mounted, setMounted] = React.useState(false);
     React.useEffect(() => setMounted(true), []);
     if (!mounted) return <>{renderFallback()}</>;
-    return <LazyInner {...props} ref={ref as never} />;
+    return (
+      <React.Suspense fallback={renderFallback()}>
+        <LazyInner {...props} ref={ref as never} />
+      </React.Suspense>
+    );
   });
   Gate.displayName = "LazySsrFalseGate";
   return Gate as unknown as LoadedOf<Loaded>;

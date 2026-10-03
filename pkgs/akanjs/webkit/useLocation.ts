@@ -1,20 +1,20 @@
 "use client";
 import type { Location, PathRoute, RouteGuide } from "akanjs/client";
-import { useCallback } from "react";
+import { useCallback, useRef } from "react";
+import { CsrStack } from "./CsrStack";
 
 interface UseLocationOptions {
   rootRouteGuide: RouteGuide;
 }
 export const useLocation = ({ rootRouteGuide }: UseLocationOptions) => {
+  const routeGuide = useRef(rootRouteGuide);
+  routeGuide.current = rootRouteGuide;
   const getLocation = useCallback((href: string): Location => {
-    const getPathSegments = (pathname: string) => {
-      return [
-        ...pathname
-          .split("/")
-          .filter((pathSegment) => !!pathSegment)
-          .map((pathSegment) => `/${pathSegment}`),
-      ];
-    };
+    const getPathSegments = (pathname: string) =>
+      pathname
+        .split("/")
+        .filter((pathSegment) => !!pathSegment)
+        .map((pathSegment) => `/${pathSegment}`);
     const getPathRoute = (pathname: string): PathRoute => {
       const pathSegments = getPathSegments(pathname);
       const getTargetRouteGuide = (pathSegments: string[], routeGuide: RouteGuide): RouteGuide => {
@@ -31,7 +31,7 @@ export const useLocation = ({ rootRouteGuide }: UseLocationOptions) => {
         if (!childRouteGuide) throw new Error(`Not found: ${pathname}`);
         return getTargetRouteGuide(pathSegments, childRouteGuide);
       };
-      const targetRouteGuide = getTargetRouteGuide(pathSegments, rootRouteGuide);
+      const targetRouteGuide = getTargetRouteGuide(pathSegments, routeGuide.current);
       const pathRoute = targetRouteGuide.pathRoute;
       if (!pathRoute) {
         window.location.assign("/404");
@@ -63,7 +63,7 @@ export const useLocation = ({ rootRouteGuide }: UseLocationOptions) => {
     const pathRoute = getPathRoute(pathname);
     const params = getParams(pathname, pathRoute);
     const searchParams = getSearchParams(search);
-    return { pathname, search, params, searchParams, pathRoute, hash, href };
+    return { pathname, search, params, searchParams, pathRoute, hash, href, entryId: CsrStack.nextEntryId() };
   }, []);
   return { getLocation };
 };

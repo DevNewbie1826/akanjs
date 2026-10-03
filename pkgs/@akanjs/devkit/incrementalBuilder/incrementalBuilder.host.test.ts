@@ -1,4 +1,8 @@
 import { afterEach, describe, expect, mock, test } from "bun:test";
+import { mkdtemp, rm } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { CSR_DEV_PATCHING_MARKER, SSR_DEV_DIRNAME } from "akanjs/server/hmr/csrDevManifest";
 import { MemoryLimit } from "akanjs/server/memoryLimit";
 import { IncrementalBuilderHost } from "./incrementalBuilder.host";
 
@@ -26,18 +30,25 @@ const mockSpawns = (): SpawnRecord[] => {
   return spawns;
 };
 
+const createHost = (onMessage: (message: unknown) => void = () => undefined) =>
+  new IncrementalBuilderHost({ app: { cwdPath: "/tmp/app" } as never, entry: "/tmp/builder.ts", env: {}, onMessage });
+
+const startRecordingHost = () => {
+  const spawns = mockSpawns();
+  const messages: unknown[] = [];
+  const host = createHost((message) => messages.push(message));
+  host.start();
+  spawns[0]?.options.ipc?.({ type: "builder-ready" });
+  return { spawns, messages, host };
+};
+
 describe("IncrementalBuilderHost", () => {
   test("restarts after a ready builder exits", async () => {
     const spawns = mockSpawns();
 
     const onReady = mock();
     const onRestartReady = mock();
-    const host = new IncrementalBuilderHost({
-      app: { cwdPath: "/tmp/app" } as never,
-      entry: "/tmp/builder.ts",
-      env: {},
-      onMessage: () => undefined,
-    });
+    const host = createHost();
 
     host.start({ onReady, onRestartReady });
     spawns[0]?.options.ipc?.({ type: "builder-ready" });
@@ -60,12 +71,7 @@ describe("IncrementalBuilderHost", () => {
   test("recycles a ready builder gracefully and replaces it immediately", async () => {
     const spawns = mockSpawns();
     const onRestartReady = mock();
-    const host = new IncrementalBuilderHost({
-      app: { cwdPath: "/tmp/app" } as never,
-      entry: "/tmp/builder.ts",
-      env: {},
-      onMessage: () => undefined,
-    });
+    const host = createHost();
 
     host.start({ onRestartReady });
     spawns[0]?.options.ipc?.({ type: "builder-ready" });
@@ -73,18 +79,14 @@ describe("IncrementalBuilderHost", () => {
 
     const reason = "rss=1300MiB>=1200MiB after 3 build(s)";
     expect(host.recycle(reason)).toBe(true);
-    // Graceful: the builder is asked to drain, not killed, so a rebuild in flight still completes.
     expect(spawns[0]?.proc.send).toHaveBeenCalledWith({ type: "builder-shutdown", reason });
     expect(spawns[0]?.proc.kill).not.toHaveBeenCalled();
     expect(host.recycle("second request")).toBe(false);
 
-    // The drain refuses everything that arrives during it, so a request sent here is a request the
-    // developer gets an error page for. Reporting the state is what lets the host hold it instead.
     expect(host.status).toBe("recycling");
     expect(host.send({ type: "build-route", id: 9, routeId: "z", seeds: [], knownEntries: [] })).toBe(false);
     expect(spawns[0]?.proc.send).toHaveBeenCalledTimes(1);
 
-    // A planned exit skips the crash backoff — the dev server has no file watcher until it is back.
     spawns[0]?.options.onExit?.();
     expect(spawns).toHaveLength(2);
     expect(spawns[1]?.options.env?.AKAN_BUILDER_ANNOUNCE_BOOT).toBe("1");
@@ -103,17 +105,7 @@ describe("IncrementalBuilderHost", () => {
   });
 
   test("fails the requests a departing builder never answered", async () => {
-    const spawns = mockSpawns();
-    const messages: unknown[] = [];
-    const host = new IncrementalBuilderHost({
-      app: { cwdPath: "/tmp/app" } as never,
-      entry: "/tmp/builder.ts",
-      env: {},
-      onMessage: (message) => messages.push(message),
-    });
-
-    host.start();
-    spawns[0]?.options.ipc?.({ type: "builder-ready" });
+    const { spawns, messages, host } = startRecordingHost();
     expect(host.send({ type: "build-route", id: 1, routeId: "a", seeds: [], knownEntries: [] })).toBe(true);
     expect(host.send({ type: "build-csr", id: 2, reason: "device webview" })).toBe(true);
     // Answered before the exit, so this one must not be failed again afterwards.
@@ -124,8 +116,6 @@ describe("IncrementalBuilderHost", () => {
     host.recycle("rss=1300MiB>=1200MiB after 3 build(s)");
     spawns[0]?.options.onExit?.();
 
-    // Nothing else answers these: the builder only refuses requests that arrive after it starts shutting
-    // down, and a kill or a truncated write sends nothing at all.
     expect(messages).toEqual([
       {
         type: "build-route-res",
@@ -152,17 +142,7 @@ describe("IncrementalBuilderHost", () => {
   });
 
   test("names a crash rather than a recycle, and answers on stop too", async () => {
-    const spawns = mockSpawns();
-    const messages: unknown[] = [];
-    const host = new IncrementalBuilderHost({
-      app: { cwdPath: "/tmp/app" } as never,
-      entry: "/tmp/builder.ts",
-      env: {},
-      onMessage: (message) => messages.push(message),
-    });
-
-    host.start();
-    spawns[0]?.options.ipc?.({ type: "builder-ready" });
+    const { spawns, messages, host } = startRecordingHost();
     host.send({ type: "build-route", id: 1, routeId: "a", seeds: [], knownEntries: [] });
     messages.length = 0;
     spawns[0]?.options.onExit?.();
@@ -175,8 +155,6 @@ describe("IncrementalBuilderHost", () => {
       },
     ]);
 
-    // `stop()` clears the process before its exit callback runs, so the callback bails on its identity
-    // check and cannot be the only place this happens.
     await wait(1_050);
     spawns[1]?.options.ipc?.({ type: "builder-ready" });
     messages.length = 0;
@@ -189,12 +167,7 @@ describe("IncrementalBuilderHost", () => {
 
   test("only recycles a builder that is ready", () => {
     const spawns = mockSpawns();
-    const host = new IncrementalBuilderHost({
-      app: { cwdPath: "/tmp/app" } as never,
-      entry: "/tmp/builder.ts",
-      env: {},
-      onMessage: () => undefined,
-    });
+    const host = createHost();
 
     host.start();
     expect(host.recycle("while still booting")).toBe(false);
@@ -202,6 +175,36 @@ describe("IncrementalBuilderHost", () => {
 
     host.stop();
     expect(host.recycle("after stop")).toBe(false);
+  });
+
+  test("a patcher a crash turned off stays off in the host that replaces this one", async () => {
+    const cwdPath = await mkdtemp(path.join(os.tmpdir(), "akan-builder-patcher-"));
+    try {
+      const spawns = mockSpawns();
+      const app = { cwdPath } as never;
+      const host = new IncrementalBuilderHost({ app, entry: "/tmp/builder.ts", env: {}, onMessage: () => undefined });
+      host.start();
+      spawns[0]?.options.ipc?.({ type: "builder-ready" });
+      const marker = path.join(cwdPath, ".akan/artifact", SSR_DEV_DIRNAME, CSR_DEV_PATCHING_MARKER);
+      await Bun.write(marker, "");
+      spawns[0]?.options.onExit?.();
+      await wait(1_050);
+      expect(spawns[1]?.options.env?.AKAN_DEV_CSR_PATCHER).toBe("off");
+      expect(host.patcherOff).toBe(true);
+      host.stop();
+      const next = new IncrementalBuilderHost({
+        app,
+        entry: "/tmp/builder.ts",
+        env: {},
+        onMessage: () => undefined,
+        patcherOff: host.patcherOff,
+      });
+      next.start();
+      expect(spawns[2]?.options.env?.AKAN_DEV_CSR_PATCHER).toBe("off");
+      next.stop();
+    } finally {
+      await rm(cwdPath, { recursive: true, force: true });
+    }
   });
 });
 
@@ -222,23 +225,17 @@ describe("IncrementalBuilderHost.maxRssBytes", () => {
     }
   };
 
-  /**
-   * Only where nothing else supplies a limit, which is not true in a container: a cgroup `memory.max`
-   * makes `resolveMaxRssBytes` derive from that instead. Measured under `docker --memory=7g`, this
-   * returned 2.45GiB rather than the fallback — the assertion was about the runner, not the code.
-   */
+  // Skipped under a cgroup `memory.max`, which `resolveMaxRssBytes` derives the ceiling from instead.
   test.skipIf(MemoryLimit.readCgroupBytes() !== null)("defaults to a dev ceiling well above a fresh boot", () => {
     withEnv(
       { AKAN_BUILDER_MAX_RSS_MB: undefined, AKAN_BUILDER_MAX_RSS: undefined, AKAN_MEMORY_LIMIT: undefined },
       () => {
-        expect(IncrementalBuilderHost.maxRssBytes()).toBe(1_200 * 1024 * 1024);
+        expect(IncrementalBuilderHost.maxRssBytes()).toBe(2_048 * 1024 * 1024);
       },
     );
   });
 
   test("derives the ceiling from the sandbox's own limit, wherever it runs", () => {
-    // The property the fallback test cannot assert in a container, stated so it holds on every runner:
-    // the builder gets 35% of whatever the sandbox is allowed.
     withEnv(
       {
         AKAN_BUILDER_MAX_RSS_MB: undefined,

@@ -3,9 +3,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { AppExecutor, WorkspaceExecutor } from "../executors";
 import type { PackageJson } from "../types";
 import { AkanAppConfig, AkanLibConfig, deriveDefaultAppId } from "./akanConfig";
-import type { DeepPartial, LibConfigResult } from "./types";
+import type { LibConfigInput } from "./types";
 
 const akanPackageJson = JSON.parse(
   fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), "../../../akanjs/package.json"), "utf8"),
@@ -19,7 +20,6 @@ const packageJson: PackageJson = {
     react: "19.0.0",
     "react-dom": "19.0.0",
     "react-server-dom-webpack": "19.0.0",
-    sharp: "1.0.0",
     "@external/runtime": "2.0.0",
   },
 };
@@ -33,8 +33,24 @@ const baseDevEnv = {
   workspaceRoot: "/workspace",
 };
 
+const loadExtAppConfig = async (tmpPrefix: string, appConfig: string, libConfig: string) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), tmpPrefix));
+  try {
+    fs.mkdirSync(path.join(root, "apps/extapp"), { recursive: true });
+    fs.mkdirSync(path.join(root, "libs/extlib"), { recursive: true });
+    fs.writeFileSync(path.join(root, "apps/extapp/akan.config.ts"), appConfig);
+    fs.writeFileSync(path.join(root, "libs/extlib/akan.config.ts"), libConfig);
+    fs.writeFileSync(path.join(root, "package.json"), JSON.stringify({ name: "extrepo", version: "1.0.0" }));
+    fs.writeFileSync(path.join(root, ".env"), "AKAN_PUBLIC_REPO_NAME=extrepo\nAKAN_PUBLIC_SERVE_DOMAIN=ext.test\n");
+    const workspace = WorkspaceExecutor.fromRoot({ workspaceRoot: root, repoName: "extrepo" });
+    return await AppExecutor.from(workspace, "extapp").getConfig();
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+};
+
 describe("AkanAppConfig", () => {
-  test("applies defaults for route domains, i18n, image, mobile, and imports", () => {
+  test("applies defaults for route domains, i18n, image, native, and imports", () => {
     const config = new AkanAppConfig(app, ["shared"], packageJson, {}, baseDevEnv);
 
     expect([...config.domains].sort()).toEqual([
@@ -46,7 +62,7 @@ describe("AkanAppConfig", () => {
     expect(config.i18n.defaultLocale).toBe("en");
     expect(config.i18n.locales).toContain("en");
     expect(config.images.formats).toEqual(["image/webp"]);
-    expect(config.mobile).toMatchObject({
+    expect(config.native).toMatchObject({
       appName: "portal",
       appId: "com.akanjs.portal",
       version: "0.0.1",
@@ -64,7 +80,8 @@ describe("AkanAppConfig", () => {
     expect(config.barrelImports).toEqual(
       expect.arrayContaining(["@apps/portal/ui", "@libs/shared/server", "akanjs/common", "akanjs/server"]),
     );
-    expect(config.docker.content).toContain("ENV AKAN_PUBLIC_APP_NAME=portal");
+    expect(config.dockerfile).toContain("ENV AKAN_PUBLIC_APP_NAME=portal");
+    expect(config.dockerfile).toContain("ENV AKAN_LOG_TO_FILE=0");
     expect(process.env.AKAN_PUBLIC_DEFAULT_LOCALE).toBe("en");
   });
 
@@ -85,7 +102,7 @@ describe("AkanAppConfig", () => {
           },
         ],
         i18n: { locales: ["ko", "en"], defaultLocale: "ko" },
-        mobile: {
+        native: {
           appName: "Portal App",
           appId: "com.portal.mobile",
           version: "1.2.3",
@@ -118,8 +135,8 @@ describe("AkanAppConfig", () => {
     expect(config.i18n.defaultLocale).toBe("ko");
     expect(config.images.qualities).toEqual([80, 90]);
     expect(config.images.dangerouslyAllowSVG).toBe(true);
-    expect(config.mobile.buildNum).toBe(7);
-    expect(config.mobile.targets.default).toMatchObject({
+    expect(config.native.buildNum).toBe(7);
+    expect(config.native.targets.default).toMatchObject({
       name: "default",
       appName: "Portal App",
       appId: "com.portal.mobile",
@@ -128,9 +145,136 @@ describe("AkanAppConfig", () => {
     });
     expect(config.publicEnv).toEqual(["AKAN_PUBLIC_FEATURE"]);
     expect(config.optimizeImports).toContain("custom-icons");
-    expect(config.docker.content).toContain('CMD ["bun","server.js"]');
-    expect(config.docker.content).toContain("FROM oven/bun:amd64 AS amd64");
-    expect(config.docker.content).toContain('RUN if [ "$TARGETARCH" = "arm64"');
+    expect(config.dockerfile).toContain('CMD ["bun","server.js"]');
+    expect(config.dockerfile).toContain("FROM oven/bun:amd64 AS amd64");
+    expect(config.dockerfile).toContain('RUN if [ "$TARGETARCH" = "arm64"');
+  });
+
+  test("defaults both web surfaces on and keeps the image free of web env overrides", () => {
+    const config = new AkanAppConfig(app, [], packageJson, {}, baseDevEnv);
+
+    expect(config.web).toEqual({ ssr: true, csr: true });
+    expect(config.dockerfile).not.toContain("AKAN_SSR");
+    expect(config.dockerfile).not.toContain("AKAN_CSR");
+  });
+
+  test("bakes the disabled surface into the image env so the default matches what was built", () => {
+    const ssrOnly = new AkanAppConfig(app, [], packageJson, { web: { csr: false } }, baseDevEnv);
+    expect(ssrOnly.web).toEqual({ ssr: true, csr: false });
+    expect(ssrOnly.dockerfile).toContain("ENV AKAN_CSR=false");
+    expect(ssrOnly.dockerfile).not.toContain("ENV AKAN_SSR=false");
+
+    const apiOnly = new AkanAppConfig(app, [], packageJson, { web: false }, baseDevEnv);
+    expect(apiOnly.web).toEqual({ ssr: false, csr: false });
+    expect(apiOnly.dockerfile).toContain("ENV AKAN_SSR=false");
+    expect(apiOnly.dockerfile).toContain("ENV AKAN_CSR=false");
+
+    expect(new AkanAppConfig(app, [], packageJson, { web: true }, baseDevEnv).web).toEqual({ ssr: true, csr: true });
+  });
+
+  test("writes the image env from getProductionEnv, one ENV line per key in its order", () => {
+    const config = new AkanAppConfig(
+      app,
+      [],
+      packageJson,
+      { routes: [{ basePath: "admin", domains: {} }], web: false, database: { modes: ["single", "cluster"] } },
+      baseDevEnv,
+    );
+
+    expect(config.getProductionEnv()).toEqual({
+      PORT: "8282",
+      NODE_ENV: "production",
+      AKAN_PUBLIC_REPO_NAME: "akanjs",
+      AKAN_PUBLIC_SERVE_DOMAIN: "akanjs.com",
+      AKAN_PUBLIC_APP_NAME: "portal",
+      AKAN_PUBLIC_ENV: "debug",
+      AKAN_PUBLIC_BASE_PATHS: "admin",
+      AKAN_PUBLIC_DEFAULT_LOCALE: "en",
+      AKAN_PUBLIC_LOCALES: config.i18n.locales.join(","),
+      AKAN_PUBLIC_API_PREFIX: "/api",
+      AKAN_PUBLIC_WS_PREFIX: "/ws",
+      AKAN_PUBLIC_OPERATION_MODE: "cloud",
+      AKAN_DATABASE_MODES: "single,cluster",
+      AKAN_LOG_TO_FILE: "0",
+      AKAN_SSR: "false",
+      AKAN_CSR: "false",
+    });
+    const envBlock = Object.entries(config.getProductionEnv())
+      .map(([key, value]) => `ENV ${key}=${value}`)
+      .join("\n");
+    expect(config.dockerfile).toContain(`COPY . .\n${envBlock}\nCMD ["bun","main.js"]`);
+  });
+
+  test("writes the Dockerfile instructions it wrote before its env came from getProductionEnv", () => {
+    //? 9adfb95c's output for this config; only the blank lines its empty interpolations left are gone since.
+    const before = [
+      "FROM oven/bun:1-slim",
+      "RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends ca-certificates tzdata && rm -rf /var/lib/apt/lists/*",
+      "RUN ln -sf /usr/share/zoneinfo/Asia/Seoul /etc/localtime",
+      "ARG TARGETARCH",
+      "",
+      "RUN mkdir -p /workspace",
+      "WORKDIR /workspace",
+      "COPY ./package.json ./package.json",
+      "RUN bun install --production",
+      "",
+      "COPY . .",
+      "ENV PORT=8282",
+      "ENV NODE_ENV=production",
+      "ENV AKAN_PUBLIC_REPO_NAME=akanjs",
+      "ENV AKAN_PUBLIC_SERVE_DOMAIN=akanjs.com",
+      "ENV AKAN_PUBLIC_APP_NAME=portal",
+      "ENV AKAN_PUBLIC_ENV=debug",
+      "",
+      "ENV AKAN_PUBLIC_DEFAULT_LOCALE=en",
+      "ENV AKAN_PUBLIC_LOCALES=en,ko",
+      "ENV AKAN_PUBLIC_API_PREFIX=/api",
+      "ENV AKAN_PUBLIC_WS_PREFIX=/ws",
+      "ENV AKAN_PUBLIC_OPERATION_MODE=cloud",
+      "ENV AKAN_DATABASE_MODES=single",
+      "ENV AKAN_LOG_TO_FILE=0",
+      "",
+      'CMD ["bun","main.js"]',
+    ];
+    const lines = (text: string) => text.split("\n").filter((line) => line !== "");
+
+    expect(lines(new AkanAppConfig(app, [], packageJson, {}, baseDevEnv).dockerfile)).toEqual(lines(before.join("\n")));
+  });
+
+  test("refuses a csr-less build that ships a native app", () => {
+    expect(
+      () => new AkanAppConfig(app, [], packageJson, { web: { csr: false }, native: { appName: "portal" } }, baseDevEnv),
+    ).toThrow("the native apps ship that bundle");
+  });
+
+  test("installs only ca-certificates and tzdata in the default image", () => {
+    const config = new AkanAppConfig(app, [], packageJson, {}, baseDevEnv);
+
+    expect(config.dockerfile).toContain(
+      "RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends ca-certificates tzdata && rm -rf /var/lib/apt/lists/*",
+    );
+    // The Chromium/ffmpeg toolchain moved to per-app `preRuns`; keeping it here paid for it in every image.
+    for (const dropped of ["libnss3", "ffmpeg", "build-essential", "redis", "xdg-utils"])
+      expect(config.dockerfile).not.toContain(dropped);
+  });
+
+  test("keeps a declared Dockerfile string verbatim", () => {
+    const dockerfile = 'FROM oven/bun:1-slim\nCOPY . .\nCMD ["bun","main.js"]';
+    const config = new AkanAppConfig(app, [], packageJson, { docker: dockerfile }, baseDevEnv);
+
+    expect(config.docker).toBe(dockerfile);
+    expect(config.dockerfile).toBe(dockerfile);
+  });
+
+  test("resolves the image parts, defaulting the base image and the command", () => {
+    const config = new AkanAppConfig(app, [], packageJson, { docker: { preRuns: ["echo hi"] } }, baseDevEnv);
+
+    expect(config.docker).toEqual({
+      image: "oven/bun:1-slim",
+      preRuns: ["echo hi"],
+      postRuns: [],
+      command: ["bun", "main.js"],
+    });
   });
 
   test("creates production package json and reports missing external versions", () => {
@@ -144,8 +288,6 @@ describe("AkanAppConfig", () => {
         react: "19.0.0",
         "react-dom": "19.0.0",
         "react-server-dom-webpack": "19.0.0",
-        croner: akanPackageJson.peerDependencies?.croner,
-        sharp: "1.0.0",
         "@external/runtime": "2.0.0",
       },
     });
@@ -184,8 +326,6 @@ describe("AkanAppConfig", () => {
       react: runtimeDependencies.react,
       "react-dom": runtimeDependencies["react-dom"],
       "react-server-dom-webpack": runtimeDependencies["react-server-dom-webpack"],
-      croner: runtimeDependencies.croner,
-      sharp: runtimeDependencies.sharp,
     });
   });
 
@@ -194,36 +334,65 @@ describe("AkanAppConfig", () => {
       ...akanPackageJson.dependencies,
       ...akanPackageJson.peerDependencies,
     };
-    const singleConfig = new AkanAppConfig(app, [], packageJson, { defaultDatabaseMode: "single" }, baseDevEnv);
-    const multipleConfig = new AkanAppConfig(app, [], packageJson, { defaultDatabaseMode: "multiple" }, baseDevEnv);
-    const clusterConfig = new AkanAppConfig(app, [], packageJson, { defaultDatabaseMode: "cluster" }, baseDevEnv);
+    const configOf = (database: { modes: ("single" | "multiple" | "cluster")[] }) =>
+      new AkanAppConfig(app, [], packageJson, { database }, baseDevEnv);
+    const dependenciesOf = (config: AkanAppConfig) => config.getProductionPackageJson().dependencies ?? {};
+    const singleConfig = configOf({ modes: ["single"] });
+    const multipleConfig = configOf({ modes: ["multiple"] });
+    const clusterConfig = configOf({ modes: ["cluster"] });
+    const edgeAndCloud = configOf({ modes: ["single", "cluster"] });
 
-    expect(singleConfig.getProductionPackageJson().dependencies).toMatchObject({
-      croner: runtimeDependencies.croner,
-    });
-    expect(singleConfig.getProductionPackageJson().dependencies).not.toHaveProperty("ioredis");
-    expect(singleConfig.getProductionPackageJson().dependencies).not.toHaveProperty("bullmq");
-    expect(singleConfig.getProductionPackageJson().dependencies).not.toHaveProperty("@libsql/client");
-    expect(singleConfig.getProductionPackageJson().dependencies).not.toHaveProperty("postgres");
-    expect(singleConfig.getProductionPackageJson().dependencies).not.toHaveProperty("protobufjs");
-
-    expect(multipleConfig.getProductionPackageJson().dependencies).toMatchObject({
-      "@libsql/client": runtimeDependencies["@libsql/client"],
+    for (const driver of ["ioredis", "bullmq", "postgres", "@libsql/client", "protobufjs"])
+      expect(dependenciesOf(singleConfig)).not.toHaveProperty(driver);
+    expect(dependenciesOf(multipleConfig)).toMatchObject({
       bullmq: runtimeDependencies.bullmq,
-      croner: runtimeDependencies.croner,
       ioredis: runtimeDependencies.ioredis,
-      protobufjs: runtimeDependencies.protobufjs,
     });
-    expect(multipleConfig.getProductionPackageJson().dependencies).not.toHaveProperty("postgres");
-
-    expect(clusterConfig.getProductionPackageJson().dependencies).toMatchObject({
+    expect(dependenciesOf(clusterConfig)).toMatchObject({
       bullmq: runtimeDependencies.bullmq,
-      croner: runtimeDependencies.croner,
       ioredis: runtimeDependencies.ioredis,
       postgres: runtimeDependencies.postgres,
-      protobufjs: runtimeDependencies.protobufjs,
     });
-    expect(clusterConfig.getProductionPackageJson().dependencies).not.toHaveProperty("@libsql/client");
+    // multiple opens the same SQLite as single and Redis replaced protobuf on the wire, so neither ships by default.
+    for (const config of [multipleConfig, clusterConfig])
+      for (const driver of ["@libsql/client", "protobufjs"]) expect(dependenciesOf(config)).not.toHaveProperty(driver);
+    expect(dependenciesOf(multipleConfig)).not.toHaveProperty("postgres");
+    // One image for an edge site and a cloud cluster carries both modes' drivers, and says which it carries.
+    expect(dependenciesOf(edgeAndCloud)).toMatchObject({ postgres: runtimeDependencies.postgres });
+    expect(edgeAndCloud.dockerfile).toContain("ENV AKAN_DATABASE_MODES=single,cluster");
+    expect(singleConfig.dockerfile).toContain("ENV AKAN_DATABASE_MODES=single");
+  });
+
+  test("runs single when the app declares no mode", () => {
+    expect(new AkanAppConfig(app, [], packageJson, {}, baseDevEnv).database.modes).toEqual(["single"]);
+  });
+
+  test("refuses a mode name that is not one of the three, naming the file", () => {
+    expect(
+      () => new AkanAppConfig(app, [], packageJson, { database: { modes: ["clsuter" as "cluster"] } }, baseDevEnv),
+    ).toThrow("database.modes in apps/portal/akan.config.ts");
+  });
+
+  test("resolves a command's mode within the declared ones", () => {
+    const previous = process.env.AKAN_DATABASE_MODE;
+    try {
+      const config = new AkanAppConfig(
+        app,
+        [],
+        packageJson,
+        { database: { modes: ["single", "cluster"] } },
+        baseDevEnv,
+      );
+      delete process.env.AKAN_DATABASE_MODE;
+      expect(config.resolveDatabaseMode()).toBe("single");
+      process.env.AKAN_DATABASE_MODE = "cluster";
+      expect(config.resolveDatabaseMode()).toBe("cluster");
+      process.env.AKAN_DATABASE_MODE = "multiple";
+      expect(() => config.resolveDatabaseMode()).toThrow('Add "multiple" to database.modes');
+    } finally {
+      if (previous === undefined) delete process.env.AKAN_DATABASE_MODE;
+      else process.env.AKAN_DATABASE_MODE = previous;
+    }
   });
 
   test("resolves database mode runtime packages and missing install specs", () => {
@@ -250,69 +419,22 @@ describe("AkanAppConfig", () => {
     );
 
     expect(config.getDatabaseModeRuntimePackages("single")).toEqual([]);
-    expect(config.getDatabaseModeRuntimePackages("multiple")).toEqual([
-      "@libsql/client",
-      "bullmq",
-      "ioredis",
-      "protobufjs",
-    ]);
-    expect(config.getDatabaseModeRuntimePackages("cluster")).toEqual(["bullmq", "ioredis", "postgres", "protobufjs"]);
-    expect(config.getMissingDatabaseModeDependencySpecs("multiple")).toEqual([
-      `@libsql/client@${runtimeDependencies["@libsql/client"]}`,
-      `protobufjs@${runtimeDependencies.protobufjs}`,
-    ]);
+    expect(config.getDatabaseModeRuntimePackages("multiple")).toEqual(["bullmq", "ioredis"]);
+    expect(config.getDatabaseModeRuntimePackages("cluster")).toEqual(["bullmq", "ioredis", "postgres"]);
+    expect(config.getMissingDatabaseModeDependencySpecs("multiple")).toEqual([]);
     expect(config.getMissingDatabaseModeDependencySpecs("cluster")).toEqual([
       `postgres@${runtimeDependencies.postgres}`,
-      `protobufjs@${runtimeDependencies.protobufjs}`,
-    ]);
-    // The workspace-root install covers the toolchain/runtime plus every app Capacitor plugin
-    // (deduped — "@capacitor/core" appears in both source lists).
-    const expectedMobilePackages: string[] = [
-      "@capacitor/cli",
-      "@capacitor/core",
-      "@capacitor/ios",
-      "@capacitor/android",
-      "@capacitor/assets",
-      "@capacitor/app",
-      "@capacitor/browser",
-      "@capacitor/camera",
-      "@capacitor/device",
-      "@capacitor/geolocation",
-      "@capacitor/haptics",
-      "@capacitor/inappbrowser",
-      "@capacitor/keyboard",
-      "@capacitor/preferences",
-      "@capacitor/push-notifications",
-      "capacitor-plugin-safe-area",
-    ];
-    expect(config.getMobileRuntimePackages() as string[]).toEqual(expectedMobilePackages);
-    expect(config.getMissingMobileDependencySpecs()).toEqual(
-      expectedMobilePackages.map((lib) => `${lib}@${runtimeDependencies[lib as keyof typeof runtimeDependencies]}`),
-    );
-    expect(config.getMobileAppCapacitorPlugins()).toEqual([
-      "@capacitor/app",
-      "@capacitor/browser",
-      "@capacitor/camera",
-      "@capacitor/core",
-      "@capacitor/device",
-      "@capacitor/geolocation",
-      "@capacitor/haptics",
-      "@capacitor/inappbrowser",
-      "@capacitor/keyboard",
-      "@capacitor/preferences",
-      "@capacitor/push-notifications",
-      "capacitor-plugin-safe-area",
     ]);
   });
 
-  test("normalizes multiple mobile targets and validates base paths", () => {
+  test("normalizes the native targets and validates base paths", () => {
     const config = new AkanAppConfig(
       app,
       [],
       packageJson,
       {
         routes: [{ basePath: "admin", domains: {} }],
-        mobile: {
+        native: {
           appName: "Portal",
           appId: "com.portal.app",
           version: "1.0.0",
@@ -325,12 +447,9 @@ describe("AkanAppConfig", () => {
               appId: "com.portal.admin",
               buildNum: 8,
               permissions: ["camera"],
-              deepLinks: {
-                schemes: ["portal-admin", "portal-admin"],
-                domains: ["https://Portal.Admin/"],
-                ios: { teamId: " TEAMID " },
-                android: { sha256CertFingerprints: ["AA:BB", "AA:BB"] },
-              },
+              deepLinks: { schemes: ["portal-admin", "portal-admin"], domains: ["https://Portal.Admin/"] },
+              ios: { teamId: " TEAMID " },
+              android: { sha256CertFingerprints: ["AA:BB", "AA:BB"] },
             },
           },
         },
@@ -338,7 +457,7 @@ describe("AkanAppConfig", () => {
       baseDevEnv,
     );
 
-    expect(config.mobile.targets.admin).toMatchObject({
+    expect(config.native.targets.admin).toMatchObject({
       name: "admin",
       basePath: "admin",
       indexPath: "/admin/home",
@@ -347,38 +466,228 @@ describe("AkanAppConfig", () => {
       version: "1.0.0",
       buildNum: 8,
       permissions: ["camera"],
-      deepLinks: {
-        schemes: ["portal-admin"],
-        domains: ["portal.admin"],
-        ios: { teamId: "TEAMID" },
-        android: { sha256CertFingerprints: ["AA:BB"] },
-      },
+      deepLinks: { schemes: ["portal-admin"], domains: ["portal.admin"] },
+      ios: { teamId: "TEAMID" },
+      android: { sha256CertFingerprints: ["AA:BB"] },
     });
 
+    expect(
+      () =>
+        new AkanAppConfig(app, [], packageJson, { native: { targets: { bad: { basePath: "missing" } } } }, baseDevEnv),
+    ).toThrow("unknown basePath");
+  });
+
+  test("a desktop server is true or { omit }, its names trimmed, deduplicated and sorted", () => {
+    const resolve = (server: unknown) =>
+      new AkanAppConfig(app, [], packageJson, { native: { desktop: { server } } } as never, baseDevEnv).native.targets
+        .default.desktop?.server;
+
+    expect(resolve(true)).toBe(true);
+    expect(resolve({ omit: [" rclnodejs", "protobufjs", "rclnodejs"] })).toEqual({ omit: ["protobufjs", "rclnodejs"] });
+    expect(resolve({})).toEqual({ omit: [] });
+    expect(() => resolve({ omit: "rclnodejs" })).toThrow("native.desktop.server.omit in apps/");
+    expect(() => resolve({ exclude: ["rclnodejs"] })).toThrow("native.desktop.server.exclude in apps/");
+  });
+
+  test("an app without basePaths has one target, default, with no basePath and the section's settings", () => {
+    const config = new AkanAppConfig(
+      app,
+      [],
+      packageJson,
+      { native: { indexPath: "/explore", desktop: { server: true } } },
+      baseDevEnv,
+    );
+
+    expect(Object.keys(config.native.targets)).toEqual(["default"]);
+    expect(config.native.targets.default.basePath).toBeUndefined();
+    expect(config.native.targets.default).toMatchObject({ indexPath: "/explore", desktop: { server: true } });
+  });
+
+  test("a platform section may name its own indexPath, normalized like the section's", () => {
+    const config = new AkanAppConfig(
+      app,
+      [],
+      packageJson,
+      {
+        native: {
+          indexPath: "/mobile",
+          ios: { indexPath: "cockpit/" },
+          desktop: { indexPath: " / ", server: true },
+        },
+      },
+      baseDevEnv,
+    );
+
+    expect(config.native.targets.default).toMatchObject({
+      indexPath: "/mobile",
+      ios: { indexPath: "/cockpit" },
+      desktop: { indexPath: "/", server: true },
+    });
+    expect(config.native.targets.default.android).toBeUndefined();
+  });
+
+  test("a target takes the native section with its own fields over it: objects merge, lists and values replace", () => {
+    const config = new AkanAppConfig(
+      app,
+      [],
+      packageJson,
+      {
+        native: {
+          fileName: "portal",
+          plugins: ["iap"],
+          ios: { infoPlist: { ITSAppUsesNonExemptEncryption: false }, files: { "sound.caf": "assets/sound.caf" } },
+          android: {
+            manifest: ["<queries/>"],
+            googleServices: "secrets/google-services.json",
+            files: { "res/raw/chime.mp3": "assets/chime.mp3" },
+          },
+          targets: {
+            default: {
+              plugins: ["share"],
+              ios: { files: { "extra.caf": "assets/extra.caf" } },
+              android: { manifest: ["<uses-feature/>"] },
+            },
+          },
+        },
+      },
+      baseDevEnv,
+    );
+
+    expect(config.native.targets.default).toMatchObject({
+      fileName: "portal",
+      plugins: ["share"],
+      ios: {
+        infoPlist: { ITSAppUsesNonExemptEncryption: false },
+        files: { "sound.caf": "assets/sound.caf", "extra.caf": "assets/extra.caf" },
+      },
+      android: {
+        manifest: ["<uses-feature/>"],
+        googleServices: "secrets/google-services.json",
+        files: { "res/raw/chime.mp3": "assets/chime.mp3" },
+      },
+    });
+  });
+
+  test("gives every target the section's updates, a target overriding a field", () => {
+    const updates = { url: "https://releases.example.com/portal", publicKey: "key=" };
+    const config = new AkanAppConfig(
+      app,
+      [],
+      packageJson,
+      { native: { updates, targets: { default: {}, pilot: { updates: { channel: "pilot" } } } } },
+      baseDevEnv,
+    );
+
+    expect(config.native.targets.default.updates).toEqual(updates);
+    expect(config.native.targets.pilot.updates).toEqual({ ...updates, channel: "pilot" });
     expect(
       () =>
         new AkanAppConfig(
           app,
           [],
           packageJson,
-          {
-            mobile: { targets: { bad: { basePath: "missing" } } },
-          },
+          { native: { targets: { pilot: { updates: { channel: "pilot" } } } } },
           baseDevEnv,
         ),
-    ).toThrow("unknown basePath");
+    ).toThrow("native.targets.pilot.updates in apps/portal/akan.config.ts has no url or publicKey");
+    expect(
+      () => new AkanAppConfig(app, [], packageJson, { native: { updates: { channel: "pilot" } } }, baseDevEnv),
+    ).toThrow("native.updates in apps/portal/akan.config.ts has no url or publicKey.");
   });
 
-  test("derives a repo-scoped default appId and records explicit-mobile intent", () => {
-    // No mobile section: appId defaults to the repo-scoped reverse-DNS id, and mobile is not explicit.
-    const withoutMobile = new AkanAppConfig(app, [], packageJson, {}, baseDevEnv);
-    expect(withoutMobile.mobile.appId).toBe("com.akanjs.portal");
-    expect(withoutMobile.hasMobileConfig).toBe(false);
+  test("merges the desktop settings field by field, the target winning", () => {
+    const config = new AkanAppConfig(
+      app,
+      [],
+      packageJson,
+      {
+        native: {
+          desktop: { recovery: "reload", window: { fullscreen: true } },
+          targets: { default: { desktop: { window: { skipTaskbar: true } } } },
+        },
+      },
+      baseDevEnv,
+    );
 
-    // Explicit mobile section without appId still uses the repo-scoped default but marks intent.
-    const withMobile = new AkanAppConfig(app, [], packageJson, { mobile: { version: "2.0.0" } }, baseDevEnv);
-    expect(withMobile.mobile.appId).toBe("com.akanjs.portal");
-    expect(withMobile.hasMobileConfig).toBe(true);
+    expect(config.native.targets.default.desktop).toEqual({
+      recovery: "reload",
+      window: { fullscreen: true, skipTaskbar: true },
+    });
+  });
+
+  test("merges the section's push and privacy into each target field by field; an icon object is one value", () => {
+    const publicKey = Buffer.alloc(32, 7).toString("base64");
+    const config = new AkanAppConfig(
+      app,
+      [],
+      packageJson,
+      {
+        native: {
+          updates: { url: "https://updates.example.com/portal", publicKey },
+          icon: { image: "assets/icon.png", backgroundColor: "#000000" },
+          android: { push: { color: "#ff5a5f" } },
+          ios: { privacy: { tracking: false } },
+          targets: {
+            default: {},
+            beta: {
+              updates: { channel: "beta" },
+              icon: { image: "assets/beta.png" },
+              android: { push: { smallIcon: "assets/noti.png" } },
+            },
+          },
+        },
+      },
+      baseDevEnv,
+    );
+
+    expect(config.native.targets.default.updates).toEqual({ url: "https://updates.example.com/portal", publicKey });
+    expect(config.native.targets.beta).toMatchObject({
+      updates: { url: "https://updates.example.com/portal", publicKey, channel: "beta" },
+      android: { push: { color: "#ff5a5f", smallIcon: "assets/noti.png" } },
+      ios: { privacy: { tracking: false } },
+    });
+    expect(config.native.targets.beta.icon).toEqual({ image: "assets/beta.png" });
+  });
+
+  test("refuses `mobile` and every setting that moved, naming where it went", () => {
+    const make = (config: Record<string, unknown>) => () =>
+      new AkanAppConfig(app, [], packageJson, config as never, baseDevEnv);
+
+    expect(make({ mobile: { appName: "portal" } })).toThrow("declares `mobile`, which is now `native`");
+    expect(make({ native: { assets: { icon: "assets/icon.png" } } })).toThrow(
+      "native.assets in apps/portal/akan.config.ts has moved: icon and splash sit directly in the native section.",
+    );
+    expect(make({ native: { targets: { default: { native: { desktop: { server: true } } } } } })).toThrow(
+      "native.targets.default.native in apps/portal/akan.config.ts has moved",
+    );
+    expect(make({ native: { files: { "ios/sound.caf": "assets/sound.caf" } } })).toThrow(
+      "native.files in apps/portal/akan.config.ts has moved: ios.files",
+    );
+    expect(make({ native: { deepLinks: { ios: { teamId: "TEAMID" } } } })).toThrow(
+      "native.deepLinks.ios in apps/portal/akan.config.ts has moved: ios.teamId.",
+    );
+    expect(make({ native: { android: { files: { "App/x.json": "x.json" } } } })).toThrow(
+      'native.android.files["App/x.json"] in apps/portal/akan.config.ts must land at res/<type>/<file> or assets/<path>.',
+    );
+    expect(make({ native: { targets: { kiosk: { ios: { files: { "../x.caf": "x.caf" } } } } } })).toThrow(
+      'native.targets.kiosk.ios.files["../x.caf"] in apps/portal/akan.config.ts must land at <path in the app bundle>.',
+    );
+    expect(make({ native: { ios: { scheme: "App" } } })).toThrow(
+      "native.ios.scheme in apps/portal/akan.config.ts is not a native setting",
+    );
+    expect(make({ native: { server: { url: "http://x" } } })).toThrow(
+      "native.server in apps/portal/akan.config.ts is not a native setting",
+    );
+  });
+
+  test("derives a repo-scoped default appId and records an explicit native section", () => {
+    const withoutNative = new AkanAppConfig(app, [], packageJson, {}, baseDevEnv);
+    expect(withoutNative.native.appId).toBe("com.akanjs.portal");
+    expect(withoutNative.hasNativeConfig).toBe(false);
+
+    const withNative = new AkanAppConfig(app, [], packageJson, { native: { version: "2.0.0" } }, baseDevEnv);
+    expect(withNative.native.appId).toBe("com.akanjs.portal");
+    expect(withNative.hasNativeConfig).toBe(true);
   });
 });
 
@@ -392,15 +701,172 @@ describe("deriveDefaultAppId", () => {
   });
 });
 
+describe("AkanAppConfig lib externalLibs", () => {
+  test("merges lib-declared external libs into the app's own, deduped", () => {
+    const libAwarePackageJson: PackageJson = {
+      ...packageJson,
+      dependencies: { ...packageJson.dependencies, puppeteer: "24.0.0" },
+    };
+    const config = new AkanAppConfig(
+      app,
+      ["shared"],
+      libAwarePackageJson,
+      { externalLibs: ["@external/runtime"] },
+      baseDevEnv,
+      [],
+      { externalLibs: ["@external/runtime", "puppeteer"], docker: { preRuns: [], postRuns: [] } },
+    );
+
+    expect(config.externalLibs).toEqual(["@external/runtime", "puppeteer"]);
+    expect(config.getProductionPackageJson().dependencies).toMatchObject({
+      "@external/runtime": "2.0.0",
+      puppeteer: "24.0.0",
+    });
+  });
+
+  test("reads them off every workspace lib config on load", async () => {
+    const config = await loadExtAppConfig(
+      "akan-config-libext-",
+      "export default { externalLibs: ['shiki'] };\n",
+      "export default { externalLibs: ['puppeteer'] };\n",
+    );
+
+    expect(config.externalLibs).toEqual(["shiki", "puppeteer"]);
+  });
+});
+
+describe("AkanAppConfig lib docker runs", () => {
+  const libDocker = (preRuns: string[], postRuns: string[] = []) => ({
+    externalLibs: [],
+    docker: { preRuns, postRuns },
+  });
+
+  test("runs lib steps before the app's own, deduped", () => {
+    const config = new AkanAppConfig(
+      app,
+      ["shared"],
+      packageJson,
+      { docker: { preRuns: ["apt-get install -y ffmpeg", "echo app"], postRuns: ["echo app-post"] } },
+      baseDevEnv,
+      [],
+      libDocker(["apt-get install -y ffmpeg", "echo lib"], ["echo lib-post"]),
+    );
+
+    expect(config.docker).toMatchObject({
+      preRuns: ["apt-get install -y ffmpeg", "echo lib", "echo app"],
+      postRuns: ["echo lib-post", "echo app-post"],
+    });
+    expect(config.dockerfile).toContain("RUN echo lib\nRUN echo app\n");
+    expect(config.dockerfile.match(/RUN apt-get install -y ffmpeg/g)).toHaveLength(1);
+  });
+
+  test("drops them when the app hands over a whole Dockerfile", () => {
+    const config = new AkanAppConfig(
+      app,
+      ["shared"],
+      packageJson,
+      { docker: "FROM scratch" },
+      baseDevEnv,
+      [],
+      libDocker(["echo lib"]),
+    );
+
+    expect(config.dockerfile).toBe("FROM scratch");
+  });
+
+  test("reads them off every workspace lib config on load", async () => {
+    const config = await loadExtAppConfig(
+      "akan-config-libdocker-",
+      "export default {};\n",
+      "export default { docker: { preRuns: ['echo from-lib'], postRuns: [{ arm64: 'echo arm-only' }] } };\n",
+    );
+
+    expect(config.dockerfile).toContain("RUN echo from-lib");
+    expect(config.dockerfile).toContain('RUN if [ "$TARGETARCH" = "arm64"');
+  });
+});
+
+describe("AkanAppConfig trustedDependencies and bin", () => {
+  const sha256 = "b".repeat(64);
+  const libBin = { ffmpeg: { "linux-x64": { url: "https://files.test/ffmpeg.tar.xz", sha256, file: "bin/ffmpeg" } } };
+
+  test("the production package.json trusts the app's and its libs' packages, and nothing when none are named", () => {
+    const withTrusted = new AkanAppConfig(
+      app,
+      [],
+      packageJson,
+      { trustedDependencies: [" rclnodejs ", "sharp"] },
+      baseDevEnv,
+      [],
+      {
+        externalLibs: [],
+        trustedDependencies: ["sharp", "@serialport/bindings-cpp"],
+        docker: { preRuns: [], postRuns: [] },
+      },
+    );
+    expect(withTrusted.getProductionPackageJson().trustedDependencies).toEqual([
+      "rclnodejs",
+      "sharp",
+      "@serialport/bindings-cpp",
+    ]);
+    expect(new AkanAppConfig(app, [], packageJson, {}, baseDevEnv).getProductionPackageJson()).not.toHaveProperty(
+      "trustedDependencies",
+    );
+    expect(() => new AkanAppConfig(app, [], packageJson, { trustedDependencies: [""] }, baseDevEnv)).toThrow(
+      "apps/portal/akan.config.ts: trustedDependencies lists package names",
+    );
+  });
+
+  test("keeps the app's bin apart from each lib's, with paths made absolute where they were declared", () => {
+    const config = new AkanAppConfig(
+      { name: "portal", cwdPath: "/repo/apps/portal" } as never,
+      [],
+      packageJson,
+      { bin: { ffmpeg: { "darwin-arm64": { path: "tools/ffmpeg" } } } },
+      baseDevEnv,
+      [],
+      { externalLibs: [], docker: { preRuns: [], postRuns: [] }, bin: [{ lib: "media", bin: libBin }] },
+    );
+    expect(config.bin).toEqual({
+      ffmpeg: { "darwin-arm64": { path: path.resolve("/repo/apps/portal/tools/ffmpeg") } },
+    });
+    expect(config.libBins).toEqual([{ lib: "media", bin: libBin }]);
+    expect(
+      new AkanLibConfig({ name: "media", cwdPath: "/repo/libs/media" } as never, {
+        bin: { ffprobe: { "linux-x64": { path: "../../tools/ffprobe" } } },
+      }).bin,
+    ).toEqual({ ffprobe: { "linux-x64": { path: path.resolve("/repo/tools/ffprobe") } } });
+  });
+
+  test("reads them off every workspace lib config on load", async () => {
+    const config = await loadExtAppConfig(
+      "akan-config-libbin-",
+      "export default { trustedDependencies: ['sharp'] };\n",
+      `export default { trustedDependencies: ['rclnodejs'], bin: ${JSON.stringify(libBin)} };\n`,
+    );
+    expect(config.trustedDependencies).toEqual(["sharp", "rclnodejs"]);
+    expect(config.libBins).toEqual([{ lib: "extlib", bin: libBin }]);
+  });
+});
+
 describe("AkanLibConfig", () => {
   test("uses empty external libs by default and preserves explicit libs", () => {
     const lib = { name: "shared" } as never;
     expect(new AkanLibConfig(lib, {}).externalLibs).toEqual([]);
 
-    const config: DeepPartial<LibConfigResult> = {
+    const config: LibConfigInput = {
       externalLibs: ["firebase-admin"],
     };
     expect(new AkanLibConfig(lib, config).externalLibs).toEqual(["firebase-admin"]);
+  });
+
+  test("defaults docker runs to empty lists and preserves declared ones", () => {
+    const lib = { name: "shared" } as never;
+    expect(new AkanLibConfig(lib, {}).docker).toEqual({ preRuns: [], postRuns: [] });
+    expect(new AkanLibConfig(lib, { docker: { preRuns: ["echo lib"] } }).docker).toEqual({
+      preRuns: ["echo lib"],
+      postRuns: [],
+    });
   });
 });
 

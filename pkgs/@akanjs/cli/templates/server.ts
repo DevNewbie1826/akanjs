@@ -1,7 +1,5 @@
 import type { AppInfo, LibInfo } from "akanjs";
 
-const capitalize = (str: string) => str.charAt(0).toUpperCase() + str.slice(1);
-
 export default function getContent(scanInfo: AppInfo | LibInfo | null, dict: { [key: string]: string } = {}) {
   if (!scanInfo) return null;
   const libs = scanInfo.getLibs();
@@ -32,7 +30,7 @@ ${scalarModules.map(([model]) => `    { constant: cnst.${model}, database: db.${
 
 ${scanInfo.type === "app" ? `export const server = new AkanServer("${scanInfo.name}", env, undefined${libs.length ? `, ${libs.join(", ")}` : ""}, lib);` : ""}
 
-export { env } from "./env/env.server.testing";
+${scanInfo.type === "lib" ? `export { env } from "./env/env.server.testing";` : ""}
 export * as db from "./lib/db";
 export * as srv from "./lib/srv";
 export * as sig from "./lib/sig";

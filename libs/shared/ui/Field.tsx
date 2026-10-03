@@ -1,10 +1,11 @@
 "use client";
 import { cnst, Err, fetch, st } from "@libs/shared/client";
-import { MapView, Upload } from "@libs/util/ui";
-import { clsx } from "akanjs/client";
+import { type GoogleProps, inputRecipe, MapView, Upload } from "@libs/util/ui";
+import { cn } from "akanjs/client";
 import { capitalize, pathGet } from "akanjs/common";
-import type { ProtoFile } from "akanjs/constant";
+import type { ProtoFile, ProtoLightFile } from "akanjs/constant";
 import type { SliceMeta } from "akanjs/fetch";
+import { actionTagOf, useFieldTool, useFileFieldTool } from "akanjs/store";
 import { Field as AkanField, Modal } from "akanjs/ui";
 import { lazy, useInterval } from "akanjs/webkit";
 import { memo, type ReactNode, useCallback, useState } from "react";
@@ -35,11 +36,19 @@ const Rich = memo((props: RichProps) => {
     toolbar,
     blockActions,
     slashMenu,
+    markdown,
+    features,
     placeholder,
     nullable,
     disabled,
     editorHeight,
+    plugins,
+    agentName,
+    agentBlocks,
+    collab,
   } = props;
+  // No useFieldTool here: it cannot describe an Any field, so AgentRichPlugin publishes this setter as markdown.
+  const agentAction = agentName ?? actionTagOf(onChange)?.action ?? null;
   const { sliceName } = slice;
   const names = {
     modelForm: `${sliceName}Form`,
@@ -51,7 +60,7 @@ const Rich = memo((props: RichProps) => {
     id?: string,
   ) => Promise<(cnst.File | ProtoFile)[]>;
   return (
-    <div className={clsx("flex flex-col", className)}>
+    <div className={cn("flex flex-col", className)}>
       {label ? <AkanField.Label className={labelClassName} nullable={nullable} label={label} desc={desc} /> : null}
       <Editor.Rich
         value={hasValue ? value : pathGet(valuePath, st.get()[names.modelForm as "adminForm"])}
@@ -65,12 +74,18 @@ const Rich = memo((props: RichProps) => {
         toolbar={toolbar}
         blockActions={blockActions}
         slashMenu={slashMenu}
+        markdown={markdown}
+        features={features}
         onChange={(val) => {
           onChange(val);
         }}
         disabled={disabled}
-        className={clsx("w-full", "")}
+        className={cn("w-full", "")}
         height={editorHeight}
+        plugins={plugins}
+        agentName={agentAction}
+        agentBlocks={agentBlocks}
+        collab={collab}
       />
     </div>
   );
@@ -85,7 +100,8 @@ interface CoordinateProps {
   desc?: string;
   coordinate: cnst.util.Coordinate | null;
   nullable?: boolean;
-  mapKey: string;
+  mapKey?: string;
+  mapOptions?: GoogleProps["options"];
   onChange: (coordinate: cnst.util.Coordinate) => void;
 }
 export const Coordinate = ({
@@ -98,26 +114,46 @@ export const Coordinate = ({
   nullable,
   coordinate,
   mapKey,
+  mapOptions,
   onChange,
 }: CoordinateProps) => {
+  useFieldTool(onChange);
   return (
-    <div className={clsx("flex flex-col", className)}>
+    <div className={cn("flex flex-col", className)}>
       {label ? <AkanField.Label className={labelClassName} nullable={nullable} label={label} desc={desc} /> : null}
-      <MapView.Google
-        mapKey={mapKey}
-        className={mapClassName}
-        center={coordinate ?? undefined}
-        zoom={3}
-        onClick={(coordinate) => {
-          if (!disabled) onChange(coordinate);
-        }}
-      >
-        {coordinate ? (
-          <MapView.Marker coordinate={coordinate}>
-            <AiTwotoneEnvironment className="text-2xl" />
-          </MapView.Marker>
-        ) : null}
-      </MapView.Google>
+      {mapKey ? (
+        <MapView.Google
+          mapKey={mapKey}
+          className={mapClassName}
+          center={coordinate ?? undefined}
+          zoom={3}
+          options={mapOptions}
+          onClick={(coordinate) => {
+            if (!disabled) onChange(coordinate);
+          }}
+        >
+          {coordinate ? (
+            <MapView.Marker coordinate={coordinate}>
+              <AiTwotoneEnvironment className="text-2xl" />
+            </MapView.Marker>
+          ) : null}
+        </MapView.Google>
+      ) : (
+        <MapView.PigeonMap
+          className={cn("h-72 w-full", mapClassName)}
+          center={coordinate ?? undefined}
+          zoom={3}
+          onClick={(coordinate) => {
+            if (!disabled) onChange(coordinate);
+          }}
+        >
+          {coordinate ? (
+            <MapView.PigeonMarker className="z-10" coordinate={coordinate}>
+              <AiTwotoneEnvironment className="text-2xl" />
+            </MapView.PigeonMarker>
+          ) : null}
+        </MapView.PigeonMap>
+      )}
     </div>
   );
 };
@@ -152,6 +188,7 @@ export const Postcode = ({
   address,
   onChange,
 }: PostcodeProps) => {
+  useFieldTool(onChange);
   const [postModalOpen, setPostModalOpen] = useState(false);
   const getCoordinate = useCallback(async (address: string): Promise<cnst.util.Coordinate> => {
     const kakaoResp = (await (
@@ -170,11 +207,11 @@ export const Postcode = ({
   }, []);
   return (
     <>
-      <div className={clsx("flex flex-col", className)}>
+      <div className={cn("flex flex-col", className)}>
         {label ? <AkanField.Label className={labelClassName} nullable={nullable} label={label} desc={desc} /> : null}
         <input
           value={address ?? ""}
-          className="input w-96"
+          className={inputRecipe({}, "w-96")}
           onClick={() => {
             setPostModalOpen(true);
           }}
@@ -205,7 +242,7 @@ export const Postcode = ({
   );
 };
 
-interface ImgProps {
+interface ImgProps<T extends cnst.LightFile> {
   label?: string;
   desc?: string;
   styleType?: "circle" | "square";
@@ -214,13 +251,18 @@ interface ImgProps {
   className?: string;
   nullable?: boolean;
   slice: SliceMeta;
-  value: cnst.File | null;
-  render?: (file: cnst.File) => ReactNode;
-  onChange: (file: cnst.File | null) => void;
+  value: T | null;
+  render?: (file: T) => ReactNode;
+  onChange: (file: T | null) => void;
+  /**
+   * 대화가 이 칸에 넣을 수 있는 그림. 넘기지 않으면 에이전트 도구가 아예 안 선다 — 후보가 없는 칸에
+   * 모든 id 를 거절하는 도구가 서면 안 된다(`useFileFieldTool`).
+   */
+  read?: () => readonly T[];
   disabled?: boolean;
   aspectRatio?: number[];
 }
-export const Img = ({
+export const Img = <T extends cnst.LightFile = cnst.File>({
   label,
   desc,
   styleType = "circle",
@@ -232,9 +274,12 @@ export const Img = ({
   value,
   slice,
   onChange,
+  read,
   disabled,
   aspectRatio,
-}: ImgProps) => {
+}: ImgProps<T>) => {
+  useFieldTool(onChange);
+  useFileFieldTool(onChange, { read, label: (file) => file.filename, disabled });
   const { sliceName } = slice;
   const names = {
     addModelFiles: `add${capitalize(sliceName)}Files`,
@@ -242,13 +287,13 @@ export const Img = ({
   const addFiles = (fetch as unknown as Record<string, (...args: unknown[]) => unknown>)[names.addModelFiles] as (
     fileList: FileList | File[],
     id?: string,
-  ) => Promise<cnst.File[]>;
+  ) => Promise<T[]>;
   useInterval(async () => {
     if (value?.status !== "uploading") return;
-    onChange(await fetch.file(value.id));
+    onChange((await fetch.file(value.id)) as unknown as T);
   }, 1000);
   return (
-    <div className={clsx("flex flex-col", className)}>
+    <div className={cn("flex flex-col", className)}>
       {label ? <AkanField.Label className={labelClassName} nullable={nullable} label={label} desc={desc} /> : null}
       <Upload.Image
         className={uploadClassName}
@@ -268,21 +313,26 @@ export const Img = ({
   );
 };
 
-interface ImgsProps {
+interface ImgsProps<T extends cnst.LightFile> {
   label?: string;
   desc?: string;
   labelClassName?: string;
   className?: string;
   slice: SliceMeta;
-  render?: (file: cnst.File) => ReactNode;
-  value: cnst.File[];
-  onChange: (files: cnst.File[]) => void;
+  render?: (file: T) => ReactNode;
+  value: T[];
+  onChange: (files: T[]) => void;
+  /**
+   * 대화가 이 칸에 넣을 수 있는 그림. 넘기지 않으면 에이전트 도구가 아예 안 선다 — 후보가 없는 칸에
+   * 모든 id 를 거절하는 도구가 서면 안 된다(`useFileFieldTool`).
+   */
+  read?: () => readonly T[];
   disabled?: boolean;
   minlength?: number;
   maxlength?: number;
 }
 
-export const Imgs = ({
+export const Imgs = <T extends cnst.LightFile = cnst.File>({
   className,
   label,
   desc,
@@ -291,10 +341,13 @@ export const Imgs = ({
   value,
   onChange,
   slice,
-  minlength = 1,
-  maxlength = 30,
+  read,
+  minlength,
+  maxlength,
   disabled,
-}: ImgsProps) => {
+}: ImgsProps<T>) => {
+  useFieldTool(onChange);
+  useFileFieldTool(onChange, { read, label: (file) => file.filename, min: minlength, max: maxlength, disabled });
   const { sliceName } = slice;
   const names = {
     addModelFiles: `add${capitalize(sliceName)}Files`,
@@ -302,25 +355,27 @@ export const Imgs = ({
   const addFiles = (fetch as unknown as Record<string, (...args: unknown[]) => unknown>)[names.addModelFiles] as (
     fileList: FileList | File[],
     id?: string,
-  ) => Promise<cnst.File[]>;
+  ) => Promise<T[]>;
   useInterval(async () => {
     if (!value.length) return;
     const uploadingFiles = value.filter((f) => f.status === "uploading");
     if (!uploadingFiles.length) return;
-    const newFiles = await Promise.all(uploadingFiles.map(async (f) => await fetch.file(f.id)));
+    const newFiles = await Promise.all(uploadingFiles.map(async (f) => (await fetch.file(f.id)) as unknown as T));
     onChange(value.map((f) => newFiles.find((nf) => nf.id === f.id) ?? f));
   }, 1000);
   return (
-    <div className={clsx("flex flex-col", className)}>
-      {label ? <AkanField.Label className={labelClassName} nullable={!!minlength} label={label} desc={desc} /> : null}
+    <div className={cn("flex flex-col", className)}>
+      {label ? (
+        <AkanField.Label className={labelClassName} nullable={!!(minlength ?? 1)} label={label} desc={desc} />
+      ) : null}
       <Upload.Images
         multiple
         fileList={value}
         disabled={disabled}
-        render={render as unknown as (file: ProtoFile) => ReactNode}
+        render={render as unknown as (file: ProtoLightFile) => ReactNode}
         styleType="square"
         onRemove={(file: File | FileList) => {
-          onChange(value.filter((f) => f.id !== (file as unknown as cnst.File).id));
+          onChange(value.filter((f) => f.id !== (file as unknown as ProtoLightFile).id));
         }}
         onSave={async (file) => {
           // TODO: Max Length 처리해야함.
@@ -332,20 +387,21 @@ export const Imgs = ({
   );
 };
 
-interface FileProps {
+interface FileProps<T extends cnst.LightFile> {
   label?: string;
   desc?: string;
   labelClassName?: string;
   className?: string;
   uploadClassName?: string;
-  render?: (file: cnst.File) => ReactNode;
+  render?: (file: T) => ReactNode;
   slice: SliceMeta;
   nullable?: boolean;
-  value: cnst.File | null;
-  onChange: (file: cnst.File | null) => void;
+  value: T | null;
+  onChange: (file: T | null) => void;
   disabled?: boolean;
+  accept?: string;
 }
-export const File = ({
+export const File = <T extends cnst.LightFile = cnst.File>({
   label,
   desc,
   labelClassName,
@@ -357,7 +413,9 @@ export const File = ({
   onChange,
   slice,
   disabled,
-}: FileProps) => {
+  accept,
+}: FileProps<T>) => {
+  useFieldTool(onChange);
   const { sliceName } = slice;
   const names = {
     addModelFiles: `add${capitalize(sliceName)}Files`,
@@ -365,18 +423,19 @@ export const File = ({
   const addFiles = (fetch as unknown as Record<string, (...args: unknown[]) => unknown>)[names.addModelFiles] as (
     fileList: FileList | File[],
     id?: string,
-  ) => Promise<cnst.File[]>;
+  ) => Promise<T[]>;
   useInterval(async () => {
     if (value?.status !== "uploading") return;
-    onChange(await fetch.file(value.id));
+    onChange((await fetch.file(value.id)) as unknown as T);
   }, 1000);
   return (
-    <div className={clsx("flex flex-col", className)}>
+    <div className={cn("flex flex-col", className)}>
       {label ? <AkanField.Label className={labelClassName} nullable={nullable} label={label} desc={desc} /> : null}
       <Upload.File
-        render={render as unknown as (file: ProtoFile) => ReactNode}
+        render={render as unknown as (file: ProtoLightFile) => ReactNode}
         uploadClassName={uploadClassName}
         disabled={disabled}
+        accept={accept}
         file={value}
         onRemove={() => {
           onChange(null);
@@ -390,21 +449,21 @@ export const File = ({
   );
 };
 
-interface FilesProps {
+interface FilesProps<T extends cnst.LightFile> {
   label?: string;
   desc?: string;
   labelClassName?: string;
   className?: string;
   slice: SliceMeta;
-  render?: (file: cnst.File) => ReactNode;
-  value: cnst.File[];
-  onChange: (files: cnst.File[]) => void;
+  render?: (file: T) => ReactNode;
+  value: T[];
+  onChange: (files: T[]) => void;
   disabled?: boolean;
   minlength?: number;
   maxlength?: number;
 }
 
-export const Files = ({
+export const Files = <T extends cnst.LightFile = cnst.File>({
   className,
   label,
   desc,
@@ -416,7 +475,8 @@ export const Files = ({
   minlength = 1,
   maxlength = 30,
   disabled,
-}: FilesProps) => {
+}: FilesProps<T>) => {
+  useFieldTool(onChange);
   const { sliceName } = slice;
   const names = {
     addModelFiles: `add${capitalize(sliceName)}Files`,
@@ -424,23 +484,23 @@ export const Files = ({
   const addFiles = (fetch as unknown as Record<string, (...args: unknown[]) => unknown>)[names.addModelFiles] as (
     fileList: FileList | File[],
     id?: string,
-  ) => Promise<cnst.File[]>;
+  ) => Promise<T[]>;
   useInterval(async () => {
     if (!value.length) return;
     const uploadingFiles = value.filter((f) => f.status === "uploading");
     if (!uploadingFiles.length) return;
-    const newFiles = await Promise.all(uploadingFiles.map(async (f) => await fetch.file(f.id)));
+    const newFiles = await Promise.all(uploadingFiles.map(async (f) => (await fetch.file(f.id)) as unknown as T));
     onChange(value.map((f) => newFiles.find((nf) => nf.id === f.id) ?? f));
   }, 1000);
   return (
-    <div className={clsx("flex flex-col", className)}>
+    <div className={cn("flex flex-col", className)}>
       {label ? <AkanField.Label className={labelClassName} nullable={!!minlength} label={label} desc={desc} /> : null}
       <Upload.FileList
         multiple
         disabled={disabled}
-        render={render as unknown as (file: ProtoFile) => ReactNode}
+        render={render as unknown as (file: ProtoLightFile) => ReactNode}
         fileList={value}
-        onRemove={(file: cnst.File) => {
+        onRemove={(file: ProtoLightFile) => {
           onChange(value.filter((f) => f.id !== file.id));
         }}
         onChange={async (file) => {

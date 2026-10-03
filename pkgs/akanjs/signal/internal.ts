@@ -7,7 +7,7 @@ import {
   type QueueAdaptor,
   QueueAdaptorRole,
   type ScheduleAdaptor,
-  Scheduler,
+  ScheduleAdaptorRole,
   type ServiceModel,
 } from "akanjs/service";
 import { type BuildInternal, buildInternal, type InternalBuilder, type InternalInfo } from "./internalInfo";
@@ -21,9 +21,13 @@ export interface Internal extends Adaptor {
 export type InternalCls<
   SrvModule extends ServiceModel = ServiceModel,
   InternalInfoMap extends { [key: string]: InternalInfo } = { [key: string]: InternalInfo },
-> = AdaptorCls & { refName: SrvRefName<SrvModule>; srv: SrvModule; [INTERNAL_META]: InternalInfoMap };
+> = AdaptorCls & {
+  /** The suffixed adaptor name the DI container keys `live.internal` by. */
+  refName: `${SrvRefName<SrvModule>}Internal`;
+  srv: SrvModule;
+  [INTERNAL_META]: InternalInfoMap;
+};
 
-/** Builds an internal adaptor for schedules, queues, processes, and server-only jobs. */
 export function internal<
   SrvModule extends ServiceModel,
   InternalInfoMap extends ReturnType<InternalBuilder<SrvModule>>,
@@ -41,17 +45,21 @@ export function internal<
     ]),
   ];
   const internalCls = class Internal extends dangerouslyAdapt(`${refName}Internal`, ({ plug, service }) => ({
-    schedule: plug(Scheduler),
+    schedule: plug(ScheduleAdaptorRole),
     queue: plug(QueueAdaptorRole),
     ...Object.fromEntries(srvKeys.map((srvRefName) => [srvRefName, service()])),
   })) {
     static srv = srv;
-    static [INTERNAL_META] = internalBuilder(buildInternal as any);
+    static [INTERNAL_META] = Object.assign(
+      {},
+      ...libInternals.map((libInternal) => libInternal[INTERNAL_META]),
+      internalBuilder(buildInternal as any),
+    );
   };
-  libInternals.forEach((libInternal) => {
-    Object.assign(internalCls[INTERNAL_META], libInternal[INTERNAL_META]);
-    Object.assign(internalCls.srv.srvMap, libInternal.srv.srvMap);
-  });
+  Object.assign(
+    srv.srvMap,
+    Object.assign({}, ...libInternals.map((libInternal) => libInternal.srv.srvMap), srv.srvMap),
+  );
   applyMixins(internalCls, libInternals);
-  return internalCls as any;
+  return internalCls as any; // the declared return is a generic instantiation built from this call's own type arguments, so there is no `T` to name
 }

@@ -1,8 +1,9 @@
 import { usePage } from "@apps/akan/client";
 import { Code, Docs } from "@apps/akan/ui";
 import { Scroll } from "@libs/util/ui";
+import { page } from "akanjs/client";
 
-export default function Page() {
+export default page().render(() => {
   const { l } = usePage();
   return (
     <Scroll>
@@ -17,7 +18,7 @@ export default function Page() {
           </div>
         </Docs.Description>
       </Scroll.Slide>
-      <div className="divider" />
+      <div className="my-4 h-px w-full bg-border" />
 
       <Scroll.Slide id="create-query-maker" title={l.trans({ en: "Create Query Maker", ko: "쿼리 메이커 생성하기" })}>
         <Docs.Title>{l.trans({ en: "Create Query Maker", ko: "쿼리 메이커 생성하기" })}</Docs.Title>
@@ -239,7 +240,7 @@ export const dictionary = modelDictionary(["en", "ko"])
             title="apps/koyo/lib/icecreamOrder/IcecreamOrder.Util.tsx"
             code={`
 "use client"; // [!code collapse:3]
-import { clsx } from "@akanjs/client";
+import { buttonRecipe } from "@akanjs/ui";
 import { st, usePage } from "@koyo/client";
 import { cnst } from "@koyo/client"; // [!code ++:2]
 import { Select } from "@akanjs/ui";
@@ -253,7 +254,7 @@ export const Process = ({ className, icecreamOrderId, disabled }: ProcessProps) 
   const { l } = usePage();
   return (
     <button
-      className={clsx("btn btn-secondary", className)}
+      className={buttonRecipe({ variant: "secondary" }, className)}
       disabled={disabled}
       onClick={() => {
         void st.do.processIcecreamOrder(icecreamOrderId);
@@ -273,7 +274,7 @@ export const Serve = ({ className, icecreamOrderId, disabled }: ServeProps) => {
   const { l } = usePage();
   return (
     <button
-      className={clsx("btn btn-accent", className)}
+      className={buttonRecipe({ variant: "accent" }, className)}
       disabled={disabled}
       onClick={() => {
         void st.do.serveIcecreamOrder(icecreamOrderId);
@@ -293,7 +294,7 @@ export const Finish = ({ className, icecreamOrderId, disabled }: FinishProps) =>
   const { l } = usePage();
   return (
     <button
-      className={clsx("btn btn-success", className)}
+      className={buttonRecipe({ variant: "success" }, className)}
       disabled={disabled}
       onClick={() => {
         void st.do.finishIcecreamOrder(icecreamOrderId);
@@ -313,7 +314,7 @@ export const Cancel = ({ className, icecreamOrderId, disabled }: CancelProps) =>
   const { l } = usePage();
   return (
     <button
-      className={clsx("btn btn-warning", className)}
+      className={buttonRecipe({ variant: "warning" }, className)}
       disabled={disabled}
       onClick={() => {
         void st.do.cancelIcecreamOrder(icecreamOrderId);
@@ -404,7 +405,7 @@ export default function Page() {
               <div className="text-5xl font-bold">{l("icecreamOrder.modelName")}</div>
               <IcecreamOrder.Util.PublicQueryMaker /> // [!code ++]
               <Model.New
-                className="btn btn-primary"
+                className={buttonRecipe({ variant: "primary" })}
                 sliceName="icecreamOrderInPublic"
                 renderTitle="name"
                 partial={icecreamOrderForm}
@@ -426,7 +427,7 @@ export default function Page() {
           />
         </Docs.Description>
       </Scroll.Slide>
-      <div className="divider" />
+      <div className="my-4 h-px w-full bg-border" />
 
       <Scroll.Slide
         id="accelerate-with-insight"
@@ -436,8 +437,8 @@ export default function Page() {
         <Docs.Description>
           <div>
             {l.trans({
-              en: `Now that we can filter our queries, let's extract meaningful insights from the data. Insight is a powerful feature that aggregates data across documents using MongoDB aggregation pipelines. Think of it like a kitchen display system that shows the chef exactly how many of each ingredient they need to prepare - total yogurt amount, number of each topping, etc.`,
-              ko: `이제 쿼리를 필터링할 수 있으니, 데이터에서 의미 있는 인사이트를 추출해봅시다. Insight는 MongoDB 집계 파이프라인을 사용하여 문서 전체에서 데이터를 집계하는 강력한 기능입니다. 주방 디스플레이 시스템이 셰프에게 준비해야 할 각 재료의 정확한 양을 보여주는 것처럼 생각해보세요 - 총 요거트 양, 각 토핑의 개수 등.`,
+              en: `Now that we can filter our queries, let's aggregate the data. Insight aggregates data across documents using MongoDB aggregation pipelines. Think of it like a kitchen display system that shows the chef exactly how many of each ingredient they need to prepare - total yogurt amount, number of each topping, etc.`,
+              ko: `이제 쿼리를 필터링할 수 있으니, 데이터를 집계해봅시다. Insight는 MongoDB 집계 파이프라인을 사용하여 문서 전체에서 데이터를 집계합니다. 주방 디스플레이 시스템이 셰프에게 준비해야 할 각 재료의 정확한 양을 보여주는 것처럼 생각해보세요 - 총 요거트 양, 각 토핑의 개수 등.`,
             })}
           </div>
           <div>
@@ -669,8 +670,8 @@ export const dictionary = modelDictionary(["en", "ko"])
           />
           <div>
             {l.trans({
-              en: `Now let's create a View component to display the aggregated insights in a beautiful dashboard layout:`,
-              ko: `이제 집계된 인사이트를 아름다운 대시보드 레이아웃으로 표시하는 View 컴포넌트를 만들어봅시다:`,
+              en: `Now let's create a View component to display the aggregated insights in a dashboard layout:`,
+              ko: `이제 집계된 인사이트를 대시보드 레이아웃으로 표시하는 View 컴포넌트를 만들어봅시다:`,
             })}
           </div>
           <Code.Snippet
@@ -692,12 +693,12 @@ export const General = ({ className, icecreamOrder }: GeneralProps) => {
       <div className="flex items-center gap-3 border-b pb-4">
         <span className="text-3xl font-extrabold text-pink-600">🍦</span>
         <span className="text-2xl font-bold">{l("icecreamOrder.modelName")}</span>
-        <span className="text-base-content/50 ml-auto text-xs">#{icecreamOrder.id}</span>
+        <span className="text-foreground/50 ml-auto text-xs">#{icecreamOrder.id}</span>
       </div>
       <div className="grid grid-cols-2 gap-x-6 gap-y-4">
-        <div className="text-base-content/50 font-semibold">{l("icecreamOrder.size")}</div>
+        <div className="text-foreground/50 font-semibold">{l("icecreamOrder.size")}</div>
         <div>{icecreamOrder.size} cc</div>
-        <div className="text-base-content/50 font-semibold">{l("icecreamOrder.toppings")}</div>
+        <div className="text-foreground/50 font-semibold">{l("icecreamOrder.toppings")}</div>
         <div className="flex flex-wrap gap-2">
           {icecreamOrder.toppings.length === 0 ? (
             <span className="text-gray-400 italic">{l.trans({ en: "No toppings", ko: "토핑 없음" })}</span>
@@ -712,7 +713,7 @@ export const General = ({ className, icecreamOrder }: GeneralProps) => {
             ))
           )}
         </div>
-        <div className="text-base-content/50 font-semibold">{l("icecreamOrder.status")}</div>
+        <div className="text-foreground/50 font-semibold">{l("icecreamOrder.status")}</div>
         <div>
           <span
             className={clsx("inline-block rounded-full px-2 py-1 text-xs font-semibold", {
@@ -726,9 +727,9 @@ export const General = ({ className, icecreamOrder }: GeneralProps) => {
             {l(\`icecreamOrderStatus.\${icecreamOrder.status}\`)}
           </span>
         </div>
-        <div className="text-base-content/50 font-semibold">{l("icecreamOrder.createdAt")}</div>
+        <div className="text-foreground/50 font-semibold">{l("icecreamOrder.createdAt")}</div>
         <div className="text-gray-500">{icecreamOrder.createdAt.format("YYYY-MM-DD HH:mm:ss")}</div>
-        <div className="text-base-content/50 font-semibold">{l("icecreamOrder.updatedAt")}</div>
+        <div className="text-foreground/50 font-semibold">{l("icecreamOrder.updatedAt")}</div>
         <div className="text-gray-500">{icecreamOrder.updatedAt.format("YYYY-MM-DD HH:mm:ss")}</div>
       </div>
       <div className="flex items-center justify-end gap-2">
@@ -925,7 +926,7 @@ export default function Page() {
               <div className="text-5xl font-bold">{l("icecreamOrder.modelName")}</div> // [!code collapse:10]
               <IcecreamOrder.Util.PublicQueryMaker />
               <Model.New
-                className="btn btn-primary"
+                className={buttonRecipe({ variant: "primary" })}
                 sliceName="icecreamOrderInPublic"
                 renderTitle="name"
                 partial={icecreamOrderForm}
@@ -948,63 +949,21 @@ export default function Page() {
           />
           <div>
             {l.trans({
-              en: `Now when users filter orders by status, the insight dashboard automatically updates to show aggregated statistics for only those filtered orders. This is incredibly powerful for real-time operational decisions!`,
-              ko: `이제 사용자가 상태별로 주문을 필터링하면, 인사이트 대시보드가 자동으로 업데이트되어 필터링된 주문에 대한 집계 통계만 보여줍니다. 이는 실시간 운영 결정에 매우 강력합니다!`,
+              en: `When users filter orders by status, the insight dashboard automatically updates to show aggregated statistics for only those filtered orders.`,
+              ko: `사용자가 상태별로 주문을 필터링하면, 인사이트 대시보드가 자동으로 업데이트되어 필터링된 주문에 대한 집계 통계만 보여줍니다.`,
             })}
-          </div>
-          <div className="my-6 rounded-lg bg-gradient-to-r from-blue-100 to-purple-100 p-6">
-            <div className="mb-3 font-bold text-blue-800 text-lg">
-              {l.trans({ en: "🎉 What You've Accomplished:", ko: "🎉 달성한 것들:" })}
-            </div>
-            <ul className="space-y-2 text-blue-700 text-sm">
-              <li>
-                ✓{" "}
-                {l.trans({
-                  en: "Created dynamic Query Makers with searchable parameters",
-                  ko: "검색 가능한 파라미터가 있는 동적 쿼리 메이커 생성",
-                })}
-              </li>
-              <li>
-                ✓{" "}
-                {l.trans({
-                  en: "Learned how to define Insight classes with MongoDB aggregation pipelines",
-                  ko: "MongoDB 집계 파이프라인을 사용한 Insight 클래스 정의 방법 학습",
-                })}
-              </li>
-              <li>
-                ✓{" "}
-                {l.trans({
-                  en: "Built View components to display aggregated statistics",
-                  ko: "집계 통계를 표시하는 View 컴포넌트 구축",
-                })}
-              </li>
-              <li>
-                ✓{" "}
-                {l.trans({
-                  en: "Connected Zone components to auto-generated store hooks",
-                  ko: "자동 생성된 스토어 훅에 Zone 컴포넌트 연결",
-                })}
-              </li>
-              <li>
-                ✓{" "}
-                {l.trans({
-                  en: "Integrated insights with filtered queries for real-time analytics",
-                  ko: "실시간 분석을 위해 필터링된 쿼리와 인사이트 통합",
-                })}
-              </li>
-            </ul>
           </div>
           <div>
             {l.trans({
-              en: `In the next tutorial, we'll explore how to relate data between different models. This will allow you to create rich relationships like associating orders with customers, linking products to categories, and building complex data graphs.`,
-              ko: `다음 튜토리얼에서는 서로 다른 모델 간의 데이터 연결 방법을 살펴볼 것입니다. 이를 통해 주문과 고객 연결, 제품과 카테고리 연결, 복잡한 데이터 그래프 구축 같은 풍부한 관계를 만들 수 있게 됩니다.`,
+              en: `In the next tutorial, we'll explore how to relate data between different models. This will allow you to create relationships like associating orders with customers, linking products to categories, and building complex data graphs.`,
+              ko: `다음 튜토리얼에서는 서로 다른 모델 간의 데이터 연결 방법을 살펴볼 것입니다. 이를 통해 주문과 고객 연결, 제품과 카테고리 연결, 복잡한 데이터 그래프 구축 같은 관계를 만들 수 있게 됩니다.`,
             })}
           </div>
         </Docs.Description>
       </Scroll.Slide>
-      <div className="divider" />
+      <div className="my-4 h-px w-full bg-border" />
 
-      <Scroll.TitleNavigator className="fixed top-32 right-0 hidden w-[250px] flex-col gap-2 lg:flex" />
+      <Scroll.TitleNavigator className="fixed top-32 right-0 hidden w-[250px] flex-col gap-2 xl:flex" />
     </Scroll>
   );
-}
+});

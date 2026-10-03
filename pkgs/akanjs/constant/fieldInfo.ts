@@ -107,6 +107,8 @@ export interface ConstantFieldProps<
   validate?: (value: FieldValue, model: any) => boolean;
   text?: TextFieldRole;
   cascade?: CascadeAction;
+  /** Stripped from every AI-facing read (in-page agent, MCP) and untouched everywhere else: cost, not secrecy. */
+  visual?: boolean;
   meta?: Metadata;
 }
 export const fieldPresets = ["email", "password", "url"] as const;
@@ -198,6 +200,7 @@ interface ConstantFieldBuildProps<
   validate?: (value: FieldValue, model: any) => boolean;
   text?: TextFieldRole;
   cascade?: CascadeAction;
+  visual: boolean;
   modelRef: ConstantModelRef;
   arrDepth: number;
   optArrDepth: number;
@@ -272,7 +275,6 @@ export type FieldInfoObjectToFieldObject<Obj extends FieldInfoObject> = {
   [K in keyof Obj]: ConstantFieldFromInfo<Obj[K]>;
 };
 
-/** Runtime metadata for a single Akan constant field. */
 export class ConstantField<
   FieldType extends ConstantFieldKind = ConstantFieldKind,
   Value extends ConstantFieldTypeInput | null = any,
@@ -302,30 +304,31 @@ export class ConstantField<
       count: field(Int, { default: 0, accumulate: {} }).toField(),
     };
   }
-  readonly nullable: Nullable;
-  readonly ref?: string;
-  readonly refPath?: string;
-  readonly refType?: "child" | "parent" | "relation";
-  readonly default: FieldValue | ((doc: { id: string }) => FieldValue);
-  readonly type?: FieldPreset;
-  readonly fieldType: FieldType;
-  readonly immutable: boolean;
-  readonly min?: number;
-  readonly max?: number;
-  readonly enum?: EnumInstance;
-  readonly select: boolean;
-  readonly minlength?: number;
-  readonly maxlength?: number;
-  readonly accumulate?: any;
-  readonly example?: FieldValue;
-  readonly of?: MapValue; // for Map type fields
-  readonly validate?: (value: FieldValue, model: any) => boolean;
-  readonly text?: TextFieldRole;
-  readonly cascade?: CascadeAction;
-  readonly modelRef: ConstantModelRef;
-  readonly arrDepth: number;
-  readonly optArrDepth: number;
-  readonly meta: Metadata;
+  declare readonly nullable: Nullable;
+  declare readonly ref?: string;
+  declare readonly refPath?: string;
+  declare readonly refType?: "child" | "parent" | "relation";
+  declare readonly default: FieldValue | ((doc: { id: string }) => FieldValue);
+  declare readonly type?: FieldPreset;
+  declare readonly fieldType: FieldType;
+  declare readonly immutable: boolean;
+  declare readonly min?: number;
+  declare readonly max?: number;
+  declare readonly enum?: EnumInstance;
+  declare readonly select: boolean;
+  declare readonly minlength?: number;
+  declare readonly maxlength?: number;
+  declare readonly accumulate?: any;
+  declare readonly example?: FieldValue;
+  declare readonly of?: MapValue; // for Map type fields
+  declare readonly validate?: (value: FieldValue, model: any) => boolean;
+  declare readonly text?: TextFieldRole;
+  declare readonly cascade?: CascadeAction;
+  declare readonly visual: boolean;
+  declare readonly modelRef: ConstantModelRef;
+  declare readonly arrDepth: number;
+  declare readonly optArrDepth: number;
+  declare readonly meta: Metadata;
   declare _isScalar: IsScalar;
   declare _isRelation: IsRelation;
   declare _isEnum: IsEnum;
@@ -334,30 +337,7 @@ export class ConstantField<
   declare _isSecret: IsSecret;
   declare _isMap: IsMap;
   constructor(props: ConstantFieldBuildProps<FieldType, FieldValue, MapValue, Metadata>) {
-    this.nullable = props.nullable as unknown as Nullable;
-    this.ref = props.ref;
-    this.refPath = props.refPath;
-    this.refType = props.refType;
-    this.default = props.default;
-    this.type = props.type;
-    this.fieldType = props.fieldType;
-    this.immutable = props.immutable;
-    this.min = props.min;
-    this.max = props.max;
-    this.enum = props.enum;
-    this.select = props.select;
-    this.minlength = props.minlength;
-    this.maxlength = props.maxlength;
-    this.accumulate = props.accumulate;
-    this.example = props.example;
-    this.of = props.of;
-    this.validate = props.validate;
-    this.text = props.text;
-    this.cascade = props.cascade;
-    this.modelRef = props.modelRef;
-    this.arrDepth = props.arrDepth;
-    this.optArrDepth = props.optArrDepth;
-    this.meta = props.meta;
+    Object.assign(this, props);
   }
 
   static fromFieldInfo<
@@ -433,6 +413,7 @@ export class ConstantField<
       validate: option.validate,
       text: option.text,
       cascade: option.cascade,
+      visual: option.visual ?? false,
       modelRef,
       arrDepth: arrDepth,
       optArrDepth: optArrDepth,
@@ -451,42 +432,31 @@ export class ConstantField<
   get isMap() {
     return (this.modelRef as Cls) === Map;
   }
+  // Shared by every read path per row, so frozen: a caller that must mutate clones. Lazy because `isScalar` reads
+  // `modelRef.modelType`, which `via()` assigns while the model classes are still being wired up.
+  #props: FieldProps | null = null;
   getProps(): FieldProps {
-    return {
-      nullable: this.nullable as unknown as boolean,
-      ref: this.ref,
-      refPath: this.refPath,
-      refType: this.refType,
-      default: this.default,
-      type: this.type,
-      fieldType: this.fieldType,
-      immutable: this.immutable,
-      min: this.min,
-      max: this.max,
-      enum: this.enum,
-      select: this.select,
-      minlength: this.minlength,
-      maxlength: this.maxlength,
-      accumulate: this.accumulate,
-      example: this.example,
-      of: this.of,
-      validate: this.validate,
-      text: this.text,
-      cascade: this.cascade,
-      modelRef: this.modelRef,
-      arrDepth: this.arrDepth,
-      optArrDepth: this.optArrDepth,
-      meta: this.meta,
-      isClass: this.isClass,
-      isScalar: this.isScalar,
-      isArray: this.isArray,
-      isMap: this.isMap,
-    };
+    this.#props ??= Object.freeze(this.#buildProps());
+    return this.#props;
+  }
+  #buildProps(): FieldProps {
+    return { ...this, isClass: this.isClass, isScalar: this.isScalar, isArray: this.isArray, isMap: this.isMap };
   }
 }
 export interface FieldObject {
   [key: string]: ConstantField;
 }
+
+// A masked field with a `text` role would publish itself through the plaintext search mirror. Distributive because
+// `FieldOption` is a union, which a plain `Omit` would collapse to the keys the members share.
+type WithoutTextRole<Option> = Option extends unknown ? Omit<Option, "text"> : never;
+
+// `removeWithAny` reads its owner off the row through `refPath`, so the option type refuses one without the other.
+type CascadeOption =
+  | { cascade?: "removeRef" | "removeWith"; refPath?: string }
+  | { cascade: "removeWithAny"; refPath: string };
+
+type WithCascadePair<Option> = Omit<Option, "cascade" | "refPath"> & CascadeOption;
 
 type FieldOption<
   Value extends ConstantFieldTypeInput,
@@ -494,13 +464,17 @@ type FieldOption<
   Metadata extends { [key: string]: any } = { [key: string]: any },
   _FieldToValue = FieldToValue<Value, MapValue> | null | undefined,
 > =
-  | Omit<
-      ConstantFieldProps<ConstantFieldKind, _FieldToValue, MapValue, Metadata>,
-      "enum" | "meta" | "nullable" | "fieldType" | "select"
+  | WithCascadePair<
+      Omit<
+        ConstantFieldProps<ConstantFieldKind, _FieldToValue, MapValue, Metadata>,
+        "enum" | "meta" | "nullable" | "fieldType" | "select"
+      >
     >
-  | Omit<
-      ConstantFieldProps<ConstantFieldKind, SingleValue<_FieldToValue>, MapValue, Metadata>,
-      "enum" | "meta" | "nullable" | "fieldType" | "select"
+  | WithCascadePair<
+      Omit<
+        ConstantFieldProps<ConstantFieldKind, SingleValue<_FieldToValue>, MapValue, Metadata>,
+        "enum" | "meta" | "nullable" | "fieldType" | "select"
+      >
     >[];
 
 export type PlainTypeToFieldType<PlainType> = PlainType extends [infer First, ...infer Rest]
@@ -511,7 +485,6 @@ export type PlainTypeToFieldType<PlainType> = PlainType extends [infer First, ..
       ? StringConstructor
       : typeof Any;
 
-/** Builds a stored property field with optional validation, default, ref, text, and metadata options. */
 export const field = <
   ExplicitType,
   Value extends ConstantFieldTypeInput = PlainTypeToFieldType<ExplicitType>,
@@ -525,13 +498,27 @@ export const field = <
     fieldType: "property",
   });
 
-field.hidden = <
+/** `field(value, { visual: true })`: a stored property the page renders and an agent never sees. */
+field.visual = <
   ExplicitType,
   Value extends ConstantFieldTypeInput = PlainTypeToFieldType<ExplicitType>,
   MapValue = Value extends MapConstructor ? typeof PrimitiveScalar : never,
 >(
   value: Value,
   option: FieldOption<Value, MapValue> = {},
+) =>
+  new FieldInfo<"property", Value, ExplicitType, MapValue>(value, {
+    ...option,
+    fieldType: "property",
+    visual: true,
+  });
+field.hidden = <
+  ExplicitType,
+  Value extends ConstantFieldTypeInput = PlainTypeToFieldType<ExplicitType>,
+  MapValue = Value extends MapConstructor ? typeof PrimitiveScalar : never,
+>(
+  value: Value,
+  option: WithoutTextRole<FieldOption<Value, MapValue>> = {},
 ) =>
   new FieldInfo<"hidden", Value, ExplicitType, MapValue>(value, {
     ...option,
@@ -544,7 +531,7 @@ field.secret = <
   MapValue = Value extends MapConstructor ? typeof PrimitiveScalar : never,
 >(
   value: Value,
-  option: FieldOption<Value, MapValue> = {},
+  option: WithoutTextRole<FieldOption<Value, MapValue>> = {},
 ) =>
   new FieldInfo<"secret", Value | null, ExplicitType | null, MapValue>(value, {
     ...option,
@@ -552,14 +539,14 @@ field.secret = <
     select: false,
     nullable: true,
   });
-/** Builds a resolved field that is derived rather than treated as a stored property. */
+/** A derived field, never stored. */
 export const resolve = <
   ExplicitType,
   Value extends ConstantFieldTypeInput = PlainTypeToFieldType<ExplicitType>,
   MapValue = Value extends MapConstructor ? typeof PrimitiveScalar : never,
 >(
   value: Value,
-  option: FieldOption<Value, MapValue> = {},
+  option: WithoutTextRole<FieldOption<Value, MapValue>> = {},
 ) =>
   new FieldInfo<"resolve", Value, ExplicitType, MapValue>(value, {
     ...option,

@@ -7,10 +7,11 @@ import {
   type SpawnOptions,
   spawn,
 } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import {
   copyFile,
   cp as cpEntry,
+  lstat,
   mkdir,
   readdir as readDirEntries,
   realpath,
@@ -20,9 +21,10 @@ import {
 } from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import type { AkanPlugin, AkanSyncContext, PluginRuntimeContext } from "akanjs";
+import type { AkanPlugin, AkanSyncContext } from "akanjs";
 import {
   capitalize,
+  getPageSourceFileViolation,
   isRouteSourceFile,
   Logger,
   parseRouteModuleKey,
@@ -31,15 +33,22 @@ import {
 } from "akanjs/common";
 import { $ } from "bun";
 import chalk from "chalk";
+import {
+  renderScopeAgentBlock,
+  renderScopeAgentsMd,
+  renderScopeClaudeMd,
+  scanScopeRecipes,
+  upsertAgentBlock,
+} from "./agentsIndex";
 import { AkanAppConfig, AkanLibConfig, decreaseBuildNum, increaseBuildNum } from "./akanConfig";
 import { getRootBoundarySegments, isRootBoundarySegments } from "./artifact/implicitRootLayout";
-import { FileSys } from "./fileSys";
-import { getDirname } from "./getDirname";
+import { CodegenLock } from "./codegenLock";
+import { FileSys, getDirname } from "./fileSys";
 import { Linter } from "./linter";
+import { resolveRepoName } from "./repoIdentity";
 import { AppInfo, LibInfo, PkgInfo, WorkspaceInfo } from "./scanInfo";
 import { Spinner } from "./spinner";
-// Type-only: the implementation is loaded on demand in `getTypeChecker` to keep `typescript` out of
-// the resident module graph.
+// Type-only: `getTypeChecker` loads it on demand to keep `typescript` out of the resident module graph.
 import type { TypeChecker } from "./typeChecker";
 import type { FileContent, PackageJson, TsConfigJson } from "./types";
 
@@ -52,41 +61,15 @@ export interface PageRoot {
   keyPrefix: string;
 }
 
-const staticTemplateFileExtensions = new Set([
-  ".avif",
-  ".bmp",
-  ".cjs",
-  ".css",
-  ".eot",
-  ".gif",
-  ".html",
-  ".ico",
-  ".jpeg",
-  ".jpg",
-  ".js",
-  ".json",
-  ".map",
-  ".md",
-  ".mjs",
-  ".mp3",
-  ".mp4",
-  ".ogg",
-  ".otf",
-  ".pdf",
-  ".png",
-  ".svg",
-  ".ttf",
-  ".txt",
-  ".wasm",
-  ".wav",
-  ".webm",
-  ".webp",
-  ".woff",
-  ".woff2",
-  ".xml",
-]);
+const staticTemplateFileExtensions = new Set(
+  ".avif .bmp .cjs .css .eot .gif .html .ico .jpeg .jpg .js .json .map .md .mjs .mp3 .mp4 .ogg .otf .pdf .png .svg"
+    .split(" ")
+    .concat(".ttf .txt .wasm .wav .webm .webp .woff .woff2 .xml".split(" ")),
+);
 
-const formatCommandArg = (value: string) => (/^[\w@%+=:,./-]+$/.test(value) ? value : JSON.stringify(value));
+//? A backslash is a path separator on Windows but an escape in a POSIX shell, so only there does it force quoting.
+const plainCommandArgPattern = process.platform === "win32" ? /^[\w@%+=:,./\\-]+$/ : /^[\w@%+=:,./-]+$/;
+const formatCommandArg = (value: string) => (plainCommandArgPattern.test(value) ? value : JSON.stringify(value));
 
 const formatCommandForDisplay = (command: string, args: string[] = []) =>
   [command, ...args].map(formatCommandArg).join(" ");
@@ -145,7 +128,7 @@ export const execEmoji = {
   pkg: "📦",
   dist: "💿",
   module: "⚙️",
-  default: "✈️", // for sys executor
+  default: "✈️",
 };
 
 const parseEnvFile = (envPath: string): Record<string, string> => {
@@ -173,6 +156,11 @@ const parseEnvFile = (envPath: string): Record<string, string> => {
   return env;
 };
 
+const withCapitalizedDict = (dict: { [key: string]: string } = {}) => ({
+  ...dict,
+  ...Object.fromEntries(Object.entries(dict).map(([key, value]) => [capitalize(key), capitalize(value)])),
+});
+
 export class Executor {
   static verbose = false;
   static setVerbose(verbose: boolean) {
@@ -198,158 +186,53 @@ export class Executor {
   #stderr(data: Buffer) {
     Logger.raw(chalk.red(data.toString()));
   }
-  exec(command: string, options: ExecOptions = {}) {
-    const cwd = options.cwd?.toString() ?? this.cwdPath;
-    const proc = exec(command, { cwd: this.cwdPath, ...options });
+  #settle(
+    proc: ChildProcess,
+    target: { command: string; args?: string[]; cwd: string },
+    { onClose = false, keepLogs = false, redStderr = false } = {},
+  ): Promise<{ code: number | null; signal: NodeJS.Signals | null; stdout: string }> {
     let stdout = "";
     let stderr = "";
     proc.stdout?.on("data", (data: Buffer) => {
       stdout += data.toString();
+      if (keepLogs) this.logs.push(data.toString());
       this.#stdout(data);
     });
     proc.stderr?.on("data", (data: Buffer) => {
       stderr += data.toString();
-      this.#stdout(data); // 정상로그도 stderr로 나옴
+      if (keepLogs) this.logs.push(data.toString());
+      if (redStderr) this.#stderr(data);
+      else this.#stdout(data); // 정상로그도 stderr로 나옴
     });
     return new Promise((resolve, reject) => {
-      proc.on("error", (error) => {
-        reject(
-          new CommandExecutionError({
-            command,
-            cwd,
-            code: null,
-            signal: null,
-            stdout,
-            stderr,
-            cause: error,
-          }),
-        );
-      });
-      proc.on("exit", (code, signal) => {
-        if (!!code || signal)
-          reject(
-            new CommandExecutionError({
-              command,
-              cwd,
-              code,
-              signal,
-              stdout,
-              stderr,
-            }),
-          );
-        else resolve({ code, signal });
+      proc.on("error", (cause) =>
+        reject(new CommandExecutionError({ ...target, code: null, signal: null, stdout, stderr, cause })),
+      );
+      proc.on(onClose ? "close" : "exit", (code: number | null, signal: NodeJS.Signals | null) => {
+        if ((onClose ? code !== 0 : code) || signal)
+          reject(new CommandExecutionError({ ...target, code, signal, stdout, stderr }));
+        else resolve({ code, signal, stdout });
       });
     });
+  }
+  exec(command: string, options: ExecOptions = {}): Promise<unknown> {
+    const target = { command, cwd: options.cwd?.toString() ?? this.cwdPath };
+    const proc = exec(command, { cwd: this.cwdPath, ...options });
+    return this.#settle(proc, target).then(({ code, signal }) => ({ code, signal }));
   }
 
   spawn(command: string, args: string[] = [], options: SpawnOptions = {}): Promise<string> {
-    const cwd = options.cwd?.toString() ?? this.cwdPath;
-    const proc = spawn(command, args, {
-      cwd: this.cwdPath,
-      // stdio: "inherit",
-      ...options,
-    });
-    let stdout = "";
-    let stderr = "";
-
-    proc.stdout?.on("data", (data: Buffer) => {
-      stdout += data.toString();
-      this.logs.push(data.toString());
-      this.#stdout(data);
-    });
-    proc.stderr?.on("data", (data: Buffer) => {
-      stderr += data.toString();
-      this.logs.push(data.toString());
-      this.#stdout(data); // 정상로그도 stderr로 나옴
-    });
-    return new Promise((resolve, reject) => {
-      proc.on("error", (error) => {
-        reject(
-          new CommandExecutionError({
-            command,
-            args,
-            cwd,
-            code: null,
-            signal: null,
-            stdout,
-            stderr,
-            cause: error,
-          }),
-        );
-      });
-      proc.on("close", (code, signal) => {
-        if (code !== 0 || signal)
-          reject(
-            new CommandExecutionError({
-              command,
-              args,
-              cwd,
-              code,
-              signal,
-              stdout,
-              stderr,
-            }),
-          );
-        else resolve(stdout);
-      });
-    });
+    const target = { command, args, cwd: options.cwd?.toString() ?? this.cwdPath };
+    const proc = spawn(command, args, { cwd: this.cwdPath, ...options });
+    return this.#settle(proc, target, { onClose: true, keepLogs: true }).then(({ stdout }) => stdout);
   }
   spawnSync(command: string, args: string[] = [], options: SpawnOptions = {}): ChildProcess {
-    const proc = spawn(command, args, {
-      cwd: this.cwdPath,
-      // stdio: "inherit",
-      ...options,
-    });
-    return proc;
+    return spawn(command, args, { cwd: this.cwdPath, ...options });
   }
-  fork(modulePath: string, args: string[] = [], options: ForkOptions = {}) {
-    const cwd = options.cwd?.toString() ?? this.cwdPath;
-    const proc = fork(modulePath, args, {
-      cwd: this.cwdPath,
-      // stdio: ["ignore", "inherit", "inherit", "ipc"],
-      ...options,
-    });
-    let stdout = "";
-    let stderr = "";
-    proc.stdout?.on("data", (data: Buffer) => {
-      stdout += data.toString();
-      this.#stdout(data);
-    });
-    proc.stderr?.on("data", (data: Buffer) => {
-      stderr += data.toString();
-      this.#stderr(data);
-    });
-    return new Promise((resolve, reject) => {
-      proc.on("error", (error) => {
-        reject(
-          new CommandExecutionError({
-            command: modulePath,
-            args,
-            cwd,
-            code: null,
-            signal: null,
-            stdout,
-            stderr,
-            cause: error,
-          }),
-        );
-      });
-      proc.on("exit", (code, signal) => {
-        if (!!code || signal)
-          reject(
-            new CommandExecutionError({
-              command: modulePath,
-              args,
-              cwd,
-              code,
-              signal,
-              stdout,
-              stderr,
-            }),
-          );
-        else resolve({ code, signal });
-      });
-    });
+  fork(modulePath: string, args: string[] = [], options: ForkOptions = {}): Promise<unknown> {
+    const target = { command: modulePath, args, cwd: options.cwd?.toString() ?? this.cwdPath };
+    const proc = fork(modulePath, args, { cwd: this.cwdPath, ...options });
+    return this.#settle(proc, target, { redStderr: true }).then(({ code, signal }) => ({ code, signal }));
   }
   getPath(filePath: string) {
     if (path.isAbsolute(filePath)) return filePath;
@@ -390,16 +273,14 @@ export class Executor {
   }
   async getFilesAndDirs(dirPath: string): Promise<{ files: string[]; dirs: string[] }> {
     const fullDirPath = this.getPath(dirPath);
-    const fileGlob = new Bun.Glob("*");
-    const files = Array.from(fileGlob.scanSync({ cwd: fullDirPath, onlyFiles: true }));
-    const dirGlob = new Bun.Glob("*");
-    const allEntries = Array.from(dirGlob.scanSync({ cwd: fullDirPath, onlyFiles: false }));
+    const glob = new Bun.Glob("*");
+    const files = Array.from(glob.scanSync({ cwd: fullDirPath, onlyFiles: true }));
+    const allEntries = Array.from(glob.scanSync({ cwd: fullDirPath, onlyFiles: false }));
     const dirs = allEntries.filter((entry) => !files.includes(entry));
     return { files, dirs };
   }
   async exists(filePath: string) {
-    const readPath = this.getPath(filePath);
-    return await FileSys.exists(readPath);
+    return await FileSys.exists(this.getPath(filePath));
   }
   async remove(filePath: string) {
     const readPath = this.getPath(filePath);
@@ -408,8 +289,7 @@ export class Executor {
     return this;
   }
   async removeDir(dirPath: string) {
-    //* XXX: `path.join(…, ".")` drops a trailing separator — `rm -rf link/` resolves through a symlink
-    //* and wipes its target, while `rm -rf link` only unlinks it.
+    //* XXX: `path.join(…, ".")` drops a trailing slash: `rm -rf link/` wipes the target, `rm -rf link` only unlinks.
     const readPath = path.join(this.getPath(dirPath), ".");
     if (await FileSys.entryExists(readPath)) await rm(readPath, { recursive: true, force: true });
     this.logger.verbose(`Remove directory ${readPath}`);
@@ -423,7 +303,8 @@ export class Executor {
     const writePath = this.getPath(filePath);
     const dir = path.dirname(writePath);
     if (!(await FileSys.dirExists(dir))) await mkdir(dir, { recursive: true });
-    let contentStr = typeof content === "string" ? content : JSON.stringify(content, null, 2);
+    //? Biome ends every .json with a newline; without one, `akan lint` and `akan sync` would flip-flop the file.
+    let contentStr = typeof content === "string" ? content : `${JSON.stringify(content, null, 2)}\n`;
 
     if (await FileSys.fileExists(writePath)) {
       const currentContent = await FileSys.readText(writePath);
@@ -449,12 +330,10 @@ export class Executor {
     return { filePath, content };
   }
   async readFile(filePath: string) {
-    const readPath = this.getPath(filePath);
-    return await FileSys.readText(readPath);
+    return await FileSys.readText(this.getPath(filePath));
   }
   async readJson(filePath: string) {
-    const readPath = this.getPath(filePath);
-    return await FileSys.readJson<object>(readPath);
+    return await FileSys.readJson<object>(this.getPath(filePath));
   }
   async cp(srcPath: string, destPath: string, { dereference = false }: { dereference?: boolean } = {}) {
     const src = this.getPath(srcPath);
@@ -462,9 +341,10 @@ export class Executor {
     if (!(await FileSys.exists(src))) return;
     const isDirectory = (await stat(src)).isDirectory();
     if (!(await FileSys.exists(dest)) && isDirectory) await mkdir(dest, { recursive: true });
-    //* `cp -r` keeps symlinks on GNU coreutils but follows them on macOS, so anything that must land as
-    //* real files regardless of platform has to say so explicitly.
-    if (dereference) await cpEntry(src, dest, { recursive: isDirectory, dereference: true, force: true });
+    //* `cp -r` keeps symlinks on GNU but follows them on macOS; Windows has no `cp -r <dir>/.` and rarely the
+    //* privilege a symlink needs, so it always copies real files.
+    if (dereference || process.platform === "win32")
+      await cpEntry(src, dest, { recursive: isDirectory, dereference: true, force: true });
     else await $`cp -r ${src}${isDirectory ? "/." : ""} ${dest}`;
   }
   log(msg: string) {
@@ -486,19 +366,10 @@ export class Executor {
   #tsconfig: TsConfigJson | null = null;
   async getTsConfig(pathname = "tsconfig.json", { refresh }: { refresh?: boolean } = {}): Promise<TsConfigJson> {
     if (this.#tsconfig && !refresh) return this.#tsconfig;
-    const tsconfig = (await this.readJson(pathname)) as TsConfigJson;
+    let tsconfig = (await this.readJson(pathname)) as TsConfigJson;
     if (tsconfig.extends) {
-      const extendsTsconfig = await this.getTsConfig(tsconfig.extends);
-      const result = {
-        ...extendsTsconfig,
-        ...tsconfig,
-        compilerOptions: {
-          ...extendsTsconfig.compilerOptions,
-          ...tsconfig.compilerOptions,
-        },
-      } as TsConfigJson;
-      this.#tsconfig = result;
-      return result;
+      const base = await this.getTsConfig(tsconfig.extends, { refresh });
+      tsconfig = { ...base, ...tsconfig, compilerOptions: { ...base.compilerOptions, ...tsconfig.compilerOptions } };
     }
     this.#tsconfig = tsconfig;
     return tsconfig;
@@ -546,6 +417,11 @@ export class Executor {
     dict: { [key: string]: string } = {},
     options: { [key: string]: unknown } = {},
   ): Promise<FileContent | null> {
+    const convertPath = (target: string) =>
+      Object.entries(dict).reduce(
+        (converted, [key, value]) => converted.replace(new RegExp(`__${key}__`, "g"), value),
+        target,
+      );
     if (targetPath.endsWith(".ts") || targetPath.endsWith(".tsx")) {
       const getContent = (await import(templatePath)) as {
         default: (
@@ -558,32 +434,20 @@ export class Executor {
       if (result === null) return null;
       const filename = typeof result === "object" ? result.filename : path.basename(targetPath).replace(".js", ".ts");
       const content = typeof result === "object" ? result.content : result;
-      const dirname = path.dirname(targetPath);
-      const convertedTargetPath = Object.entries(dict).reduce(
-        (path, [key, value]) => path.replace(new RegExp(`__${key}__`, "g"), value),
-        `${dirname}/${filename}`,
-      );
+      const convertedTargetPath = convertPath(`${path.dirname(targetPath)}/${filename}`);
       this.logger.verbose(`Apply template ${templatePath} to ${convertedTargetPath}`);
       return this.writeFile(convertedTargetPath, content, { overwrite });
     } else if (targetPath.endsWith(".template")) {
       const content = await FileSys.readText(templatePath);
-      const convertedTargetPath = Object.entries(dict).reduce(
-        (path, [key, value]) => path.replace(new RegExp(`__${key}__`, "g"), value),
-        targetPath.slice(0, -9),
-      );
+      const convertedTargetPath = convertPath(targetPath.slice(0, -9));
       const convertedContent = Object.entries(dict).reduce(
         (data, [key, value]) => data.replace(new RegExp(`<%= ${key} %>`, "g"), value),
         content,
       );
       this.logger.verbose(`Apply template ${templatePath} to ${convertedTargetPath}`);
-      return this.writeFile(convertedTargetPath, convertedContent, {
-        overwrite,
-      });
+      return this.writeFile(convertedTargetPath, convertedContent, { overwrite });
     } else if (staticTemplateFileExtensions.has(path.extname(targetPath).toLowerCase())) {
-      const convertedTargetPath = Object.entries(dict).reduce(
-        (path, [key, value]) => path.replace(new RegExp(`__${key}__`, "g"), value),
-        targetPath,
-      );
+      const convertedTargetPath = convertPath(targetPath);
       const writePath = this.getPath(convertedTargetPath);
       const dirname = path.dirname(writePath);
       if (!(await FileSys.dirExists(dirname))) await mkdir(dirname, { recursive: true });
@@ -609,13 +473,11 @@ export class Executor {
   }): Promise<FileContent[]> {
     const templateRoot = await this.#resolveTemplateRoot();
     const templatePath = `${templateRoot}${template ? `/${template}` : ""}`;
-    const prefixTemplatePath = templatePath; // templatePath.endsWith(".tsx") ? templatePath : templatePath.replace(".ts", ".js");
-    if ((await stat(prefixTemplatePath)).isFile()) {
-      const filename = path.basename(prefixTemplatePath);
+    if ((await stat(templatePath)).isFile()) {
       const fileContent = await this.#applyTemplateFile(
         {
-          templatePath: prefixTemplatePath,
-          targetPath: path.join(basePath, filename),
+          templatePath,
+          targetPath: path.join(basePath, path.basename(templatePath)),
           scanInfo,
           overwrite,
         },
@@ -673,17 +535,26 @@ export class Executor {
     options?: { [key: string]: unknown };
     overwrite?: boolean;
   }): Promise<FileContent[]> {
-    const dict = {
-      ...(options.dict ?? {}),
-      ...Object.fromEntries(
-        Object.entries(options.dict ?? {}).map(([key, value]) => [capitalize(key), capitalize(value)]),
-      ),
-    };
-    return this._applyTemplate({ ...options, dict });
+    const fileContents = await this._applyTemplate({ ...options, dict: withCapitalizedDict(options.dict) });
+    await this.#formatAppliedTemplate(fileContents);
+    return fileContents;
   }
-  // Async so `typescript` (~65MB resident) is loaded only by the commands that actually typecheck,
-  // not by every process that imports an executor. `typeCheckAsync` below runs in a subprocess and
-  // never touches this path.
+
+  // A template cannot sort the identifiers it emits (`Task` vs `Zoo`). Best-effort: `create-akan-workspace`
+  // scaffolds before `bun install`, with no local Biome binary yet.
+  async #formatAppliedTemplate(fileContents: FileContent[]) {
+    const filePaths = fileContents
+      .map((fileContent) => fileContent.filePath)
+      .filter((filePath) => filePath.endsWith(".ts") || filePath.endsWith(".tsx"));
+    if (filePaths.length === 0) return;
+    try {
+      const { fixed } = await this.getLinter().fixFiles(filePaths);
+      if (fixed.length > 0) this.logger.verbose(`Formatted ${fixed.length} scaffolded file(s)`);
+    } catch (err) {
+      this.logger.verbose(`Skipped formatting scaffolded files: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  // Async so `typescript` (~65MB resident) loads only in the commands that typecheck.
   async getTypeChecker() {
     const { TypeChecker } = await import("./typeChecker");
     this.typeChecker ??= new TypeChecker(this);
@@ -749,10 +620,10 @@ export class Executor {
     filePath: string,
     { fix = false, dryRun = false }: { fix?: boolean; dryRun?: boolean } = {},
   ): Promise<{
-    results: unknown[]; // ESLint.LintResult[];
+    results: unknown[];
     message: string;
-    errors: unknown[]; // ESLintLinter.LintMessage[];
-    warnings: unknown[]; // ESLintLinter.LintMessage[];
+    errors: unknown[];
+    warnings: unknown[];
   }> {
     const path = this.getPath(filePath);
     const linter = this.getLinter();
@@ -779,15 +650,14 @@ export class WorkspaceExecutor extends Executor {
     this.repoName = repoName;
   }
 
-  static #execs = new Map<string, WorkspaceExecutor>();
   static fromRoot({
     workspaceRoot = process.cwd(),
-    repoName = path.basename(process.cwd()),
+    repoName = resolveRepoName(workspaceRoot),
   }: {
     workspaceRoot?: string;
     repoName?: string;
   } = {}) {
-    return WorkspaceExecutor.#execs.get(repoName) ?? new WorkspaceExecutor({ workspaceRoot, repoName });
+    return new WorkspaceExecutor({ workspaceRoot, repoName });
   }
   static getBaseDevEnv(envPath?: string) {
     // Bun auto-loads .env, so we use process.env directly
@@ -836,11 +706,9 @@ export class WorkspaceExecutor extends Executor {
     return await WorkspaceInfo.fromExecutor(this);
   }
   async getApps() {
-    if (!(await FileSys.dirExists(`${this.workspaceRoot}/apps`))) return [];
     return await this.#getDirHasFile(`${this.workspaceRoot}/apps`, "akan.config.ts");
   }
   async getLibs() {
-    if (!(await FileSys.dirExists(`${this.workspaceRoot}/libs`))) return [];
     return await this.#getDirHasFile(`${this.workspaceRoot}/libs`, "akan.config.ts");
   }
   async getSyss() {
@@ -848,7 +716,6 @@ export class WorkspaceExecutor extends Executor {
     return [appNames, libNames] as [string[], string[]];
   }
   async getPkgs() {
-    if (!(await FileSys.dirExists(`${this.workspaceRoot}/pkgs`))) return [];
     return await this.#getDirHasFile(`${this.workspaceRoot}/pkgs`, "package.json");
   }
   async getExecs() {
@@ -902,20 +769,36 @@ export class WorkspaceExecutor extends Executor {
     return await getDirs(basePath);
   }
   async commit(message: string, { init = false, add = true }: { init?: boolean; add?: boolean } = {}) {
-    if (init) await this.exec(`git init --quiet`);
-    if (add) await this.exec(`git add .`);
-    await this.exec(`git commit --quiet -m "${message}"`);
+    if (init) await this.spawn("git", ["init", "--quiet"]);
+    if (add) await this.spawn("git", ["add", "."]);
+    // Argument vector, not a shell string: a message carrying a double quote breaks the interpolated form.
+    await this.spawn("git", ["commit", "--quiet", "-m", message]);
+  }
+  /** `git commit` exits non-zero on an empty index, so a re-runnable caller has to ask first. */
+  async hasChanges() {
+    return !!(await this.spawn("git", ["status", "--porcelain"])).trim();
+  }
+  /** Sorted workspace-relative paths; `untracked` adds uncommitted files, still honoring `.gitignore`. */
+  async listGitFiles(paths: string[], { untracked = false }: { untracked?: boolean } = {}) {
+    if (!paths.length) return [];
+    const mode = untracked ? ["--cached", "--others", "--exclude-standard"] : ["--cached"];
+    const stdout = await this.spawn("git", ["ls-files", "-z", ...mode, "--", ...paths]);
+    return stdout
+      .split("\0")
+      .filter((file) => !!file)
+      .sort();
   }
   async #getDirHasFile(basePath: string, targetFilename: string) {
-    const AVOID_DIRS = ["node_modules", "dist", "public", "webkit"];
+    if (!(await FileSys.dirExists(basePath))) return [];
+    //? `local/` is gitignored scratch: a test's temporary workspace there has a package.json of its own.
+    const AVOID_DIRS = ["node_modules", "dist", "public", "webkit", "local"];
     const getDirs = async (dirname: string, maxDepth = 3, results: string[] = [], prefix = "") => {
       const dirs = await this.readdir(dirname);
       await Promise.all(
         dirs.map(async (dir) => {
           if (AVOID_DIRS.includes(dir)) return;
           const dirPath = path.join(dirname, dir);
-          //* A dangling symlink (e.g. a synced lib page whose source was deleted) must not fail the walk —
-          //* this runs for `getApps`, so throwing here would break every command until it is repaired.
+          //* Not `stat`: a dangling symlink would throw, and this walk backs `getApps`, i.e. every command.
           if (await FileSys.dirExists(dirPath)) {
             const hasTargetFile = await FileSys.fileExists(path.join(dirPath, targetFilename));
             if (hasTargetFile) results.push(`${prefix}${dir}`);
@@ -925,50 +808,34 @@ export class WorkspaceExecutor extends Executor {
       );
       return results;
     };
-    return await getDirs(basePath);
+    return (await getDirs(basePath)).sort((a, b) => a.localeCompare(b));
   }
 
-  async getScalarConstantFiles() {
+  async #fromEverySys<T>(read: (sys: SysExecutor) => Promise<T[]>): Promise<T[]> {
     const [appNames, libNames] = await this.getSyss();
-    const scalarConstantExampleFiles = [
-      ...(
-        await Promise.all(appNames.map((appName) => AppExecutor.from(this, appName).getScalarConstantFiles()))
-      ).flat(),
-      ...(
-        await Promise.all(libNames.map((libName) => LibExecutor.from(this, libName).getScalarConstantFiles()))
-      ).flat(),
-    ];
-    return scalarConstantExampleFiles;
+    const fromApps = await Promise.all(appNames.map((appName) => read(AppExecutor.from(this, appName))));
+    const fromLibs = await Promise.all(libNames.map((libName) => read(LibExecutor.from(this, libName))));
+    return [...fromApps.flat(), ...fromLibs.flat()];
+  }
+  async getScalarConstantFiles() {
+    return await this.#fromEverySys((sys) => sys.getScalarConstantFiles());
   }
   async getConstantFiles() {
-    const [appNames, libNames] = await this.getSyss();
-    const moduleConstantExampleFiles = [
-      ...(await Promise.all(appNames.map((appName) => AppExecutor.from(this, appName).getConstantFiles()))).flat(),
-      ...(await Promise.all(libNames.map((libName) => LibExecutor.from(this, libName).getConstantFiles()))).flat(),
-    ];
-    return moduleConstantExampleFiles;
+    return await this.#fromEverySys((sys) => sys.getConstantFiles());
   }
   async getDictionaryFiles() {
-    const [appNames, libNames] = await this.getSyss();
-    const moduleDictionaryExampleFiles = [
-      ...(await Promise.all(appNames.map((appName) => AppExecutor.from(this, appName).getDictionaryFiles()))).flat(),
-      ...(await Promise.all(libNames.map((libName) => LibExecutor.from(this, libName).getDictionaryFiles()))).flat(),
-    ];
-    return moduleDictionaryExampleFiles;
+    return await this.#fromEverySys((sys) => sys.getDictionaryFiles());
   }
   async getViewFiles() {
-    const [appNames, libNames] = await this.getSyss();
-    const viewExampleFiles = [
-      ...(await Promise.all(appNames.map((appName) => AppExecutor.from(this, appName).getViewsSourceCode()))).flat(),
-      ...(await Promise.all(libNames.map((libName) => LibExecutor.from(this, libName).getViewsSourceCode()))).flat(),
-    ];
-    return viewExampleFiles;
+    return await this.#fromEverySys((sys) => sys.getViewsSourceCode());
   }
 }
 
-interface SysExecutorOptions {
+interface NamedExecutorOptions {
   workspace?: WorkspaceExecutor;
   name: string;
+}
+interface SysExecutorOptions extends NamedExecutorOptions {
   type: "app" | "lib";
 }
 
@@ -999,6 +866,16 @@ export class SysExecutor extends Executor {
     const path = this.type === "app" ? `apps/${this.name}/lib` : `libs/${this.name}/lib`;
     return await this.workspace.getDirInModule(path, this.name);
   }
+  async getPageConventionViolations(): Promise<{ relativePath: string; reason: string }[]> {
+    if (!(await this.exists("page"))) return [];
+    const violations: { relativePath: string; reason: string }[] = [];
+    for (const entry of await this.getAllFiles("**/*", { cwd: this.getPath("page") })) {
+      const relativePath = entry.split(path.sep).join("/");
+      const reason = getPageSourceFileViolation(relativePath);
+      if (reason) violations.push({ relativePath: `page/${relativePath}`, reason });
+    }
+    return violations;
+  }
 
   #scanInfo: AppInfo | LibInfo | null = null;
   hasScanInfo() {
@@ -1027,29 +904,12 @@ export class SysExecutor extends Executor {
           options: { exec: this, facet },
         }),
       ),
-      ...scanInfo.getDatabaseModules().map((model) =>
-        this._applyTemplate({
-          basePath: `lib/${model}`,
-          template: "moduleRoot",
-          scanInfo,
-          dict: { model, Model: capitalize(model) },
-        }),
-      ),
-      ...scanInfo.getServiceModules().map((model) =>
-        this._applyTemplate({
-          basePath: `lib/_${model}`,
-          template: "moduleRoot",
-          scanInfo,
-          dict: { model, Model: capitalize(model) },
-        }),
-      ),
-      ...scanInfo.getScalarModules().map((model) =>
-        this._applyTemplate({
-          basePath: `lib/__scalar/${model}`,
-          template: "moduleRoot",
-          scanInfo,
-          dict: { model, Model: capitalize(model) },
-        }),
+      ...[
+        ...scanInfo.getDatabaseModules().map((model) => [model, `lib/${model}`]),
+        ...scanInfo.getServiceModules().map((model) => [model, `lib/_${model}`]),
+        ...scanInfo.getScalarModules().map((model) => [model, `lib/__scalar/${model}`]),
+      ].map(([model, basePath]) =>
+        this._applyTemplate({ basePath, template: "moduleRoot", scanInfo, dict: { model, Model: capitalize(model) } }),
       ),
     ];
   }
@@ -1071,19 +931,36 @@ export class SysExecutor extends Executor {
         : await LibInfo.fromExecutor(this as unknown as LibExecutor, {
             refresh,
           });
-    if (write) {
-      await Promise.all(this.#getScanTemplateTasks(scanInfo));
-      await this.writeJson(`akan.${this.type}.json`, scanInfo.getScanResult());
-      if (this.type === "lib") this.#updateDependencies(scanInfo);
+    //* Locked: `writeLib` rewrites dependency-lib barrels that other dev servers regenerate and watch too.
+    if (write)
+      await CodegenLock.run(this.workspace.workspaceRoot, `scan:${this.name}`, async () => {
+        await Promise.all(this.#getScanTemplateTasks(scanInfo));
+        await this.writeJson(`akan.${this.type}.json`, scanInfo.getScanResult());
+        if (this.type === "lib") this.#updateDependencies(scanInfo);
 
-      if (writeLib) {
-        const libInfos = [...scanInfo.getLibInfos().values()];
-        await this.#updateDependencies(scanInfo);
-        await Promise.all(libInfos.flatMap((libInfo) => libInfo.exec.#getScanTemplateTasks(libInfo)));
-      }
-    }
+        if (writeLib) {
+          const libInfos = [...scanInfo.getLibInfos().values()];
+          await this.#updateDependencies(scanInfo);
+          await Promise.all(libInfos.flatMap((libInfo) => libInfo.exec.#getScanTemplateTasks(libInfo)));
+        }
+        await this.syncAgentsIndex(scanInfo);
+      });
     this.#scanInfo = scanInfo;
     return scanInfo;
+  }
+  /** Rewrites only the marker block of the scoped AGENTS.md; content outside the markers belongs to the user. */
+  async syncAgentsIndex(scanInfo?: AppInfo | LibInfo) {
+    const info = scanInfo ?? (await this.scan({ write: false }));
+    const scope = { type: this.type, name: this.name };
+    const recipes = await scanScopeRecipes(this.workspace.workspaceRoot, scope, info.getScanResult().libDeps);
+    const block = renderScopeAgentBlock(scope, recipes);
+    const existing = (await this.exists("AGENTS.md")) ? await this.readFile("AGENTS.md") : null;
+    await this.writeFile(
+      "AGENTS.md",
+      existing?.trim() ? upsertAgentBlock(existing, block) : renderScopeAgentsMd(scope, block),
+    );
+    // CLAUDE.md 는 얇은 포인터라 최초 1회만 깔아준다 — 사용자가 지우거나 고친 것을 되살리지 않는다.
+    if (!(await this.exists("CLAUDE.md"))) await this.writeFile("CLAUDE.md", renderScopeClaudeMd(scope));
   }
   async #updateDependencies(scanInfo: AppInfo | LibInfo) {
     const rootPackageJson = await this.workspace.getPackageJson();
@@ -1126,69 +1003,49 @@ export class SysExecutor extends Executor {
   }
 
   async getDatabaseModules() {
-    const databaseModules = (await this.readdir("lib"))
-      .filter((name) => !name.startsWith("_") && !name.startsWith("__") && !name.endsWith(".ts"))
-      .filter((name) => Bun.file(`${this.cwdPath}/lib/${name}/${name}.constant.ts`).exists());
-    return databaseModules;
+    return (await this.readdir("lib"))
+      .filter((name) => !name.startsWith("_") && !name.endsWith(".ts"))
+      .filter((name) => existsSync(`${this.cwdPath}/lib/${name}/${name}.constant.ts`));
   }
 
   async getServiceModules() {
-    const serviceModules = (await this.readdir("lib"))
+    return (await this.readdir("lib"))
       .filter((name) => name.startsWith("_") && !name.startsWith("__"))
-      .filter((name) => Bun.file(`${this.cwdPath}/lib/${name}/${name}.service.ts`).exists());
-    return serviceModules;
+      .filter((name) => existsSync(`${this.cwdPath}/lib/${name}/${name.slice(1)}.service.ts`));
   }
 
   async getScalarModules() {
-    const scalarModules = (await this.readdir("lib/__scalar"))
+    return (await this.readdir("lib/__scalar"))
       .filter((name) => !name.startsWith("_"))
-      .filter((name) => Bun.file(`${this.cwdPath}/lib/__scalar/${name}/${name}.constant.ts`).exists());
-    return scalarModules;
+      .filter((name) => existsSync(`${this.cwdPath}/lib/__scalar/${name}/${name}.constant.ts`));
   }
 
+  async #getComponentModules(role: "View" | "Unit" | "Template") {
+    return (await this.readdir("lib"))
+      .filter((name) => !name.startsWith("_") && !name.endsWith(".ts"))
+      .filter((name) => existsSync(`${this.cwdPath}/lib/${name}/${capitalize(name)}.${role}.tsx`));
+  }
+  async #getComponentSources(role: "View" | "Unit" | "Template") {
+    const modules = await this.#getComponentModules(role);
+    return Promise.all(modules.map((name) => this.getLocalFile(`lib/${name}/${capitalize(name)}.${role}.tsx`)));
+  }
   async getViewComponents() {
-    const viewComponents = (await this.readdir("lib"))
-      .filter((name) => !name.startsWith("_") && !name.startsWith("__") && !name.endsWith(".ts"))
-      .filter((name) => Bun.file(`${this.cwdPath}/lib/${name}/${capitalize(name)}.View.tsx`).exists());
-    return viewComponents;
+    return await this.#getComponentModules("View");
   }
-
   async getUnitComponents() {
-    const unitComponents = (await this.readdir("lib"))
-      .filter((name) => !name.startsWith("_") && !name.startsWith("__") && !name.endsWith(".ts"))
-      .filter((name) => Bun.file(`${this.cwdPath}/lib/${name}/${capitalize(name)}.Unit.tsx`).exists());
-    return unitComponents;
+    return await this.#getComponentModules("Unit");
   }
   async getTemplateComponents() {
-    const templateComponents = (await this.readdir("lib"))
-      .filter((name) => !name.startsWith("_") && !name.startsWith("__") && !name.endsWith(".ts"))
-      .filter((name) => Bun.file(`${this.cwdPath}/lib/${name}/${capitalize(name)}.Template.tsx`).exists());
-    return templateComponents;
+    return await this.#getComponentModules("Template");
   }
-
   async getViewsSourceCode() {
-    const viewComponents = await this.getViewComponents();
-    return Promise.all(
-      viewComponents.map((viewComponent) =>
-        this.getLocalFile(`lib/${viewComponent}/${capitalize(viewComponent)}.View.tsx`),
-      ),
-    );
+    return await this.#getComponentSources("View");
   }
   async getUnitsSourceCode() {
-    const unitComponents = await this.getUnitComponents();
-    return Promise.all(
-      unitComponents.map((unitComponent) =>
-        this.getLocalFile(`lib/${unitComponent}/${capitalize(unitComponent)}.Unit.tsx`),
-      ),
-    );
+    return await this.#getComponentSources("Unit");
   }
   async getTemplatesSourceCode() {
-    const templateComponents = await this.getTemplateComponents();
-    return Promise.all(
-      templateComponents.map((templateComponent) =>
-        this.getLocalFile(`lib/${templateComponent}/${capitalize(templateComponent)}.Template.tsx`),
-      ),
-    );
+    return await this.#getComponentSources("Template");
   }
 
   async getScalarConstantFiles() {
@@ -1203,7 +1060,9 @@ export class SysExecutor extends Executor {
   async getScalarDictionaryFiles() {
     const scalarModules = await this.getScalarModules();
     return Promise.all(
-      scalarModules.map((scalarModule) => this.getLocalFile(`lib/${scalarModule}/${scalarModule}.dictionary.ts`)),
+      scalarModules.map((scalarModule) =>
+        this.getLocalFile(`lib/__scalar/${scalarModule}/${scalarModule}.dictionary.ts`),
+      ),
     );
   }
 
@@ -1237,30 +1096,15 @@ export class SysExecutor extends Executor {
     dict?: { [key: string]: string };
     overwrite?: boolean;
   }): Promise<FileContent[]> {
-    const dict = {
-      ...(options.dict ?? {}),
-      ...Object.fromEntries(
-        Object.entries(options.dict ?? {}).map(([key, value]) => [capitalize(key), capitalize(value)]),
-      ),
-    };
     const scanInfo = await this.scan();
-    const fileContents = await this._applyTemplate({
-      ...options,
-      scanInfo,
-      dict,
-    });
+    const fileContents = await this._applyTemplate({ ...options, scanInfo, dict: withCapitalizedDict(options.dict) });
     await this.scan();
     return fileContents;
   }
 }
 
-interface AppExecutorOptions {
-  workspace?: WorkspaceExecutor;
-  name: string;
-}
 export class AppExecutor extends SysExecutor {
-  // `typescript` costs ~65MB resident, so keep it out of the module graph of every process that only
-  // ever imports an executor. Route validation is the sole consumer here and is already async.
+  // Lazy: the validator pulls in `typescript` (~65MB resident).
   static #routeSourceValidator: typeof import("./routeSourceValidator").RouteSourceValidator | null = null;
   static async #getRouteSourceValidator() {
     AppExecutor.#routeSourceValidator ??= (await import("./routeSourceValidator")).RouteSourceValidator;
@@ -1268,29 +1112,31 @@ export class AppExecutor extends SysExecutor {
   }
   dist: Executor;
   override emoji = execEmoji.app;
-  constructor({ workspace, name }: AppExecutorOptions) {
+  constructor({ workspace, name }: NamedExecutorOptions) {
     super({ workspace, name, type: "app" });
     this.dist = new Executor(`dist/${name}`, `${this.workspace.workspaceRoot}/dist/apps/${name}`);
   }
-  static #execs = new Map<string, AppExecutor>();
   static from(executor: SysExecutor | WorkspaceExecutor, name: string) {
-    const exec = AppExecutor.#execs.get(name);
-    if (exec) return exec;
-    else if (executor instanceof WorkspaceExecutor) return new AppExecutor({ workspace: executor, name });
-    else return new AppExecutor({ workspace: executor.workspace, name });
+    return new AppExecutor({ workspace: executor instanceof WorkspaceExecutor ? executor : executor.workspace, name });
+  }
+  //* Not dev output: native builds and the update releases waiting to be uploaded, and the downloaded `bin` sources.
+  static readonly #keptOnStart = [path.join(".akan", "native"), path.join(".akan", "cache", "bin")];
+  async #removeDevOutput(dir = ".akan") {
+    const entries = await readDirEntries(this.getPath(dir)).catch(() => [] as string[]);
+    await Promise.all(
+      entries.map(async (name) => {
+        const entry = path.join(dir, name);
+        if (AppExecutor.#keptOnStart.includes(entry)) return;
+        if (AppExecutor.#keptOnStart.some((kept) => kept.startsWith(`${entry}${path.sep}`)))
+          return await this.#removeDevOutput(entry);
+        await this.removeDir(entry);
+      }),
+    );
   }
   getEnv() {
     return WorkspaceExecutor.getBaseDevEnv().env;
   }
-  /**
-   * This app's dev port, derived from its position in the sorted `apps/` listing so several apps can run
-   * at once without colliding.
-   *
-   * `AKAN_DEV_PORT` pins it instead, because the derived value *moves*: the index shifts whenever any other
-   * app directory appears or disappears, and a dev host recomputes this on every restart. So a session that
-   * adds an app relands its dev server on a different port, and anything that reserved a port relative to
-   * the old one is left pointing at nothing.
-   */
+  /** `AKAN_DEV_PORT` pins it; the derived port moves whenever an app directory appears or disappears. */
   async getDevPort() {
     const pinned = Number(process.env.AKAN_DEV_PORT);
     if (Number.isInteger(pinned) && pinned > 0 && pinned <= 65_535) return pinned;
@@ -1301,10 +1147,8 @@ export class AppExecutor extends SysExecutor {
     return basePort + appIndex + portOffset;
   }
   getCommandEnv(env: Record<string, string> = {}): Record<string, string> {
-    const basePort = 8282;
-    const portOffset = WorkspaceExecutor.getBaseDevEnv().portOffset;
-    const PORT = (basePort + portOffset).toString();
-    const AKAN_PUBLIC_SERVER_PORT = portOffset ? (8282 + portOffset).toString() : undefined;
+    const { portOffset } = WorkspaceExecutor.getBaseDevEnv();
+    const PORT = (8282 + portOffset).toString();
     return {
       ...process.env,
       AKAN_PUBLIC_APP_NAME: this.name,
@@ -1312,58 +1156,80 @@ export class AppExecutor extends SysExecutor {
       NODE_NO_WARNINGS: "1",
       PORT,
       AKAN_PUBLIC_CLIENT_PORT: PORT,
-      ...(AKAN_PUBLIC_SERVER_PORT ? { AKAN_PUBLIC_SERVER_PORT } : {}),
+      ...(portOffset ? { AKAN_PUBLIC_SERVER_PORT: PORT } : {}),
       ...env,
+    };
+  }
+  async getDatabaseModeEnv() {
+    const akanConfig = await this.getConfig();
+    return {
+      AKAN_DATABASE_MODE: akanConfig.resolveDatabaseMode(),
+      AKAN_DATABASE_MODES: akanConfig.database.modes.join(","),
     };
   }
   async prepareCommand(type: "build" | "start") {
     const akanConfig = await this.getConfig();
-    const databaseMode = process.env.AKAN_DATABASE_MODE ?? akanConfig.defaultDatabaseMode ?? "single";
     const routeEnv = {
       AKAN_PUBLIC_BASE_PATHS: [...akanConfig.basePaths].join(","),
-      AKAN_DATABASE_MODE: databaseMode,
+      AKAN_PUBLIC_API_PREFIX: akanConfig.api.prefix,
+      AKAN_PUBLIC_WS_PREFIX: akanConfig.api.websocketPrefix,
+      ...(await this.getDatabaseModeEnv()),
     };
     Object.assign(process.env, routeEnv);
     if (type === "build") {
-      //* `scanSync` already read the route set, and it reads it unfiltered — dev-only routes are still
-      //* generated against and typechecked. Drop the cache so the build phases re-read it without them.
+      //* `scanSync` read the route set unfiltered; drop the cache so build phases re-read it without dev-only routes.
       this.#excludeDevOnlyPages = true;
       this.#pageKeys = null;
-      if (await this.exists(this.dist.cwdPath)) await this.dist.exec(`rm -rf ${this.dist.cwdPath}`);
+      await this.dist.removeDir(this.dist.cwdPath);
       await Promise.all([this.dist.mkdir("private"), this.dist.mkdir("public")]);
-      //* Lib assets are symlinks in the app dir (see syncAssets). dist is the docker build context and the
-      //* release tarball root, neither of which follows a link out of itself, so materialize them here.
+      //* Lib assets are symlinks, which neither the docker context nor the release tarball follows out of dist.
+      //* Only the web router reads `public/`, so an api-only build leaves it out.
       await Promise.all([
         this.cp("private", `${this.dist.cwdPath}/private`, { dereference: true }),
-        this.cp("public", `${this.dist.cwdPath}/public`, { dereference: true }),
+        ...(akanConfig.web.ssr ? [this.cp("public", `${this.dist.cwdPath}/public`, { dereference: true })] : []),
       ]);
-    } else await this.removeDir(".akan");
+    } else {
+      await this.#removeDevOutput();
+      //? `akan start` keeps the full dev surface: the incremental builder is also the file watcher.
+      if (!akanConfig.web.ssr || !akanConfig.web.csr)
+        this.logger.verbose(
+          `akan.config.ts disables web.${!akanConfig.web.ssr ? "ssr" : "csr"}; \`akan start\` still serves it, \`akan build\` will not`,
+        );
+    }
+    //? Bun auto-loads `.env`, so NODE_ENV=production can arrive unexported and send the dev server to the production
+    //? route cache. Set on `process.env` because the builder runs here and bakes NODE_ENV into its bundles.
+    if (type === "start") process.env.NODE_ENV = "development";
     const devPort = type === "start" ? (await this.getDevPort()).toString() : undefined;
     const env = this.getCommandEnv({
       AKAN_COMMAND_TYPE: type,
       ...routeEnv,
       ...(devPort ? { PORT: devPort, AKAN_PUBLIC_CLIENT_PORT: devPort, AKAN_PUBLIC_SERVER_PORT: devPort } : {}),
     });
-    // `start` spawns subprocesses that carry `env`, but `build` runs its phases in this same process and
-    // reads `process.env` directly. Publish the resolved env here so SSR/CSR bundling (fed by getPublicEnv,
-    // which filters to AKAN_PUBLIC_*) sees AKAN_PUBLIC_APP_NAME — otherwise SSR throws
-    // "environment variable AKAN_PUBLIC_APP_NAME is required". Only AKAN_PUBLIC_* is baked into bundles, so
-    // this does not leak non-public env.
-    if (type === "build") Object.assign(process.env, env);
+    // `build` runs its phases in this process, so the env is published here (only AKAN_PUBLIC_* reaches bundles).
+    // Ports and the operation mode are dropped: `define` would bake them in and outrank the container's own values.
+    if (type === "build") {
+      const buildEnv = { ...env };
+      delete buildEnv.AKAN_PUBLIC_CLIENT_PORT;
+      delete buildEnv.AKAN_PUBLIC_SERVER_PORT;
+      delete buildEnv.AKAN_PUBLIC_OPERATION_MODE;
+      delete process.env.AKAN_PUBLIC_OPERATION_MODE;
+      Object.assign(process.env, buildEnv);
+    }
     return { env };
   }
   #publicEnv: Record<string, string> | null = null;
   getPublicEnv(...patterns: string[]) {
     if (this.#publicEnv) return this.#publicEnv;
     const searchPatterns = [...patterns, "AKAN_PUBLIC_*"];
-    const regexes = searchPatterns.map((pattern) => {
-      let body = "";
-      for (const ch of pattern) {
-        if (ch === "*") body += ".*";
-        else body += ch.replace(/[.+^${}()|[\]\\?]/g, "\\$&");
-      }
-      return new RegExp(`^${body}$`);
-    });
+    const regexes = searchPatterns.map(
+      (pattern) =>
+        new RegExp(
+          `^${pattern
+            .split("*")
+            .map((part) => part.replace(/[.+^${}()|[\]\\?]/g, "\\$&"))
+            .join(".*")}$`,
+        ),
+    );
     const publicEnv: Record<string, string> = {};
     for (const [k, v] of Object.entries(process.env)) {
       if (typeof v !== "string") continue;
@@ -1376,14 +1242,11 @@ export class AppExecutor extends SysExecutor {
   #akanConfig: AkanAppConfig | null = null;
   override async getConfig({ refresh }: { refresh?: boolean } = {}) {
     if (this.#akanConfig && !refresh) return this.#akanConfig;
-    // A refresh means the config file may have been edited; bust the import cache so the fresh
-    // module is evaluated instead of Bun's cached instance.
     this.#akanConfig = await AkanAppConfig.from(this, { bustImportCache: refresh });
     return this.#akanConfig;
   }
 
   #pageKeys: string[] | null = null;
-  /** Set once `prepareCommand("build")` runs, so every later consumer of the route set agrees on it. */
   #excludeDevOnlyPages = false;
   async getPageKeys({ refresh }: { refresh?: boolean } = {}): Promise<string[]> {
     if (this.#pageKeys && !refresh) return this.#pageKeys;
@@ -1393,7 +1256,9 @@ export class AppExecutor extends SysExecutor {
     const owners = new Map<string, { absPath: string; fromLib: boolean }>();
     const devOnlyKeys = new Set<string>();
     const devOnlyDirs: string[] = [];
-    for (const root of await this.getPageRoots()) {
+    const pageRoots = await this.getPageRoots();
+    const libKeyPrefixes = pageRoots.map((root) => root.keyPrefix).filter(Boolean);
+    for (const root of pageRoots) {
       if (!(await FileSys.dirExists(root.dir))) continue;
       for await (const rel of glob.scan({
         cwd: root.dir,
@@ -1403,6 +1268,8 @@ export class AppExecutor extends SysExecutor {
         const segments = rel.split(path.sep);
         if (segments.some((s) => s === "node_modules")) continue;
         const posix = `${root.keyPrefix}${segments.join("/")}`;
+        //* A lib folder that is a copy rather than a link (the Windows fallback) is walked into from `page` too.
+        if (!root.keyPrefix && libKeyPrefixes.some((prefix) => posix.startsWith(prefix))) continue;
         const absPath = path.join(root.dir, ...segments);
         validatePageSourceFile(posix, { filePath: absPath });
         if (!isRouteSourceFile(posix)) continue;
@@ -1418,8 +1285,7 @@ export class AppExecutor extends SysExecutor {
         const fromLib = !!root.keyPrefix;
         const routeId = `${parsed.kind}:${parsed.pattern}`;
         const owner = owners.get(routeId);
-        //* App-owned routes have always been allowed to collide (two groups, one pattern); only report a
-        //* collision once a synced lib is involved, where neither side can see the other.
+        //* App-owned routes may collide (two groups, one pattern); a synced lib cannot see the other side.
         if (owner && (owner.fromLib || fromLib)) {
           throw new Error(
             `[route-convention] duplicate ${parsed.kind} route "${parsed.pattern}" in app "${this.name}":\n- ${owner.absPath}\n- ${absPath}`,
@@ -1434,11 +1300,11 @@ export class AppExecutor extends SysExecutor {
         else {
           const info = validator.validateRouteSourceExports(routeSource, absPath, parsed.kind, {
             rootLayout: isRootLayout,
+            pattern: parsed.pattern,
           });
           if (info.devOnly) {
             devOnlyKeys.add(key);
-            //* A layout owns its directory, so a dev-only one takes the whole subtree with it — leaving its
-            //* pages behind would ship them stripped of the chrome they were written under.
+            //* A dev-only layout takes its whole subtree, or its pages would ship without their chrome.
             if (parsed.kind === "layout") devOnlyDirs.push(key.replace(/[^/]+$/, ""));
           }
         }
@@ -1456,12 +1322,7 @@ export class AppExecutor extends SysExecutor {
     this.verbose(`[route] excluded ${dropped.length} dev-only route file(s) from the build: ${dropped.join(", ")}`);
     return pageKeys.filter((key) => !isDevOnly(key));
   }
-  /**
-   * Every directory that contributes route files, as `page`-relative key prefixes. Lib roots are the
-   * symlinks `syncPages` created, so route keys stay app-relative while `realDir` is what a file watcher
-   * reports. Enumeration never crosses a symlink (neither Bun's glob nor TypeScript's `include` does),
-   * which is why linked page folders have to be listed here instead of found by walking `page`.
-   */
+  /** Lib roots are the `syncPages` symlinks, listed because neither Bun's glob nor TS `include` crosses one. */
   async getPageRoots(): Promise<PageRoot[]> {
     const akanConfig = await this.getConfig();
     const pageDir = `${this.cwdPath}/page`;
@@ -1482,18 +1343,16 @@ export class AppExecutor extends SysExecutor {
   }
 
   static readonly #pageLibsDir = "(libs)";
-  /** Where `(libs)` may live: once at the page root, or once per basePath when the app declares subRoutes. */
   static #pageLibParents(basePaths: Iterable<string>): string[] {
     const parents = [...basePaths].map((basePath) => `${basePath}/`);
     return parents.length ? parents : [""];
   }
-  /** Returns whether the linked page set changed, which is what makes the app's route keys stale. */
+  /** Whether the linked page set changed, which makes the app's route keys stale. */
   async syncPages(libDeps: string[]): Promise<boolean> {
     const akanConfig = await this.getConfig();
     const parents = AppExecutor.#pageLibParents(akanConfig.basePaths);
     const libs = await this.#resolvePageLibs(akanConfig.syncPageLibs, libDeps);
-    //* Listed rather than taken from `getPageRoots`, which drops links whose target is gone — those are
-    //* exactly the ones a sync has to clean up.
+    //* Not `getPageRoots`: it drops links whose target is gone, exactly the ones a sync must clean up.
     const linked = (
       await Promise.all(
         parents.map(async (parent) => {
@@ -1504,7 +1363,11 @@ export class AppExecutor extends SysExecutor {
       )
     ).flat();
     const wanted = parents.flatMap((parent) => libs.map((lib) => `${parent}${AppExecutor.#pageLibsDir}/(${lib})/`));
-    if (linked.sort().join(",") === wanted.sort().join(",")) return false;
+    //* A copy — the Windows fallback when a junction is refused — does not follow its lib, so only links are current.
+    const isLink = async (key: string) =>
+      (await lstat(`${this.cwdPath}/page/${key.slice(0, -1)}`).catch(() => null))?.isSymbolicLink() ?? false;
+    if (linked.sort().join(",") === wanted.sort().join(",") && (await Promise.all(linked.map(isLink))).every(Boolean))
+      return false;
     await Promise.all(
       parents.map((parent) => this.removeDir(`${this.cwdPath}/page/${parent}${AppExecutor.#pageLibsDir}`)),
     );
@@ -1559,8 +1422,7 @@ export class AppExecutor extends SysExecutor {
     );
   }
   static async #linkLibAsset(targetPath: string, linkPath: string) {
-    //* A relative link keeps working when the workspace is mounted at another path (containers, CI);
-    //* Windows junctions are the exception and resolve their target as an absolute path.
+    //* Relative, so it survives a remount (containers, CI); a Windows junction needs an absolute target.
     const isWindows = process.platform === "win32";
     try {
       const target = isWindows ? targetPath : path.relative(path.dirname(linkPath), targetPath);
@@ -1584,8 +1446,6 @@ export class AppExecutor extends SysExecutor {
     if (write) await this.#runPluginSyncAssets();
     return scanInfo;
   }
-  //* build-time asset generation is delegated to plugins (e.g. the push plugin writes
-  //* public/firebase-messaging-sw.js). The framework itself no longer knows about firebase.
   async #runPluginSyncAssets() {
     const plugins = await this.collectPlugins();
     if (!plugins.some((plugin) => plugin.syncAssets)) return;
@@ -1599,6 +1459,7 @@ export class AppExecutor extends SysExecutor {
       executor: this,
       getPath: (rel) => this.getPath(rel),
       fileExists: (rel) => FileSys.fileExists(this.getPath(rel)),
+      readFile: (rel) => this.readFile(rel),
       writeFile: async (rel, content, opts) => {
         await this.writeFile(rel, content, opts);
       },
@@ -1616,8 +1477,6 @@ export class AppExecutor extends SysExecutor {
       },
     };
   }
-  //* Aggregate plugins declared by this app's akan.config plus each of its lib dependencies'
-  //* akan.config. This is how a lib (e.g. libs/util) opts an app into a feature turnkey.
   async collectPlugins(): Promise<AkanPlugin[]> {
     const scanInfo = (await this.scan({ write: false })) as AppInfo;
     const libDeps = scanInfo.getLibs();
@@ -1636,17 +1495,6 @@ export class AppExecutor extends SysExecutor {
       return true;
     });
   }
-  async getPluginRuntimePackages(): Promise<string[]> {
-    const plugins = await this.collectPlugins();
-    const appConfig = await this.getConfig();
-    const ctx: PluginRuntimeContext = {
-      appName: this.name,
-      mobile: appConfig.mobile,
-      hasMobilePermission: (permission) =>
-        Object.values(appConfig.mobile.targets).some((target) => target.permissions?.includes(permission) ?? false),
-    };
-    return [...new Set(plugins.flatMap((plugin) => plugin.runtimePackages?.(ctx) ?? []))];
-  }
   async increaseBuildNum() {
     await increaseBuildNum(this);
   }
@@ -1654,58 +1502,44 @@ export class AppExecutor extends SysExecutor {
     await decreaseBuildNum(this);
   }
 }
-interface LibExecutorOptions {
-  workspace?: WorkspaceExecutor;
-  name: string;
-}
 export class LibExecutor extends SysExecutor {
   dist: Executor;
   override emoji = execEmoji.lib;
-  constructor({ workspace, name }: LibExecutorOptions) {
+  constructor({ workspace, name }: NamedExecutorOptions) {
     super({ workspace, name, type: "lib" });
     this.dist = new Executor(`dist/${name}`, `${this.workspace.workspaceRoot}/dist/libs/${name}`);
   }
-  static #execs = new Map<string, LibExecutor>();
   static from(executor: SysExecutor | WorkspaceExecutor, name: string) {
-    const exec = LibExecutor.#execs.get(name);
-    if (exec) return exec;
-    else if (executor instanceof WorkspaceExecutor) return new LibExecutor({ workspace: executor, name });
-    else return new LibExecutor({ workspace: executor.workspace, name });
+    return new LibExecutor({ workspace: executor instanceof WorkspaceExecutor ? executor : executor.workspace, name });
   }
 
   #akanConfig: AkanLibConfig | null = null;
   override async getConfig({ refresh }: { refresh?: boolean } = {}) {
     if (this.#akanConfig && !refresh) return this.#akanConfig;
-    this.#akanConfig = await AkanLibConfig.from(this);
+    this.#akanConfig = await AkanLibConfig.from(this, { bustImportCache: refresh });
     return this.#akanConfig;
   }
 }
 
-interface PkgExecutorOptions {
-  workspace?: WorkspaceExecutor;
-  name: string;
-}
 export class PkgExecutor extends Executor {
   workspace: WorkspaceExecutor;
   override name: string;
   dist: Executor;
   override emoji = execEmoji.pkg;
-  constructor({ workspace = WorkspaceExecutor.fromRoot(), name }: PkgExecutorOptions) {
+  constructor({ workspace = WorkspaceExecutor.fromRoot(), name }: NamedExecutorOptions) {
     super(name, `${workspace.workspaceRoot}/pkgs/${name}`);
     this.workspace = workspace;
     this.name = name;
     this.dist = new Executor(`dist/${name}`, `${this.workspace.workspaceRoot}/dist/pkgs/${name}`);
   }
   static from(executor: SysExecutor | WorkspaceExecutor, name: string) {
-    if (executor instanceof WorkspaceExecutor) return new PkgExecutor({ workspace: executor, name });
-    return new PkgExecutor({ workspace: executor.workspace, name });
+    return new PkgExecutor({ workspace: executor instanceof WorkspaceExecutor ? executor : executor.workspace, name });
   }
 
   #scanInfo: PkgInfo | null = null;
   async scan({ refresh }: { refresh?: boolean } = {}): Promise<PkgInfo> {
     if (this.#scanInfo && !refresh) return this.#scanInfo;
     const scanInfo = await PkgInfo.fromExecutor(this, { refresh });
-    // this.writeJson("akan.pkg.json", pkgScanResult);
     this.#scanInfo = scanInfo;
     return scanInfo;
   }
@@ -1716,6 +1550,9 @@ export class PkgExecutor extends Executor {
     };
     const rootVersion = rootDeps[dep];
     if (rootVersion) return rootVersion;
+    // Overrides never reach a consumer's install, so a pinned transitive dep is published as a dependency.
+    const overrideVersion = rootPackageJson.overrides?.[dep];
+    if (typeof overrideVersion === "string") return overrideVersion;
 
     try {
       const packageJsonPath = `pkgs/${dep}/package.json`;
@@ -1743,17 +1580,9 @@ export class PkgExecutor extends Executor {
     if (missingDeps.length > 0)
       throw new Error(`Missing dependency versions in root package.json: ${missingDeps.join(", ")}`);
 
-    const toDependencyEntries = (names: string[]) =>
-      names.map((dep) => {
-        const version = dependencyVersions.get(dep);
-        if (!version) throw new Error(`Missing dependency versions in root package.json: ${dep}`);
-        return [dep, version] as const;
-      });
-
-    return {
-      dependencies: Object.fromEntries(toDependencyEntries(dependencyNames)),
-      devDependencies: Object.fromEntries(toDependencyEntries(devDependencyNames)),
-    };
+    const toDependencyMap = (names: string[]) =>
+      Object.fromEntries(names.map((dep) => [dep, dependencyVersions.get(dep) as string]));
+    return { dependencies: toDependencyMap(dependencyNames), devDependencies: toDependencyMap(devDependencyNames) };
   }
   async updatePackageJsonDependencies(
     dependencies: string[] = [],
@@ -1782,7 +1611,7 @@ export class PkgExecutor extends Executor {
           default: "./index.ts",
         },
       },
-      engines: { bun: ">=1.3.13" },
+      engines: { bun: ">=1.4.0" },
       ...dependencyMaps,
     };
     await Promise.all([this.dist.writeJson("package.json", distPkgJson), this.writeJson("package.json", distPkgJson)]);

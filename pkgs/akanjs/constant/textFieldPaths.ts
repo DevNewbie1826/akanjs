@@ -18,8 +18,7 @@ export class TextFieldPaths extends TextFieldPathSet {
         this.#assertIndexable(key, field.text, field);
         this[field.text].add(key);
       }
-      // Scalar children are embedded in `_doc`, so their paths stay addressable. A relation stores only an id, so
-      // recursing into one yields paths that never exist in the stored document.
+      // A scalar child is embedded in `_doc`, so its paths stay addressable; a relation stores only an id.
       if (field.isClass && field.isScalar) this.#mergeChild(key, field);
     }
     return this;
@@ -35,21 +34,24 @@ export class TextFieldPaths extends TextFieldPathSet {
     }
   }
 
-  // A child path reaches the mirror through its parent, so an unreadable or unaddressable parent has to fail the
-  // class build the same way the leaf itself would. Checking only the leaf leaves the secret's own subtree open:
-  // `_doc` stores a secret in plaintext, so every text field under it would be published through search.
+  // `_doc` stores a secret in plaintext, so a text field under a masked parent would publish it through search.
   #assertReachable(path: string, parent: ConstantField) {
-    if (parent.fieldType === "secret") throw new Error(`Text field "${path}" is under a secret field`);
-    if (parent.fieldType === "hidden") throw new Error(`Text field "${path}" is under a hidden field`);
-    if (parent.fieldType === "resolve") throw new Error(`Text field "${path}" is under a resolved field`);
+    const fix = `Drop the text role on "${path}", or leave the parent unmasked.`;
+    if (parent.fieldType === "secret") throw new Error(`Text field "${path}" is under a secret field. ${fix}`);
+    if (parent.fieldType === "hidden") throw new Error(`Text field "${path}" is under a hidden field. ${fix}`);
+    if (parent.fieldType === "resolve") throw new Error(`Text field "${path}" is under a resolved field. ${fix}`);
     if (parent.arrDepth > 1) throw new Error(`Text field "${path}" is under a nested array and cannot be indexed`);
   }
 
   #assertIndexable(key: string, role: TextFieldRole, field: ConstantField) {
-    // A secret field reaching the mirror would surface it in every search result, so fail the class build instead.
-    if (field.fieldType === "secret") throw new Error(`Text field "${key}" is secret and must not be indexed`);
-    if (field.fieldType === "hidden") throw new Error(`Text field "${key}" is hidden and must not be indexed`);
-    if (field.fieldType === "resolve") throw new Error(`Text field "${key}" is resolved and is absent from _doc`);
+    // Backstop for the option type's refusal, for an option object the excess-property check cannot see through.
+    const masked = `The search mirror stores plaintext. Drop the text role on "${key}", or make the field plain.`;
+    if (field.fieldType === "secret")
+      throw new Error(`Text field "${key}" is secret and must not be indexed. ${masked}`);
+    if (field.fieldType === "hidden")
+      throw new Error(`Text field "${key}" is hidden and must not be indexed. ${masked}`);
+    if (field.fieldType === "resolve")
+      throw new Error(`Text field "${key}" is resolved and is absent from _doc. Drop the text role on "${key}".`);
     if (field.isMap) throw new Error(`Text field "${key}" is a Map and cannot be indexed`);
     if (field.arrDepth > 1) throw new Error(`Text field "${key}" is a nested array and cannot be indexed`);
     const modelRef = field.modelRef as unknown as Cls;

@@ -1,9 +1,9 @@
+import path from "node:path";
 import type { Dayjs } from "dayjs";
-import type { SupportedLlmModel } from "../aiEditor";
 import { GlobalConfig } from "./globalConfig";
 
-export const basePath = `${Bun.env.HOME ?? Bun.env.USERPROFILE}/.akan`;
-export const configPath = `${basePath}/config.json`;
+export const basePath = path.join(Bun.env.HOME ?? Bun.env.USERPROFILE ?? "", ".akan");
+export const configPath = path.join(basePath, "config.json");
 
 export interface HostConfig {
   host: string;
@@ -25,15 +25,36 @@ export interface RemoteEnvServerConfig {
   username?: string;
   port?: number;
 }
+export type PlatformGatePolicy = "gate" | "warn";
+export interface LinuxTestTargetConfig {
+  cpus?: number;
+  memory?: string;
+  policy?: PlatformGatePolicy;
+}
+export interface WindowsTestTargetConfig {
+  host: string;
+  user: string;
+  identityFile: string;
+  knownHostsFile?: string;
+  utmVm?: string;
+  workRoot?: string;
+  tolerateScriptFailures?: string[];
+  policy?: PlatformGatePolicy;
+  greenStreak?: number;
+}
+export interface TestTargetsConfig {
+  linux?: LinuxTestTargetConfig;
+  windows?: WindowsTestTargetConfig;
+}
 export interface AkanGlobalConfig {
   cloudHost: { [key: string]: HostConfigDto };
   remoteEnvServers: Record<string, RemoteEnvServerConfig>;
-  llm: { model: SupportedLlmModel; apiKey: string } | null;
+  testTargets: TestTargetsConfig;
 }
 export const defaultAkanGlobalConfig: AkanGlobalConfig = {
   cloudHost: {},
   remoteEnvServers: {},
-  llm: null,
+  testTargets: {},
 };
 
 export interface AccessTokenDto {

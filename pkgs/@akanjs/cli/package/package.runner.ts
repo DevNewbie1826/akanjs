@@ -44,35 +44,53 @@ export class PackageRunner extends runner("package") {
     throw new Error(`[package] failed to locate akanjs package.json from ${path.dirname(Bun.main)}`);
   }
   async createPackage(workspace: Workspace, pkgName: string) {
-    await workspace.applyTemplate({ basePath: `pkgs/${pkgName}`, template: "pkgRoot", dict: { pkgName } });
+    const workspaceRootPath = ["pkgs", ...pkgName.split("/")].map(() => "..").join("/");
+    await workspace.applyTemplate({
+      basePath: `pkgs/${pkgName}`,
+      template: "pkgRoot",
+      dict: { pkgName, workspaceRootPath },
+    });
     await workspace.setPkgTsPaths(pkgName);
   }
   async removePackage(pkg: Pkg) {
-    await pkg.workspace.exec(`rm -rf pkgs/${pkg.name}`);
+    await pkg.workspace.removeDir(`pkgs/${pkg.name}`);
     await pkg.workspace.unsetPkgTsPaths(pkg.name);
   }
   async scanSync(pkg: Pkg) {
-    const scanResult = await pkg.scan();
-    return scanResult;
+    return await pkg.scan();
   }
   async buildPackage(pkg: Pkg) {
     await $`rm -rf ${pkg.dist.cwdPath}`;
     await pkg.dist.mkdir(pkg.dist.cwdPath);
     const scanner = await TypeScriptDependencyScanner.from(pkg);
     const { npmDeps, npmDevDeps, missingDeps } = await scanner.getPackageBuildDependencies(pkg.name);
+    // The pi packages are pinned here: Bun applies neither pi-coding-agent's `npm-shrinkwrap.json` nor our
+    // `overrides` to a consumer's install, and a published dependency is the only pin its resolver honours.
     const packageRuntimeDependencies: Record<string, string[]> = {
-      "@akanjs/devkit": ["daisyui", "tailwind-scrollbar"],
+      "@akanjs/devkit": [
+        "tailwind-scrollbar",
+        "@earendil-works/chord",
+        "@earendil-works/pi-agent-core",
+        "@earendil-works/pi-ai",
+        "@earendil-works/pi-telemetry",
+        "@earendil-works/pi-tui",
+      ],
     };
     const packageRuntimeDevDependencies: Record<string, string[]> = { akanjs: ["@biomejs/biome", "@types/bun"] };
     if (pkg.name === "@akanjs/cli") {
       const devkitPackageJson = await pkg.workspace.readJson("pkgs/@akanjs/devkit/package.json");
       packageRuntimeDependencies[pkg.name] = [
         ...Object.keys(((devkitPackageJson as PackageJson).dependencies ?? {}) as Record<string, string>),
-        "daisyui",
         "tailwind-scrollbar",
       ].filter((dep) => dep !== "akanjs" && dep !== "@akanjs/devkit");
     }
-    const bundledRuntimeDeps = new Set(pkg.name === "@akanjs/cli" ? ["@akanjs/devkit"] : []);
+    // Embedded into the dist, so naming them as dependencies would point a consumer at a missing registry entry.
+    const packageBundledRuntimeDependencies: Record<string, string[]> = {
+      "@akanjs/cli": ["@akanjs/devkit", "@akanjs/native"],
+      "@akanjs/devkit": ["@akanjs/native"],
+      akanjs: ["use-agentic", "@akanjs/native"],
+    };
+    const bundledRuntimeDeps = new Set(packageBundledRuntimeDependencies[pkg.name] ?? []);
     const forcedRuntimeDeps = packageRuntimeDependencies[pkg.name] ?? [];
     const forcedRuntimeDevDeps = packageRuntimeDevDependencies[pkg.name] ?? [];
     const [rootPackageJson, pkgJson] = await Promise.all([pkg.workspace.getPackageJson(), pkg.getPackageJson()]);
@@ -81,13 +99,14 @@ export class PackageRunner extends runner("package") {
         .filter(([, meta]) => meta.optional)
         .map(([dep]) => dep),
     );
-    const packageRuntimeDeps = [...new Set([...npmDeps, ...forcedRuntimeDeps])].filter(
-      (dep) => !optionalPeerDeps.has(dep) && !bundledRuntimeDeps.has(dep),
-    );
-    const packageRuntimeDevDeps = [...new Set([...npmDevDeps, ...forcedRuntimeDevDeps])].filter(
-      (dep) => !optionalPeerDeps.has(dep),
-    );
-    const rootDeps = { ...rootPackageJson.dependencies, ...rootPackageJson.devDependencies };
+    const isShipped = (dep: string) => !optionalPeerDeps.has(dep) && !bundledRuntimeDeps.has(dep);
+    const packageRuntimeDeps = [...new Set([...npmDeps, ...forcedRuntimeDeps])].filter(isShipped);
+    const packageRuntimeDevDeps = [...new Set([...npmDevDeps, ...forcedRuntimeDevDeps])].filter(isShipped);
+    const rootDeps = {
+      ...rootPackageJson.overrides,
+      ...rootPackageJson.dependencies,
+      ...rootPackageJson.devDependencies,
+    };
     const missingForcedDeps = forcedRuntimeDeps.filter((dep) => !rootDeps[dep]);
     const missingForcedDevDeps = forcedRuntimeDevDeps.filter((dep) => !rootDeps[dep]);
     const requiredMissingDeps = missingDeps.filter((dep) => !optionalPeerDeps.has(dep));
@@ -107,7 +126,8 @@ export class PackageRunner extends runner("package") {
         stdio: "inherit",
       });
     } else {
-      await $`cp -r ${pkg.cwdPath}/. ${pkg.dist.cwdPath}`;
+      await pkg.dist.cp(pkg.cwdPath, pkg.dist.cwdPath);
+      await $`rm -rf ${pkg.dist.cwdPath}/local`;
       await Promise.all([
         pkg.generateDistPackageJson(packageRuntimeDeps, packageRuntimeDevDeps),
         pkg.generateTsconfigJson(),
@@ -121,7 +141,6 @@ export class PackageRunner extends runner("package") {
   /** Matches the tail of the text preceding a specifier when that specifier is actually imported. */
   static readonly #importPosition = /(?:\bfrom\s*|\brequire\s*\(\s*|\bimport\s*\(\s*|\bimport\s+)$/;
 
-  /** Splits `akanjs/server/akanApp` into the package name and the `exports` subpath to look up. */
   static #splitSpecifier(specifier: string) {
     const segments = specifier.split("/");
     const name = specifier.startsWith("@") ? segments.slice(0, 2).join("/") : segments[0];
@@ -129,14 +148,7 @@ export class PackageRunner extends runner("package") {
     return { name, subpath: subpath ? `./${subpath}` : "." };
   }
 
-  /**
-   * Collects every specifier the dist tree imports from `packageNames`, mapped to the importing files.
-   *
-   * Only import positions in non-test files count. Test files are skipped because the transform suites
-   * carry specifiers as fixture *data* (`"akanjs/server/akanApp"`, `"akanjs/ui/*"`) that never resolve
-   * and never run for a consumer, and whole-line comments are skipped because this package documents
-   * subpath imports in prose.
-   */
+  // Test files carry specifiers as fixture data, and comment lines document subpath imports in prose: both skipped.
   async #collectDistAkanImports(distPath: string, packageNames: Iterable<string>) {
     const alternatives = [...new Set(packageNames)].map((name) => name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
     const specifierPattern = new RegExp(`["'](${alternatives.join("|")})((?:/[^"'\\s]*)?)["']`, "g");
@@ -160,16 +172,8 @@ export class PackageRunner extends runner("package") {
     return imports;
   }
 
-  /**
-   * Fails when the dist tree imports a subpath of itself, or of a sibling akan package, that the
-   * corresponding `exports` map cannot reach.
-   *
-   * This is the check that `"exports": { "./*": "./*" }` in `@akanjs/devkit` needed and did not have.
-   * Exports targets are matched exactly — no extension appended, no `index.ts` probed — so every
-   * subpath import in the published package failed at runtime while `tsc`, the bundle, and the whole
-   * test suite stayed green, because inside the monorepo those specifiers resolve through tsconfig
-   * `paths` instead. Nothing short of resolving against the built manifest can see the difference.
-   */
+  // Exports targets match exactly (no extension appended, no `index.ts` probed), and tsconfig `paths` hide a miss
+  // inside the monorepo, so only resolving against the built manifest catches an unreachable subpath.
   async #verifyDistExportsReachable(pkg: Pkg, peerExportsMaps: Map<string, PackageExportsMap>) {
     const exportsMaps = new Map(peerExportsMaps).set(pkg.name, await PackageExportsMap.from(pkg.dist.cwdPath));
     const imports = await this.#collectDistAkanImports(pkg.dist.cwdPath, exportsMaps.keys());
@@ -212,15 +216,12 @@ export class PackageRunner extends runner("package") {
       throw new Error(`[package] dist package name mismatch: expected ${pkg.name}, got ${pkgJson.name ?? "(missing)"}`);
     }
     if (!pkgJson.version) throw new Error(`[package] dist package version is missing for ${pkg.name}`);
-    if (!pkgJson.publishConfig || pkgJson.publishConfig.access !== "public") {
+    if (pkgJson.publishConfig?.access !== "public") {
       throw new Error(`[package] ${pkg.name} must publish with publishConfig.access=public`);
     }
-    if (!(await Bun.file(`${pkg.dist.cwdPath}/README.md`).exists())) {
-      throw new Error(`[package] README.md is missing from dist package ${pkg.name}`);
-    }
-    if (!(await Bun.file(`${pkg.dist.cwdPath}/README.ko.md`).exists())) {
-      throw new Error(`[package] README.ko.md is missing from dist package ${pkg.name}`);
-    }
+    for (const readme of ["README.md", "README.ko.md"])
+      if (!(await Bun.file(`${pkg.dist.cwdPath}/${readme}`).exists()))
+        throw new Error(`[package] ${readme} is missing from dist package ${pkg.name}`);
     const binEntries =
       typeof pkgJson.bin === "string" ? [pkgJson.bin] : Object.values((pkgJson.bin ?? {}) as Record<string, string>);
     if (binEntries.some((binPath) => binPath.endsWith(".ts"))) {
@@ -237,7 +238,10 @@ export class PackageRunner extends runner("package") {
     const packOutput = await pkg.workspace.spawn("npm", ["pack", "--dry-run", "--json", pkg.dist.cwdPath], {
       cwd: pkg.workspace.workspaceRoot,
     });
-    const [packResult] = JSON.parse(packOutput) as Array<{ files?: unknown[]; size?: number }>;
+    const [packResult] = JSON.parse(packOutput) as Array<{ files?: { path?: string }[]; size?: number }>;
+    const localFiles = (packResult?.files ?? []).filter((file) => file.path?.startsWith("local/"));
+    if (localFiles.length > 0)
+      throw new Error(`[package] ${pkg.name} would publish ${localFiles.length} test-run files under local/`);
     return {
       name: pkg.name,
       version: pkgJson.version,
@@ -255,9 +259,7 @@ export class PackageRunner extends runner("package") {
       peerExportsMaps.set(pkg.name, await PackageExportsMap.from(pkg.dist.cwdPath));
     }
     const results = [];
-    for (const pkg of pkgs) {
-      results.push(await this.verifyDistPackage(pkg, { peerExportsMaps }));
-    }
+    for (const pkg of pkgs) results.push(await this.verifyDistPackage(pkg, { peerExportsMaps }));
     return results;
   }
 

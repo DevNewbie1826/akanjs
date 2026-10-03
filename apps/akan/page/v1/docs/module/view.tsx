@@ -1,8 +1,9 @@
 import { usePage } from "@apps/akan/client";
 import { Code, Docs, type IntroItem } from "@apps/akan/ui";
 import { Scroll } from "@libs/util/ui";
+import { page } from "akanjs/client";
 
-export default function ViewDocsPage() {
+export default page().render(() => {
   const { l } = usePage();
 
   const comparisonItems: IntroItem[] = [
@@ -51,7 +52,7 @@ export default function ViewDocsPage() {
           </div>
         </Docs.Description>
       </Scroll.Slide>
-      <div className="divider" />
+      <div className="my-4 h-px w-full bg-border" />
 
       <Scroll.Slide id="comparison" title={l.trans({ en: "View vs Unit", ko: "View vs Unit" })}>
         <Docs.SubTitle>
@@ -68,7 +69,7 @@ export default function ViewDocsPage() {
         </Docs.Description>
         <Docs.IntroTable type="Comparison" items={comparisonItems} />
       </Scroll.Slide>
-      <div className="divider" />
+      <div className="my-4 h-px w-full bg-border" />
 
       <Scroll.Slide id="file-location" title={l.trans({ en: "File Location", ko: "파일 위치" })}>
         <Docs.Title>{l.trans({ en: "File Location", ko: "파일 위치" })}</Docs.Title>
@@ -85,7 +86,7 @@ apps/
           `}
         />
       </Scroll.Slide>
-      <div className="divider" />
+      <div className="my-4 h-px w-full bg-border" />
 
       <Scroll.Slide id="implementation" title={l.trans({ en: "Implementation", ko: "구현" })}>
         <Docs.Title>{l.trans({ en: "Implementation", ko: "구현" })}</Docs.Title>
@@ -150,7 +151,7 @@ export const General = ({ className, product }: GeneralProps) => {
            <div className="space-y-4">
              <h3>{l("product.options")}</h3>
              {product.options.map(option => (
-               <div key={option.name} className="p-4 bg-base-200 rounded-lg">
+               <div key={option.name} className="p-4 bg-muted rounded-lg">
                  {option.name}: {option.values.join(", ")}
                </div>
              ))}
@@ -168,7 +169,7 @@ export const General = ({ className, product }: GeneralProps) => {
           `}
         />
       </Scroll.Slide>
-      <div className="divider" />
+      <div className="my-4 h-px w-full bg-border" />
 
       <Scroll.Slide id="usage" title={l.trans({ en: "Usage in Detail Pages", ko: "상세 페이지에서의 사용" })}>
         <Docs.Title>{l.trans({ en: "Usage in Detail Pages", ko: "상세 페이지에서의 사용" })}</Docs.Title>
@@ -222,7 +223,7 @@ export default function Page({ params }: PageProps) {
           `}
         />
       </Scroll.Slide>
-      <div className="divider" />
+      <div className="my-4 h-px w-full bg-border" />
 
       <Scroll.Slide id="load-view" title={l.trans({ en: "Load.View", ko: "Load.View" })}>
         <Docs.Title>{l.trans({ en: "Load.View", ko: "Load.View" })}</Docs.Title>
@@ -273,7 +274,7 @@ export const View = ({ className, view }: ViewProps) => {
           `}
         />
       </Scroll.Slide>
-      <div className="divider" />
+      <div className="my-4 h-px w-full bg-border" />
 
       <Scroll.Slide id="composition" title={l.trans({ en: "Composition Strategy", ko: "구성 전략" })}>
         <Docs.Title>{l.trans({ en: "Composition Strategy", ko: "구성 전략" })}</Docs.Title>
@@ -285,14 +286,14 @@ export const View = ({ className, view }: ViewProps) => {
         </Docs.Description>
 
         <div className="mt-6 grid grid-cols-1 gap-4">
-          <div className="rounded-xl border bg-base-100 p-4">
+          <div className="rounded-xl border bg-background p-4">
             <div className="mb-2 font-bold text-lg">View (Parent)</div>
             <div className="text-sm opacity-70">
               {l.trans({ en: "Layouts, Structural grids, Headings", ko: "레이아웃, 구조적 그리드, 제목" })}
             </div>
           </div>
           <div className="flex flex-col items-center justify-center text-2xl opacity-30">⬇️</div>
-          <div className="rounded-xl border bg-base-100 p-4">
+          <div className="rounded-xl border bg-background p-4">
             <div className="mb-2 font-bold text-lg">Children</div>
             <div className="text-sm opacity-70">
               <ul className="list-disc space-y-1 pl-4">
@@ -314,7 +315,7 @@ export const View = ({ className, view }: ViewProps) => {
         </div>
       </Scroll.Slide>
 
-      <Scroll.TitleNavigator className="fixed top-32 right-0 hidden w-[250px] flex-col gap-2 lg:flex" />
+      <Scroll.TitleNavigator className="fixed top-32 right-0 hidden w-[250px] flex-col gap-2 xl:flex" />
     </Scroll>
   );
-}
+});

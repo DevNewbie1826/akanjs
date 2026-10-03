@@ -2,6 +2,7 @@ import type {
   App,
   ArgMeta,
   ArgsOption,
+  ArgType,
   CommandContext,
   Exec,
   InternalArgMeta,
@@ -13,9 +14,14 @@ import type {
   Sys,
 } from "./argMeta";
 import { normalizePrimitiveArgType } from "./argMeta";
-import { assertUniqueDependencies, type DependencyInstanceMap, injectDependencies } from "./dependencyBuilder";
+import {
+  assertUniqueDependencies,
+  type DependencyCls,
+  type DependencyInstanceMap,
+  type DependencyKey,
+  injectDependencies,
+} from "./dependencyBuilder";
 import { COMMAND_META, type CommandCls, type TargetMeta, type TargetOption } from "./targetMeta";
-import type { DependencyCls, DependencyKey } from "./types";
 
 type PrimitiveValue<T extends PrimitiveArgType> = T extends StringConstructor
   ? string
@@ -23,9 +29,20 @@ type PrimitiveValue<T extends PrimitiveArgType> = T extends StringConstructor
     ? number
     : boolean;
 type MaybeNullable<Value, Option> = Option extends { nullable: true } ? Value | null : Value;
+// A DynamicEnum yields never (a function is no readonly array), so ArgValue falls back to the primitive type.
+type EnumValue<Option> = Option extends { enum: infer Choices }
+  ? Choices extends readonly (infer Choice)[]
+    ? Choice extends { value: infer Value }
+      ? Value
+      : Choice
+    : never
+  : never;
+type ArgValue<Type extends PrimitiveArgType, Option> = [EnumValue<Option>] extends [never]
+  ? PrimitiveValue<Type>
+  : EnumValue<Option>;
 type AddArg<Params extends unknown[], Type extends PrimitiveArgType, Option> = [
   ...Params,
-  MaybeNullable<PrimitiveValue<Type>, Option>,
+  MaybeNullable<ArgValue<Type, Option>, Option>,
 ];
 type AddInternalArg<Params extends unknown[], Token extends InternalArgToken> = [...Params, Token["_value"]];
 type AddInternalArgs<Params extends unknown[], Tokens extends readonly InternalArgToken[]> = Tokens extends readonly [
@@ -58,6 +75,14 @@ type CommandHandler<Deps extends readonly DependencyCls[], Params extends unknow
   ...args: Params
 ) => unknown | Promise<unknown>;
 
+const argMetaOf = (
+  type: ArgType,
+  name: string,
+  primitive: PrimitiveArgType,
+  argsOption: object | undefined,
+  idx: number,
+): ArgMeta => ({ name, argsOption: { ...argsOption, type: normalizePrimitiveArgType(primitive) }, key: "", idx, type });
+
 class TargetBuilder<Deps extends readonly DependencyCls[], Params extends unknown[] = [], Context = object> {
   readonly #args: (ArgMeta | InternalArgMeta)[];
 
@@ -68,56 +93,29 @@ class TargetBuilder<Deps extends readonly DependencyCls[], Params extends unknow
     this.#args = args;
   }
 
-  arg<Type extends PrimitiveArgType, Option extends ArgsOption<Context> = ArgsOption<Context>>(
+  #add<NextParams extends unknown[], NextContext = Context>(...argMetas: (ArgMeta | InternalArgMeta)[]) {
+    return new TargetBuilder<Deps, NextParams, NextContext>(this.targetOption, [...this.#args, ...argMetas]);
+  }
+
+  arg<Type extends PrimitiveArgType, const Option extends ArgsOption<Context> = ArgsOption<Context>>(
     name: string,
     type: Type,
     argsOption: Option = {} as Option,
-  ): TargetBuilder<Deps, AddArg<Params, Type, Option>, Context> {
-    return new TargetBuilder<Deps, AddArg<Params, Type, Option>, Context>(this.targetOption, [
-      ...this.#args,
-      {
-        name,
-        argsOption: { ...argsOption, type: normalizePrimitiveArgType(type) },
-        key: "",
-        idx: this.#args.length,
-        type: "Argument",
-      } as ArgMeta<CommandContext>,
-    ]);
+  ) {
+    return this.#add<AddArg<Params, Type, Option>>(argMetaOf("Argument", name, type, argsOption, this.#args.length));
   }
 
-  option<Type extends PrimitiveArgType, Option extends ArgsOption<Context> = ArgsOption<Context>>(
+  option<Type extends PrimitiveArgType, const Option extends ArgsOption<Context> = ArgsOption<Context>>(
     name: string,
     type: Type,
     argsOption: Option = {} as Option,
-  ): TargetBuilder<Deps, AddArg<Params, Type, Option>, Context> {
-    return new TargetBuilder<Deps, AddArg<Params, Type, Option>, Context>(this.targetOption, [
-      ...this.#args,
-      {
-        name,
-        argsOption: { ...argsOption, type: normalizePrimitiveArgType(type) },
-        key: "",
-        idx: this.#args.length,
-        type: "Option",
-      } as ArgMeta<CommandContext>,
-    ]);
+  ) {
+    return this.#add<AddArg<Params, Type, Option>>(argMetaOf("Option", name, type, argsOption, this.#args.length));
   }
 
-  with<const Tokens extends readonly InternalArgToken[]>(
-    ...tokens: Tokens
-  ): TargetBuilder<Deps, AddInternalArgs<Params, Tokens>, AddInternalContext<Context, Tokens>> {
-    return new TargetBuilder<Deps, AddInternalArgs<Params, Tokens>, AddInternalContext<Context, Tokens>>(
-      this.targetOption,
-      [
-        ...this.#args,
-        ...tokens.map(
-          (token, offset) =>
-            ({
-              key: "",
-              idx: this.#args.length + offset,
-              type: token.type,
-            }) satisfies InternalArgMeta,
-        ),
-      ],
+  with<const Tokens extends readonly InternalArgToken[]>(...tokens: Tokens) {
+    return this.#add<AddInternalArgs<Params, Tokens>, AddInternalContext<Context, Tokens>>(
+      ...tokens.map((token, offset) => ({ key: "", idx: this.#args.length + offset, type: token.type })),
     );
   }
 
@@ -135,12 +133,12 @@ type CommandBuilderContext<Deps extends readonly DependencyCls[]> = {
   public: (targetOption?: Omit<TargetOption, "type">) => TargetBuilder<Deps>;
   cloud: (targetOption?: Omit<TargetOption, "type">) => TargetBuilder<Deps>;
   dev: (targetOption?: Omit<TargetOption, "type">) => TargetBuilder<Deps>;
-  arg: <Type extends PrimitiveArgType, Option extends ArgsOption<CommandContext> = ArgsOption<CommandContext>>(
+  arg: <Type extends PrimitiveArgType, const Option extends ArgsOption<CommandContext> = ArgsOption<CommandContext>>(
     name: string,
     type: Type,
     argsOption?: Option,
   ) => ArgMeta;
-  option: <Type extends PrimitiveArgType, Option extends ArgsOption<CommandContext> = ArgsOption<CommandContext>>(
+  option: <Type extends PrimitiveArgType, const Option extends ArgsOption<CommandContext> = ArgsOption<CommandContext>>(
     name: string,
     type: Type,
     argsOption?: Option,
@@ -159,22 +157,8 @@ const createContext = <Deps extends readonly DependencyCls[]>(): CommandBuilderC
   public: createTarget<Deps>("public"),
   cloud: createTarget<Deps>("cloud"),
   dev: createTarget<Deps>("dev"),
-  arg: (name, type, argsOption) =>
-    ({
-      name,
-      argsOption: { ...(argsOption ?? {}), type: normalizePrimitiveArgType(type) },
-      key: "",
-      idx: -1,
-      type: "Argument",
-    }) as ArgMeta<CommandContext>,
-  option: (name, type, argsOption) =>
-    ({
-      name,
-      argsOption: { ...(argsOption ?? {}), type: normalizePrimitiveArgType(type) },
-      key: "",
-      idx: -1,
-      type: "Option",
-    }) as ArgMeta<CommandContext>,
+  arg: (name, type, argsOption) => argMetaOf("Argument", name, type, argsOption, -1),
+  option: (name, type, argsOption) => argMetaOf("Option", name, type, argsOption, -1),
 });
 
 const buildCommandMeta = (definitions: Record<string, TargetDefinition>) => {

@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import path from "node:path";
 import type { BunPlugin } from "bun";
 import type { PageEntry } from "../artifact/implicitRootLayout";
@@ -5,18 +6,17 @@ import { resolveSsrPageEntriesForApp } from "../artifact/implicitRootLayout";
 import type { App } from "../commandDecorators";
 import { createBarrelImportsPlugin } from "../transforms/barrelImportsPlugin";
 import { createExternalizeFrameworkPlugin } from "../transforms/externalizeFrameworkPlugin";
+import { loaderFor } from "../transforms/moduleSyntax";
 import { transformUseClient } from "../transforms/rscUseClientTransform";
 import { createUseClientBundlePlugin } from "../transforms/useClientBundlePlugin";
+import { bundleDefine } from "./bundleDefine";
+import { CsrDevPaths } from "./csrDevPaths";
 import { PagesEntrySourceGenerator } from "./pagesEntrySourceGenerator";
+import { ServerGraphFile } from "./serverGraphFile";
 
 export interface BuildPagesBundleResult {
-  /** Absolute path to the emitted `pages-[hash].js`. */
   bundlePath: string;
-  /**
-   * Monotonic build identifier. Bun.build emits a fresh filename whenever
-   * any input changes, but importers still benefit from a `?v=<buildId>`
-   * query-string cache bust — `buildId` is that value.
-   */
+  /** Cache-bust value for `import(bundlePath?v=<buildId>)`. */
   buildId: number;
   splitting: boolean;
   entryBytes: number;
@@ -27,10 +27,6 @@ export interface BuildPagesBundleResult {
 
 const VIRTUAL_PAGES_ENTRY = "akan-pages-entry";
 
-/**
- * Build the server-side pages bundle. The RSC worker loads the result with
- * `await import(bundlePath?v=buildId)`.
- */
 export class PagesBundleBuilder {
   #app: App;
   #command: "build" | "start";
@@ -49,6 +45,13 @@ export class PagesBundleBuilder {
       this.#pageEntries ?? (await resolveSsrPageEntriesForApp(this.#app, await this.#app.getPageKeys()));
     const entrySource = PagesEntrySourceGenerator.generate(resolvedEntries);
     const workspaceRoot = this.#app.workspace.workspaceRoot;
+    const dev = this.#command === "start";
+    const clientExports: Record<string, string[]> = {};
+    const onClientModule = dev
+      ? (file: string, exports: string[]) => {
+          clientExports[CsrDevPaths.realpath(file)] = exports;
+        }
+      : undefined;
     const result = await Bun.build({
       entrypoints: [VIRTUAL_PAGES_ENTRY],
       outdir: `${this.#artifactDir}/server`,
@@ -61,10 +64,11 @@ export class PagesBundleBuilder {
         chunk: "chunks/[name]-[hash].[ext]",
         asset: "assets/[name]-[hash].[ext]",
       },
-      define: this.#define(),
+      define: bundleDefine(this.#app, this.#command, "ssr"),
+      metafile: dev,
       plugins: [
         PagesBundleBuilder.createPagesEntryPlugin(entrySource),
-        PagesBundleBuilder.createServerCssStubPlugin(),
+        PagesBundleBuilder.createCssStubPlugin(),
         PagesBundleBuilder.createServerUseClientFetchPlugin(),
         await createExternalizeFrameworkPlugin({ app: this.#app, extra: akanConfig.externalLibs }),
         akanConfig.barrelImports.length > 0
@@ -73,9 +77,10 @@ export class PagesBundleBuilder {
                 transformUseClient(source, {
                   path: args.path,
                   workspaceRoot,
+                  onClientModule,
                 }),
             })
-          : createUseClientBundlePlugin({ workspaceRoot }),
+          : createUseClientBundlePlugin({ workspaceRoot, onClientModule }),
       ],
     });
 
@@ -86,6 +91,8 @@ export class PagesBundleBuilder {
 
     const bundlePath = path.resolve(entryArtifact.path);
     const buildId = Date.now();
+    if (dev && result.metafile)
+      await ServerGraphFile.write(this.#artifactDir, this.#serverGraph(result.metafile, clientExports));
     const outputBytes = result.outputs.reduce((sum, output) => sum + output.size, 0);
     const chunkCount = result.outputs.filter((output) => output.kind === "chunk").length;
     this.#app.verbose(
@@ -102,23 +109,21 @@ export class PagesBundleBuilder {
     };
   }
 
+  #serverGraph(metafile: Bun.BuildMetafile, clientExports: Record<string, string[]>) {
+    const inputs = Object.keys(metafile.inputs)
+      .filter((input) => !input.includes("node_modules"))
+      .map((input) => path.resolve(input))
+      .filter((input) => fs.existsSync(input))
+      .map((input) => CsrDevPaths.realpath(input));
+    return { inputs, clientExports };
+  }
+
   get #artifactDir(): string {
     return `${this.#command === "build" ? this.#app.dist.cwdPath : this.#app.cwdPath}/.akan/artifact`;
   }
 
   get #splitting(): boolean {
     return process.env.AKAN_SERVER_PAGES_SPLITTING === "1";
-  }
-
-  #define(): Record<string, string> {
-    const nodeEnv = this.#command === "build" ? "production" : (process.env.NODE_ENV ?? "development");
-    return {
-      "process.env.NODE_ENV": JSON.stringify(nodeEnv),
-      "process.env.AKAN_PUBLIC_RENDER_ENV": JSON.stringify("ssr"),
-      ...Object.fromEntries(
-        Object.entries(this.#app.getPublicEnv()).map(([key, value]) => [`process.env.${key}`, JSON.stringify(value)]),
-      ),
-    };
   }
 
   static createPagesEntryPlugin(source: string): BunPlugin {
@@ -137,9 +142,9 @@ export class PagesBundleBuilder {
     };
   }
 
-  static createServerCssStubPlugin(): BunPlugin {
+  static createCssStubPlugin(): BunPlugin {
     return {
-      name: "akan-server-css-stub",
+      name: "akan-css-stub",
       setup(build) {
         build.onLoad({ filter: /\.css$/ }, () => ({
           contents: "",
@@ -175,11 +180,4 @@ export class PagesBundleBuilder {
         "const fetchProto = FetchClient.build<typeof signal>(cnst, serverFetch.serializedSignal, { Err: pageProto.Err, base: serverFetch });",
       );
   }
-}
-
-function loaderFor(absPath: string): "ts" | "tsx" | "js" | "jsx" {
-  if (absPath.endsWith(".tsx")) return "tsx";
-  if (absPath.endsWith(".jsx")) return "jsx";
-  if (absPath.endsWith(".ts")) return "ts";
-  return "js";
 }

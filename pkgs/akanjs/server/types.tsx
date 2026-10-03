@@ -1,3 +1,4 @@
+import type { AkanWebConfig } from "akanjs";
 import type { PromiseOrObject } from "akanjs/base";
 import type { AkanI18nConfig } from "akanjs/common";
 import type { ClientManifest } from "./artifact";
@@ -12,6 +13,8 @@ export type WebsocketRoute = (
 export type WebsocketRoutes = Record<string, WebsocketRoute>;
 
 export type HttpRoutes = Bun.Serve.Options<unknown>["routes"];
+
+export type LocalPublish = (roomId: string, data: object | object[] | Uint8Array) => void;
 
 export interface SignalRouteOptions {
   globalPrefix?: false;
@@ -52,6 +55,8 @@ export interface AkanImageConfig {
   maximumRedirects: number;
   fetchTimeoutMs: number;
   maxRemoteBytes: number;
+  /** Concurrent encodes; `0` sizes it from the CPUs the serving process sees, which the build machine's count is not. */
+  maxConcurrency: number;
 }
 
 export const defaultAkanImageConfig: AkanImageConfig = {
@@ -66,6 +71,7 @@ export const defaultAkanImageConfig: AkanImageConfig = {
   maximumRedirects: 3,
   fetchTimeoutMs: 7000,
   maxRemoteBytes: 25 * 1024 * 1024,
+  maxConcurrency: 0,
 };
 
 export function mergeAkanImageConfig(config: Partial<AkanImageConfig> = {}): AkanImageConfig {
@@ -100,11 +106,28 @@ export type BaseBuildArtifact = {
   i18n: AkanI18nConfig;
   imageConfig: AkanImageConfig;
   deepLinkAssociations?: MobileDeepLinkAssociation[];
+  /** Surfaces this artifact was built for; absent (an artifact older than the option) reads as both on. */
+  web?: AkanWebConfig;
+};
+
+export const resolveWebConfig = (web: Partial<AkanWebConfig> | undefined): AkanWebConfig => ({
+  ssr: web?.ssr ?? true,
+  csr: web?.csr ?? true,
+});
+
+/** Reads `AKAN_SSR` / `AKAN_CSR`: each is on unless set to `"false"` or `"0"`. */
+export const getWebConfigFromEnv = (): AkanWebConfig => {
+  const off = (name: string) => process.env[name] === "false" || process.env[name] === "0";
+  const ssr = !off("AKAN_SSR");
+  // The CSR bundle inlines the stylesheet the SSR build compiles, so a csr-only process has no artifact.
+  return { ssr, csr: ssr && !off("AKAN_CSR") };
 };
 
 export interface MobileDeepLinkAssociation {
   targetName: string;
-  appId: string;
+  /** Null when the target names no id for the platform; that platform then gets no association. */
+  iosAppId: string | null;
+  androidAppId: string | null;
   domains: string[];
   iosTeamId?: string;
   androidSha256CertFingerprints?: string[];
@@ -119,4 +142,10 @@ export interface RenderState {
   buildId: number;
   cssAssets: Record<string, CssAsset>;
   cssBytesByUrl: Record<string, Uint8Array>;
+  /** The newest CSR dev bundle generation; a CSR tab whose own generation differs has missed an update. */
+  csrGeneration?: number;
+  /** The newest SSR dev registry generation sent to the tabs; a tab whose registry differs has missed an update. */
+  ssrGeneration?: number;
+  /** When the SSR dev registry was last built whole; a tab booted from an earlier one reloads. */
+  ssrEpoch?: number;
 }

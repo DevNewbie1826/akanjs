@@ -1,32 +1,30 @@
 "use client";
-import { clsx } from "akanjs/client";
-import { ConstantRegistry } from "akanjs/constant";
+import { cn } from "akanjs/client";
+import { capitalize } from "akanjs/common";
+import { ConstantRegistry, labelOf } from "akanjs/constant";
 import type { ClientView, ServerView } from "akanjs/fetch";
 import { st } from "akanjs/store";
-import { useFetch } from "akanjs/webkit";
+import { useScreenScope } from "akanjs/webkit";
 import { type ReactNode, useEffect, useMemo, useRef } from "react";
 
 import { Empty } from "../Empty";
 import { Loading } from "../Loading";
+import Stream from "./Stream";
 
 interface DefaultProps<T extends string, M> {
-  /** Additional classes for the default wrapping div. */
   className?: string;
-  /** Render the model directly without the default wrapper div. */
+  /** Renders the model without the default wrapper div. */
   noDiv?: boolean;
-  /** Custom fallback shown while the client view is loading. */
   loading?: ReactNode;
-  /** Render callback invoked with the loaded full model. */
+  empty?: ReactNode;
   renderView: (model: M) => ReactNode;
 }
 
 interface ViewProps<T extends string, Full extends { id: string }> extends DefaultProps<T, Full> {
-  /** Client view promise returned by Akan fetch helpers. */
   view: ClientView<T, Full>;
 }
 
 interface RenderProps<T extends string, Full extends { id: string }> extends DefaultProps<T, Full> {
-  /** Resolved server view payload used to hydrate the client store. */
   view: ServerView<T, Full>;
 }
 
@@ -39,6 +37,7 @@ function Render<T extends string, Full extends { id: string }>({
 }: RenderProps<T, Full>) {
   const loadedId = useRef<string | null>(null);
   const storeUse = st.use as { [key: string]: () => unknown };
+  const storeDo = st.do as unknown as { [key: string]: (...args: any[]) => Promise<void> };
   const storeGet = st.get as unknown as <T>() => { [key: string]: T };
   const { refName } = view;
   const model = storeUse[refName]() as Full | null;
@@ -71,45 +70,60 @@ function Render<T extends string, Full extends { id: string }>({
     loadedId.current = modelObj.id;
   }, [modelViewAt, modelObj.id]);
 
+  useEffect(() => {
+    // A payload older than the last local write is an RSC-cache replay, so the model hydrated above is stale.
+    // `<refName>StaleAt` is the root slice's stamp, absent only when the signal declares no slice.
+    const modelStaleAt = storeGet<Date | undefined>()[`${refName}StaleAt`];
+    if (!modelStaleAt || storeGet<Date>()[`${refName}ViewAt`].getTime() >= modelStaleAt.getTime()) return;
+    if (storeGet<string | boolean>()[`${refName}Loading`]) return;
+    void storeDo[`view${capitalize(refName)}`](modelObj.id);
+  }, [modelViewAt, modelObj.id]);
+
   const renderModel = loadedId.current === modelObj.id ? model : modelInit;
+  const scopePath = useScreenScope({
+    id: `${refName}-view`,
+    kind: refName,
+    label: renderModel ? labelOf(cnst.full, renderModel) : undefined,
+  });
 
   return noDiv && renderModel ? (
     <>{renderView(renderModel)}</>
   ) : renderModel ? (
-    <div className={clsx("w-full", className)}>{renderView(renderModel)}</div>
+    <div className={cn("w-full", className)} data-agent-scope={scopePath}>
+      {renderView(renderModel)}
+    </div>
   ) : null;
 }
 
 export default function View<T extends string, Full extends { id: string }>({
-  className,
   view,
-  noDiv,
-  loading,
-  renderView,
+  empty,
+  ...props
 }: ViewProps<T, Full>) {
-  //get Props
-  const props: ViewProps<T, Full> = {
-    className,
-    view,
-    noDiv,
-    loading,
-    renderView,
-  };
-  const { fulfilled, value: promiseView } = useFetch(view);
-
-  return fulfilled ? (
-    promiseView ? (
-      <Render {...props} view={promiseView} />
-    ) : (
-      <div className="size-full">
-        <Empty />
-      </div>
-    )
-  ) : loading ? (
-    <>{loading}</>
-  ) : (
-    <div className="size-full">
-      <Loading.Skeleton active />
-    </div>
+  return (
+    <Stream
+      of={view}
+      fallback={
+        props.loading === undefined ? (
+          <div className="size-full">
+            <Loading.Skeleton active />
+          </div>
+        ) : (
+          props.loading
+        )
+      }
+    >
+      {(serverView) =>
+        serverView ? (
+          <Render {...props} view={serverView} />
+        ) : (
+          (empty ?? (
+            <div className="size-full">
+              <Empty />
+            </div>
+          ))
+        )
+      }
+    </Stream>
   );
 }

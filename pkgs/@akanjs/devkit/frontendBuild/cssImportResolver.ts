@@ -25,8 +25,8 @@ export class CssImportResolver {
   async resolve(id: string, fromBase: string): Promise<string | null> {
     for (const resolve of [
       () => this.#resolveWithTsconfig(id),
-      () => this.#resolveWithBun(id, fromBase),
-      () => this.#resolveWithRequire(id, fromBase),
+      () => this.#resolveCssWith(fromBase, (base) => Bun.resolveSync(id, base)),
+      () => this.#resolveCssWith(fromBase, (base) => require.resolve(id, { paths: [base] })),
       () => this.#resolvePackageStyle(id, fromBase),
     ]) {
       const resolved = await resolve();
@@ -35,22 +35,10 @@ export class CssImportResolver {
     return null;
   }
 
-  #resolveWithBun(id: string, fromBase: string): string | null {
+  #resolveCssWith(fromBase: string, resolveFrom: (base: string) => string): string | null {
     for (const base of this.#resolutionBases(fromBase)) {
       try {
-        const resolved = Bun.resolveSync(id, base);
-        if (CssImportResolver.isCssFile(resolved)) return resolved;
-      } catch {
-        // Try the next known package resolution root.
-      }
-    }
-    return null;
-  }
-
-  #resolveWithRequire(id: string, fromBase: string): string | null {
-    for (const base of this.#resolutionBases(fromBase)) {
-      try {
-        const resolved = require.resolve(id, { paths: [base] });
+        const resolved = resolveFrom(base);
         if (CssImportResolver.isCssFile(resolved)) return resolved;
       } catch {
         // Try the next known package resolution root.
@@ -106,14 +94,14 @@ export class CssImportResolver {
       const pkg = await Bun.file(pkgPath).json();
       const subpath = id === pkgName ? "." : `.${id.slice(pkgName.length)}`;
       const exportValue = pkg.exports?.[subpath];
-      const styleEntry =
-        (typeof exportValue === "string"
+      const exportedEntry =
+        typeof exportValue === "string"
           ? exportValue
-          : exportValue?.style || exportValue?.import || exportValue?.default) ||
-        pkg.exports?.["."]?.style ||
-        pkg.style ||
-        "index.css";
-      return await this.#firstExisting(path.resolve(pkgDir, styleEntry));
+          : exportValue?.style || exportValue?.import || exportValue?.default;
+      if (exportedEntry) return await this.#firstExisting(path.resolve(pkgDir, exportedEntry));
+      //* A subpath resolves literally: the package's own style entry would silently load a different stylesheet.
+      if (subpath !== ".") return await this.#firstExisting(path.resolve(pkgDir, subpath));
+      return await this.#firstExisting(path.resolve(pkgDir, pkg.exports?.["."]?.style || pkg.style || "index.css"));
     } catch {
       return null;
     }
@@ -134,7 +122,7 @@ export class CssImportResolver {
 
   async #firstExisting(basePath: string): Promise<string | null> {
     for (const suffix of CSS_IMPORT_EXTS) {
-      const candidate = `${basePath}${suffix}`;
+      const candidate = path.normalize(`${basePath}${suffix}`);
       if (await Bun.file(candidate).exists()) return candidate;
     }
     return null;

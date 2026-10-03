@@ -1,6 +1,16 @@
-import { ID, Int } from "akanjs/base";
+import { join } from "node:path";
+import { type BackendEnv, Binary, dayjs, ID, Int } from "akanjs/base";
 import { ConstantRegistry, via } from "akanjs/constant";
-import { by, type DatabaseCls, DatabaseRegistry, from, into, type ModelCls, type SchemaOf } from "akanjs/document";
+import {
+  by,
+  type DatabaseCls,
+  DatabaseRegistry,
+  type DataInputOf,
+  from,
+  into,
+  type ModelCls,
+  type SchemaOf,
+} from "akanjs/document";
 import { ServiceModel, serve } from "akanjs/service";
 import { endpoint } from "../../signal/endpoint";
 import { Public } from "../../signal/guards";
@@ -8,7 +18,9 @@ import { internal } from "../../signal/internal";
 import { middleware } from "../../signal/middleware";
 import { serverSignal } from "../../signal/serverSignal";
 import type { SignalContext } from "../../signal/signalContext";
+import { DatabaseSignal } from "../../signal/signalRegistry";
 import { slice } from "../../signal/slice";
+import type { DatabaseModule } from "../akanLib";
 
 const ServerResolverTestNested = via((f) => ({
   label: f(String),
@@ -92,34 +104,39 @@ class ServerResolverTestModel extends into(
   ServerResolverTestModelMixin as unknown as ModelCls,
 ) {}
 
+class ServerResolverTestInsightDoc extends by(ServerResolverTestInsight) {}
+
 export const serverResolverTestDatabase = DatabaseRegistry.buildModel(
   "serverResolverTestItem",
   ServerResolverTestInput as unknown as DatabaseCls<InstanceType<typeof ServerResolverTestInput>>,
   ServerResolverTestDoc,
   ServerResolverTestModel,
   ServerResolverTestObject,
-  ServerResolverTestInsight,
+  ServerResolverTestInsightDoc,
   ServerResolverTestFilter,
 );
 
-class ParentHookService extends serve(serverResolverTestDatabase, () => ({})) {
-  _preCreate(data: Record<string, unknown>) {
-    return { ...data, parentPreCreate: true };
+/** Named so the hook overrides below can extend it: a class expression cannot be extended twice. */
+const ServerResolverTestServe = serve(serverResolverTestDatabase, () => ({}));
+type HookRecord = Record<string, unknown>;
+type PreCreateData = DataInputOf<InstanceType<typeof ServerResolverTestInput>, ServerResolverTestDoc>;
+
+class ParentHookService extends ServerResolverTestServe {
+  // Methods, not class fields: `serve` collects an extension service's hooks off its prototype.
+  override async _preCreate(data: PreCreateData) {
+    return { ...(data as HookRecord), parentPreCreate: true } as unknown as PreCreateData;
   }
-  _postCreate(doc: Record<string, unknown>) {
-    return { ...doc, parentPostCreate: true };
+  override async _postCreate(doc: ServerResolverTestDoc) {
+    return { ...(doc as unknown as HookRecord), parentPostCreate: true } as unknown as ServerResolverTestDoc;
   }
 }
 
 export class ServerResolverTestService extends serve(serverResolverTestDatabase, () => ({}), ParentHookService) {
-  _preCreate(data: Record<string, unknown>) {
-    return { ...data, childPreCreate: true };
+  override async _preCreate(data: PreCreateData) {
+    return { ...(data as HookRecord), childPreCreate: true } as unknown as PreCreateData;
   }
-  _postCreate(doc: Record<string, unknown>) {
-    return { ...doc, childPostCreate: true };
-  }
-  queryInCategory(category: string) {
-    return { category };
+  override async _postCreate(doc: ServerResolverTestDoc) {
+    return { ...(doc as unknown as HookRecord), childPostCreate: true } as unknown as ServerResolverTestDoc;
   }
   categoryEcho(category: string) {
     return category;
@@ -151,6 +168,7 @@ export class ServerResolverTestMiddleware extends middleware("serverResolverTest
 
 export class ServerResolverTestRoomGuard {
   static name = "ServerResolverTestRoomGuard";
+  static scope = "account" as const;
   canPass(context: SignalContext): boolean {
     return context.get<{ role?: string }>("account")?.role === "member";
   }
@@ -175,7 +193,9 @@ export class ServerResolverTestEndpoint extends endpoint(serverResolverTestServi
     .param("id", ID)
     .body("data", ServerResolverTestInput)
     .exec((id, data) => {
-      return { id, ...data, createdAt: new Date(0), updatedAt: new Date(0), removedAt: null, secret: "hidden" };
+      // A binding, not a literal: the excess-property check would reject `secret`, which the tests expect dropped.
+      const row = { id, ...data, createdAt: dayjs(0), updatedAt: dayjs(0), secret: "hidden" };
+      return row;
     }),
   roomFeed: builder
     .pubsub(ServerResolverTestLight)
@@ -183,6 +203,14 @@ export class ServerResolverTestEndpoint extends endpoint(serverResolverTestServi
     .exec(() => {
       resolverOrder.push("pubsub-subscribe");
     }),
+  roomStream: builder
+    .pubsub(Binary)
+    .room("channel", String)
+    .exec(() => undefined),
+  roomQueuedStream: builder
+    .pubsub(Binary, { backpressure: "queue" })
+    .room("channel", String)
+    .exec(() => undefined),
   guardedRoomFeed: builder
     .pubsub(ServerResolverTestLight, { guards: [ServerResolverTestRoomGuard] })
     .room("roomId", ID)
@@ -223,12 +251,39 @@ export class ServerResolverTestServerSignal extends serverSignal(
   ServerResolverTestInternal,
 ) {}
 
-export const makeEnv = () => ({
-  repoName: "akan",
-  serveDomain: "example.com",
-  appName: "serverResolver",
-  environment: "local",
-  operationMode: "local",
-  tunnelUsername: "root",
-  tunnelPassword: "akan",
+export const makeEnv = () => ({});
+
+export const makeSqliteEnv = (workspaceRoot: string) =>
+  ({
+    workspaceRoot,
+    database: {
+      sqlite: {
+        filePath: join(workspaceRoot, "akan.db"),
+        journalMode: "WAL",
+        busyTimeoutMs: 1000,
+        synchronous: "NORMAL",
+        foreignKeys: true,
+      },
+    },
+    solid: {
+      filePath: join(workspaceRoot, "solid.db"),
+      journalMode: "WAL",
+      busyTimeoutMs: 1000,
+      synchronous: "NORMAL",
+      cleanupIntervalMs: 60_000,
+      queuePollIntervalMs: 60_000,
+      queueLeaseMs: 30_000,
+    },
+  }) satisfies BackendEnv & { workspaceRoot: string };
+
+export const serverResolverTestModule = (service: ServiceModel = serverResolverTestServiceModel): DatabaseModule => ({
+  constant: serverResolverTestConstant,
+  database: serverResolverTestDatabase,
+  service,
+  signal: new DatabaseSignal(
+    ServerResolverTestInternal,
+    ServerResolverTestEndpoint,
+    ServerResolverTestSlice,
+    ServerResolverTestServerSignal,
+  ),
 });

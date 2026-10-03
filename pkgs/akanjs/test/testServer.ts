@@ -1,21 +1,25 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { BackendEnv } from "akanjs/base";
+import { type BackendEnv, type BaseEnv, type DatabaseMode, DatabaseModes, resetEnvCache } from "akanjs/base";
 import { Logger, sleep } from "akanjs/common";
 import { type AkanLib, AkanServer } from "akanjs/server";
+import { ConformanceEnv } from "./conformance";
 
 const MAX_RETRY = 5;
 const TEST_LISTEN_PORT_BASE = 38080;
-const MIN_ACTIVATION_TIME = 0;
 const MAX_ACTIVATION_TIME = 30000;
 
-type TestDatabaseMode = "memory" | "tempFile";
+type TestStorage = "memory" | "tempFile";
+
+/** `BackendEnv` carries server options only, so a harness that also stamps `process.env` needs the identity beside it. */
+export type TestEnv = BaseEnv & BackendEnv;
 
 export interface TestServerOptions {
   workerId?: number;
   port?: number;
-  databaseMode?: TestDatabaseMode;
+  /** Where the SQLite files live. */
+  storage?: TestStorage;
   serverMode?: "federation" | "batch" | "all";
   listen?: boolean;
   web?: boolean;
@@ -32,6 +36,9 @@ const TEST_ENV_KEYS = [
   "AKAN_PUBLIC_OPERATION_MODE",
   "AKAN_PUBLIC_SERVER_PORT",
   "SERVER_HTTP_PROTOCOL",
+  "AKAN_DATABASE_MODE",
+  "REDIS_URI",
+  ...ConformanceEnv.deploymentEnvKeys,
 ] as const;
 
 const resolveWorkerId = (workerId?: number) => {
@@ -44,8 +51,10 @@ const resolveWorkerId = (workerId?: number) => {
 export class TestServer {
   readonly #logger = new Logger("TestServer");
   readonly #libs: AkanLib[];
-  readonly #env: BackendEnv;
-  readonly #databaseMode: TestDatabaseMode;
+  readonly #env: TestEnv;
+  readonly #storage: TestStorage;
+  readonly #mode: DatabaseMode = TestServer.#modeFromEnv();
+  #dropSchema: (() => Promise<void>) | null = null;
   readonly #serverMode: "federation" | "batch" | "all";
   readonly #listen: boolean;
   readonly #web: boolean;
@@ -55,7 +64,7 @@ export class TestServer {
   #startAt = Date.now();
   #server?: AkanServer;
   #tempDir?: string;
-  static initClient(env: BackendEnv, workerId?: number) {
+  static initClient(env: BaseEnv, workerId?: number) {
     TestServer.applyProcessEnv(env, {
       workerId,
       port: TEST_LISTEN_PORT_BASE + resolveWorkerId(workerId),
@@ -63,7 +72,7 @@ export class TestServer {
     });
   }
   static applyProcessEnv(
-    env: BackendEnv,
+    env: BaseEnv,
     {
       workerId,
       port,
@@ -82,12 +91,12 @@ export class TestServer {
     process.env.AKAN_PUBLIC_SERVER_PORT = String(resolvedPort);
     process.env.SERVER_HTTP_PROTOCOL = "http:";
   }
-  constructor(env: BackendEnv, libs: AkanLib | AkanLib[], options: TestServerOptions = {}) {
+  constructor(env: TestEnv, libs: AkanLib | AkanLib[], options: TestServerOptions = {}) {
     this.workerId = resolveWorkerId(options.workerId);
     this.#port = options.port ?? TEST_LISTEN_PORT_BASE + this.workerId;
     this.#env = { ...env };
     this.#libs = Array.isArray(libs) ? libs : [libs];
-    this.#databaseMode = options.databaseMode ?? "memory";
+    this.#storage = options.storage ?? "memory";
     this.#serverMode = options.serverMode ?? "all";
     this.#listen = options.listen ?? true;
     this.#web = options.web ?? false;
@@ -112,62 +121,91 @@ export class TestServer {
   }
   async #init() {
     const now = Date.now();
-    this.#logger.log(`Test System #${this.workerId} Initializing...`);
+    this.#logger.info(`Test System #${this.workerId} Initializing...`);
     this.#rememberProcessEnv();
+    // A developer's shell may point at a real database, and the deployment's env wins over the one a test hands in.
+    for (const key of ConformanceEnv.deploymentEnvKeys) delete process.env[key];
     TestServer.applyProcessEnv(this.#env, { workerId: this.workerId, port: this.#port, serverMode: this.#serverMode });
     const { databaseFilePath, solidFilePath } = await this.#makeDatabaseFiles();
+    const pragmas =
+      this.#storage === "memory"
+        ? { journalMode: "MEMORY", synchronous: "OFF" }
+        : { journalMode: "WAL", synchronous: "NORMAL" };
     this.#env.port = this.#port;
-    this.#env.database = {
-      driver: "sqlite",
-      sqlite: {
-        filePath: databaseFilePath,
-        journalMode: this.#databaseMode === "memory" ? "MEMORY" : "WAL",
-        synchronous: this.#databaseMode === "memory" ? "OFF" : "NORMAL",
-        foreignKeys: true,
-      },
-    };
+    this.#env.database = { sqlite: { filePath: databaseFilePath, ...pragmas, foreignKeys: true } };
     this.#env.solid = {
       filePath: solidFilePath,
-      journalMode: this.#databaseMode === "memory" ? "MEMORY" : "WAL",
-      synchronous: this.#databaseMode === "memory" ? "OFF" : "NORMAL",
+      ...pragmas,
       cleanupIntervalMs: 60_000,
       queuePollIntervalMs: 60_000,
       queueLeaseMs: 30_000,
     };
-    this.#env.onCleanup = async () => {
-      await this.cleanup();
-    };
+    this.#env.onCleanup = () => this.cleanup();
+    await this.#applyDatabaseMode();
     this.#server = new AkanServer(this.#env.appName, this.#env, this.#serverMode, ...this.#libs);
     await this.#server.start({ listen: this.#listen, web: this.#web });
-    this.#logger.log(`Test System #${this.workerId} Initialized, SQLite: ${this.#databaseMode}`);
+    this.#logger.info(
+      `Test System #${this.workerId} Initialized, database mode: ${this.#mode}, SQLite: ${this.#storage}`,
+    );
     this.#startAt = Date.now();
-    this.#logger.log(`Test System #${this.workerId} Activation Time: ${this.#startAt - now}ms`);
+    this.#logger.info(`Test System #${this.workerId} Activation Time: ${this.#startAt - now}ms`);
   }
   async cleanup() {
-    this.#logger.log("SQLite test database cleanup is handled by server termination.");
+    this.#logger.info("SQLite test database cleanup is handled by server termination.");
   }
   async terminate() {
     const now = Date.now();
-    const elapsed = now - this.#startAt;
-    await sleep(50); // cooldown
+    await sleep(50);
     await this.#server?.stop();
     this.#server = undefined;
+    await this.#dropSchema?.();
+    this.#dropSchema = null;
     if (this.#tempDir) {
       await rm(this.#tempDir, { recursive: true, force: true });
       this.#tempDir = undefined;
     }
     this.#restoreProcessEnv();
-    if (elapsed < MIN_ACTIVATION_TIME) {
-      this.#logger.log(`waiting for ${MIN_ACTIVATION_TIME - elapsed}`);
-      await sleep(MIN_ACTIVATION_TIME - elapsed);
-    }
-    this.#logger.log(`System Terminated in ${Date.now() - now}ms`);
+    this.#logger.info(`System Terminated in ${Date.now() - now}ms`);
+  }
+  // `single` unless `AKAN_TEST_DATABASE_MODE` names another; never the `AKAN_DATABASE_MODE` of a developer's shell.
+  static #modeFromEnv(): DatabaseMode {
+    return DatabaseModes.parse(process.env.AKAN_TEST_DATABASE_MODE?.trim() || "single", "AKAN_TEST_DATABASE_MODE");
+  }
+
+  async #applyDatabaseMode() {
+    process.env.AKAN_DATABASE_MODE = this.#mode;
+    resetEnvCache();
+    if (this.#mode === "single") return;
+    const redisUrl = ConformanceEnv.url("redis");
+    const postgresUrl = ConformanceEnv.url("postgres");
+    const missing = [
+      ...(redisUrl ? [] : ["AKAN_TEST_REDIS_URL"]),
+      ...(this.#mode === "cluster" && !postgresUrl ? ["AKAN_TEST_POSTGRES_URL"] : []),
+    ];
+    if (!redisUrl || missing.length)
+      throw new Error(
+        `AKAN_TEST_DATABASE_MODE=${this.#mode} needs ${missing.join(" and ")}; \`bun run testConformance --keep\` starts both`,
+      );
+    // One logical Redis database per worker, emptied first. Pub/sub channels are not per database and every worker
+    // runs the same app, so a room two workers both joined would hear the other's events.
+    const redis = new URL(redisUrl);
+    redis.pathname = `/${this.workerId % 16}`;
+    process.env.REDIS_URI = redis.toString();
+    const { Redis } = await import("ioredis");
+    const client = new Redis(redis.toString(), { lazyConnect: true });
+    await client.connect();
+    await client.flushdb();
+    client.disconnect();
+    if (this.#mode === "multiple") return;
+    const { url, insightUrl, drop } = await ConformanceEnv.postgresSchema(`akan_test_w${this.workerId}`, {
+      insight: true,
+    });
+    this.#env.database = { ...this.#env.database, postgres: { url, insightUrl } };
+    this.#dropSchema = drop;
   }
   #rememberProcessEnv() {
     this.#previousEnv.clear();
-    TEST_ENV_KEYS.forEach((key) => {
-      this.#previousEnv.set(key, process.env[key]);
-    });
+    for (const key of TEST_ENV_KEYS) this.#previousEnv.set(key, process.env[key]);
   }
   #restoreProcessEnv() {
     this.#previousEnv.forEach((value, key) => {
@@ -175,9 +213,10 @@ export class TestServer {
       else process.env[key] = value;
     });
     this.#previousEnv.clear();
+    resetEnvCache();
   }
   async #makeDatabaseFiles() {
-    if (this.#databaseMode === "memory") return { databaseFilePath: ":memory:", solidFilePath: ":memory:" };
+    if (this.#storage === "memory") return { databaseFilePath: ":memory:", solidFilePath: ":memory:" };
     this.#tempDir = await mkdtemp(join(tmpdir(), `akan-${this.#env.appName}-${this.workerId}-`));
     return {
       databaseFilePath: join(this.#tempDir, `${this.#env.appName}.db`),

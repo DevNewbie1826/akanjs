@@ -14,14 +14,9 @@ export interface DeepLinkOptions extends RouteOptions {
 const DEEP_LINK_STACK_STEP_DELAY = 450;
 
 export interface RouterInstance {
-  push: (href: string, routeOptions?: RouteOptions) => void;
-  replace: (href: string, routeOptions?: RouteOptions) => void;
-  back: (routeOptions?: RouteOptions) => void;
-  refresh: () => void;
-}
-interface InternalRouterInstance {
-  push: (href: string, routeOptions?: RouteOptions) => void;
-  replace: (href: string, routeOptions?: RouteOptions) => void;
+  /** May answer a promise that rejects when the route refused to move — see `Router.navigation`. */
+  push: (href: string, routeOptions?: RouteOptions) => void | Promise<void>;
+  replace: (href: string, routeOptions?: RouteOptions) => void | Promise<void>;
   back: (routeOptions?: RouteOptions) => void;
   refresh: () => void;
 }
@@ -116,6 +111,8 @@ export const normalizeDeepLinkHref = (
   href: string,
   origin = globalThis.window?.location?.origin ?? "http://localhost",
 ) => {
+  //? Already a path: resolving it against a native shell's `app://localhost` would read the host into it.
+  if (href.startsWith("/") && !href.startsWith("//")) return normalizeRoutePath(href) ?? "/";
   const url = new URL(href, origin);
   if (url.protocol === "http:" || url.protocol === "https:") return `${url.pathname}${url.search}${url.hash}`;
   const hostPath = url.hostname ? `/${url.hostname}` : "";
@@ -135,8 +132,6 @@ const getServerBasePath = (reqPathname: string, lang: string, headerBasePath: st
 
 declare global {
   var __AKAN_ROUTER__: Router | undefined;
-  var __AKAN_DEV_SYNC_NAVIGATION__: ((href: string, kind: "push" | "replace" | "back" | "pop") => void) | undefined;
-  var __AKAN_DEV_SYNC_NAVIGATION_APPLYING__: boolean | undefined;
 }
 
 export const getPathInfo = (requestUrl: string, lang: string, prefix: string) => {
@@ -163,19 +158,17 @@ class Router {
   #lang = parseAkanI18nEnv().defaultLocale;
   #routePaths = new Set<string>();
   #indexPath = "/";
+  #navigation: Promise<void> = Promise.resolve();
   #historyIdx = 0;
-  #instance: InternalRouterInstance = {
+  #redirects = 0;
+  #instance: RouterInstance = {
     push: (href: string) => {
       const { href: fullHref } = this.#getPathInfo(href);
-      Logger.log(`push to:${fullHref}`);
-      // ! need to revive
-      // if (getEnv().side === "server") void redirect(fullHref);
+      Logger.warn(`router.push(${fullHref}) does not navigate on the server; use router.redirect() there`);
     },
     replace: (href: string) => {
-      const { pathname } = this.#getPathInfo(href);
-      Logger.log(`replace to:${pathname}`);
-      // ! need to revive
-      // if (getEnv().side === "server") void redirect(fullHref);
+      const { href: fullHref } = this.#getPathInfo(href);
+      Logger.warn(`router.replace(${fullHref}) does not navigate on the server; use router.redirect() there`);
     },
     back: () => {
       throw new Error("back is only available in client");
@@ -185,7 +178,6 @@ class Router {
     },
   };
   init(options: SsrClientRouterOption | SsrServerRouterOption | CSRClientRouterOption) {
-    // if (this.isInitialized) throw new Error("Router is already initialized");
     this.#prefix = options.prefix ?? "";
     this.#lang = options.lang ?? parseAkanI18nEnv().defaultLocale;
     this.#routePaths = new Set(
@@ -195,35 +187,25 @@ class Router {
     );
     this.#indexPath = splitHref(options.indexPath ?? "/").path;
     if (this.#routePaths.size > 0 && !this.#routePaths.has(this.#indexPath)) {
-      Logger.log(`[router] indexPath '${this.#indexPath}' was not found in route manifest. Falling back to '/'.`);
+      Logger.info(`[router] indexPath '${this.#indexPath}' was not found in route manifest. Falling back to '/'.`);
       this.#indexPath = "/";
     }
     this.#ensureHistoryState();
     if (options.type === "csr") this.#initCsrClientRouter(options);
-    else if (options.side === "server") this.#initSsrServerRouter(options);
-    else this.#initSsrClientRouter(options);
+    else if (options.side === "client") this.#initSsrClientRouter(options);
     this.isInitialized = true;
     Logger.verbose("Router initialized");
   }
-  #initSsrServerRouter(options: SsrServerRouterOption) {
-    // already initialized in next server
-  }
   #initSsrClientRouter(options: SsrClientRouterOption) {
+    const navigate = (method: "push" | "replace") => (href: string, routeOptions?: RouteOptions) => {
+      const pathInfo = this.#getPathInfo(href);
+      const navigationPathInfo = this.#getNavigationPathInfo(href);
+      this.#postPathChange(pathInfo);
+      return options.router[method](navigationPathInfo.href, routeOptions);
+    };
     this.#instance = {
-      push: (href: string, routeOptions) => {
-        const router = options.router;
-        const pathInfo = this.#getPathInfo(href);
-        const navigationPathInfo = this.#getNavigationPathInfo(href);
-        this.#postPathChange(pathInfo);
-        router.push(navigationPathInfo.href, routeOptions);
-      },
-      replace: (href: string, routeOptions) => {
-        const router = options.router;
-        const pathInfo = this.#getPathInfo(href);
-        const navigationPathInfo = this.#getNavigationPathInfo(href);
-        this.#postPathChange(pathInfo);
-        router.replace(navigationPathInfo.href, routeOptions);
-      },
+      push: navigate("push"),
+      replace: navigate("replace"),
       back: () => {
         const router = options.router;
         const pathInfo = this.#getPathInfo(document.referrer);
@@ -243,7 +225,7 @@ class Router {
       push: (href: string, routeOptions) => {
         const { path, pathname, hash, href: fullHref } = this.#getPathInfo(href);
         this.#postPathChange({ path, pathname, hash });
-        options.router.push(this.#withCsrRuntimeSearchParams(fullHref), routeOptions);
+        return options.router.push(this.#withCsrRuntimeSearchParams(fullHref), routeOptions);
       },
       replace: (href: string, routeOptions) => {
         const { path, pathname, hash, href: fullHref } = this.#getPathInfo(href);
@@ -323,7 +305,7 @@ class Router {
     return getPathInfo(href, lang, shouldExposeBasePath() ? this.#prefix : "");
   }
   #postPathChange({ path, pathname, hash }: { path: string; pathname: string; hash: string }) {
-    Logger.log(`pathChange-start:${path}${hash ? `#${hash}` : ""}`);
+    Logger.info(`pathChange-start:${path}${hash ? `#${hash}` : ""}`);
     window.parent.postMessage({ type: "pathChange", path, pathname, hash }, "*");
   }
   #postDevSyncNavigation(kind: "push" | "replace", href: string) {
@@ -338,12 +320,20 @@ class Router {
       .map((_, index) => `/${segments.slice(0, index + 1).join("/")}`)
       .filter((candidate) => this.#routePaths.has(candidate));
   }
+  //? A universal link carries the page's own path, locale and basePath included; the manifest keeps neither.
+  #routePathOfLink(path: string) {
+    const segments = path.split("/").filter(Boolean);
+    if (segments[0] && (parseAkanI18nEnv().locales as readonly string[]).includes(segments[0])) segments.shift();
+    if (this.#prefix && segments[0] === this.#prefix) segments.shift();
+    return segments.length ? `/${segments.join("/")}` : "/";
+  }
   resolveDeepLinkStack(href: string) {
     this.#checkInitialized();
     const normalizedHref = normalizeDeepLinkHref(href);
-    const { path, search, hash } = splitHref(normalizedHref);
+    const { path: linkPath, search, hash } = splitHref(normalizedHref);
+    const path = this.#routePathOfLink(linkPath);
     if (this.#routePaths.size > 0 && !this.#routePaths.has(path)) {
-      Logger.log(`[router] deep link target '${path}' was not found in route manifest.`);
+      Logger.info(`[router] deep link target '${path}' was not found in route manifest.`);
       return [];
     }
     const stack = this.#routePaths.size > 0 ? this.#getExistingSegmentStack(path) : [path];
@@ -372,17 +362,27 @@ class Router {
   }
   push(href: string, routeOptions?: RouteOptions) {
     this.#checkInitialized();
-    this.#instance.push(href, routeOptions);
+    this.#track(this.#instance.push(href, routeOptions));
     this.#rememberHistoryState("push");
     this.#postDevSyncNavigation("push", href);
     return undefined as never;
   }
   replace(href: string, routeOptions?: RouteOptions) {
     this.#checkInitialized();
-    this.#instance.replace(href, routeOptions);
+    this.#track(this.#instance.replace(href, routeOptions));
     this.#rememberHistoryState("replace");
     this.#postDevSyncNavigation("replace", href);
     return undefined as never;
+  }
+  /** The last `push`/`replace`; rejects when the route refused to move. A method, not a getter: through the `router`
+   * Proxy a getter would run with the Proxy as `this` and fail on the private field. */
+  navigation(): Promise<void> {
+    return this.#navigation;
+  }
+  #track(result: void | Promise<void>) {
+    this.#navigation = Promise.resolve(result);
+    // Observed here so a refusal nobody awaited is not an unhandled rejection; `navigation()` still rejects.
+    void this.#navigation.catch(() => undefined);
   }
   canGoBack() {
     if (getEnv().side === "server") return false;
@@ -398,7 +398,6 @@ class Router {
   }
   back(routeOptions?: RouteOptions) {
     if (getEnv().side === "server") throw new Error("back is only available in client side");
-    // history보고 뒤로갈지 끌지 정하던가 먹통하던가
     this.#checkInitialized();
     this.#instance.back(routeOptions);
     return undefined as never;
@@ -408,6 +407,11 @@ class Router {
     this.#checkInitialized();
     this.#instance.refresh();
     return undefined as never;
+  }
+  /** Client-side redirects so far: a render that saw this change while it ran redirected instead of drawing. A method
+   * for the reason `navigation()` is one. */
+  redirectCount(): number {
+    return this.#redirects;
   }
   redirect(href: string, options: RedirectOptions = {}): never {
     const method = options.method ?? "replace";
@@ -421,19 +425,21 @@ class Router {
       const lang = (h.get("x-locale") ?? langFromPath ?? this.#lang) as string;
       const basePath = getServerBasePath(reqPathname, lang, h.get("x-base-path") ?? undefined, this.#prefix);
       const { pathname, href: fullHref } = getPathInfo(href, lang, shouldExposeBasePath() ? basePath : "");
-      Logger.log(`redirect to:${pathname}`);
+      Logger.info(`redirect to:${pathname}`);
       throw new AkanRedirectError(fullHref, method, status);
     } else {
+      this.#redirects += 1;
       this.#instance[method](href);
     }
     return undefined as never;
   }
   notFound(): never {
     if (getEnv().side === "server") {
-      Logger.log(`redirect to:/404`);
+      Logger.info(`redirect to:/404`);
       throw new AkanNotFoundError();
     }
     this.#checkInitialized();
+    this.#redirects += 1;
     this.#instance.replace("/404");
     return undefined as never;
   }
@@ -449,10 +455,13 @@ class Router {
     this.#instance.replace(`${path}${search ? `?${search}` : ""}${hash ? `#${hash}` : ""}`);
     return undefined as never;
   }
+  /** A pathname without its locale and base-path segments; unlike `getPath`, it needs no browser. */
+  routeOf(pathname: string) {
+    return getPathInfo(pathname, this.#lang, this.#prefix).path;
+  }
   getPath(pathname = window.location.pathname) {
     if (getEnv().side === "server") throw new Error("getPath is only available in client side");
-    const { path } = getPathInfo(pathname, this.#lang, this.#prefix);
-    return path;
+    return this.routeOf(pathname);
   }
   getFullPath(withLang = true) {
     if (getEnv().side === "server") throw new Error("getPath is only available in client side");

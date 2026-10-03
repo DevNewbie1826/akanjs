@@ -1,15 +1,18 @@
 "use client";
 import type { DataList } from "akanjs/base";
-import { clsx, type DataAction, type DataColumn } from "akanjs/client";
-import { capitalize } from "akanjs/common";
+import { cn, type DataAction, type DataColumn } from "akanjs/client";
 import type { FilterInstance } from "akanjs/document";
 import type { FetchInitForm, SliceMeta } from "akanjs/fetch";
 import { st } from "akanjs/store";
 import { type ReactNode, useEffect } from "react";
+import { Empty } from "../Empty";
 import { Loading } from "../Loading";
 import { Model } from "../Model";
+import { sliceNamesOf } from "../sliceNamesOf";
 import DataItem from "./Item";
 import DataPagination from "./Pagination";
+
+const gridClassName = "grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4";
 
 type DataItemProps<T extends string, M extends { id: string }, L extends { id: string }> = {
   [key in T]: L;
@@ -55,23 +58,8 @@ export default function CardList<
 }: CardListProps<T, Input, Full, Light, Filter>) {
   const storeUse = st.use as { [key: string]: () => unknown };
   const storeDo = st.do as unknown as { [key: string]: (...args: any[]) => Promise<void> };
-  const storeGet = st.get as unknown as <T>() => { [key: string]: T };
   const { refName, sliceName } = slice;
-  const [modelName, modelClassName] = [refName, capitalize(refName)];
-  const names = {
-    model: modelName,
-    modelId: `${modelName}Id`,
-    modelList: `${modelName}List`,
-    modelListLoading: `${modelName}ListLoading`,
-    limitOfModel: `limitOf${modelClassName}`,
-    initModel: `init${modelClassName}`,
-  };
-  const namesOfSlice = {
-    modelList: sliceName.replace(names.model, names.modelList),
-    modelListLoading: sliceName.replace(names.model, names.modelListLoading),
-    limitOfModel: sliceName.replace(names.model, names.limitOfModel),
-    initModel: sliceName.replace(names.model, names.initModel),
-  };
+  const { names, namesOfSlice } = sliceNamesOf(refName, sliceName);
   const modelList = storeUse[namesOfSlice.modelList]() as DataList<Light>;
   const modelListLoading = storeUse[namesOfSlice.modelListLoading]() as string | boolean;
   const limitOfModel = storeUse[namesOfSlice.limitOfModel]() as number;
@@ -86,14 +74,22 @@ export default function CardList<
   return (
     <div className={className}>
       {modelListLoading ? (
-        <div className={clsx("grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-5", cardListClassName)}>
+        <div className={cn(gridClassName, cardListClassName)}>
           {new Array(limitOfModel || 20)
             .fill(0)
             .map((_, idx) => `skeleton-${idx}`)
-            .map((key) => (renderLoading ? renderLoading() : <Loading.Skeleton key={key} active />))}
+            .map((key) =>
+              renderLoading ? (
+                renderLoading()
+              ) : (
+                <Loading.Skeleton key={key} className="rounded-box border border-border bg-card p-4" active />
+              ),
+            )}
         </div>
+      ) : !modelList.length ? (
+        <Empty />
       ) : (
-        <div className={clsx("grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-5", cardListClassName)}>
+        <div className={cn(gridClassName, cardListClassName)}>
           {modelList.map((model, idx) => {
             return (
               <DataItem

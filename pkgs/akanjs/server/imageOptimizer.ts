@@ -1,7 +1,11 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { Logger } from "akanjs/common";
+import { isAnimatedImage } from "./animatedImage";
 import { ImageOptimizerError } from "./imageOptimizerError";
+import { Semaphore } from "./semaphore";
+import { resolveStaticPath } from "./staticPath";
 import {
   type AkanImageConfig,
   type AkanImageFormat,
@@ -9,18 +13,6 @@ import {
   getAkanImageWidths,
   mergeAkanImageConfig,
 } from "./types";
-
-type SharpFactory = typeof import("sharp");
-
-let sharpLoad: Promise<SharpFactory> | null = null;
-
-function loadSharp(): Promise<SharpFactory> {
-  sharpLoad ??= import("sharp").then((mod) => {
-    const loaded = mod as unknown as { default?: SharpFactory } & SharpFactory;
-    return loaded.default ?? loaded;
-  });
-  return sharpLoad;
-}
 
 export interface ImageOptimizerOptions {
   publicDir: string;
@@ -49,6 +41,14 @@ interface OptimizedImage {
   contentType: string;
   etag: string;
   maxAge: number;
+  cacheFile: string | null;
+}
+
+interface RemoteCachePointer {
+  file: string;
+  contentType: string;
+  maxAge: number;
+  expireAt: number;
 }
 
 export class ImageOptimizer {
@@ -59,18 +59,42 @@ export class ImageOptimizer {
   static readonly #webp = "image/webp";
   static readonly #gif = "image/gif";
   static readonly #avif = "image/avif";
+  static readonly #heic = "image/heic";
   static readonly #bypassTypes = new Set(["image/x-icon", "image/x-icns", "image/bmp", "image/jxl", "image/heic"]);
+  static readonly #encodableTypes = new Set(["image/jpeg", "image/png", "image/webp", "image/avif"]);
 
   #publicDir: string;
   #cacheDir: string;
   #prodMode: boolean;
   #config: AkanImageConfig;
+  #semaphore: Semaphore;
+  readonly #inflight = new Map<string, Promise<OptimizedImage>>();
+  #logger = new Logger("ImageOptimizer");
 
   constructor({ publicDir, cacheDir, prodMode, config }: ImageOptimizerOptions) {
     this.#publicDir = publicDir;
     this.#cacheDir = cacheDir;
     this.#prodMode = prodMode;
-    this.#config = mergeAkanImageConfig(config);
+    const merged = mergeAkanImageConfig(config);
+    const formats = merged.formats.filter((format) => ImageOptimizer.#isCodecAvailable(format));
+    if (formats.length !== merged.formats.length) {
+      const dropped = merged.formats.filter((format) => !formats.includes(format));
+      this.#logger.warn(`${dropped.join(", ")} needs an OS codec this platform does not have; serving webp instead`);
+    }
+    this.#config = { ...merged, formats: formats.length ? formats : ["image/webp"] };
+    this.#semaphore = new Semaphore(ImageOptimizer.#resolveConcurrency(this.#config.maxConcurrency));
+  }
+
+  // Bun.Image shares the off-thread pool with fs and hashing, sized by visible CPUs (1 under a cpu limit): take half.
+  static #resolveConcurrency(configured: number): number {
+    return configured > 0 ? configured : Math.max(1, Math.floor(navigator.hardwareConcurrency / 2));
+  }
+
+  // AVIF/HEIC/TIFF need the OS codec of the `system` backend (macOS, Windows); Linux's `bun` backend throws on them.
+  static #isCodecAvailable(contentType: string): boolean {
+    if (contentType !== ImageOptimizer.#avif && contentType !== ImageOptimizer.#heic && contentType !== "image/tiff")
+      return true;
+    return Bun.Image.backend === "system";
   }
 
   async handle(req: Request): Promise<Response> {
@@ -78,16 +102,84 @@ export class ImageOptimizer {
     if ("error" in parsed) return new Response(parsed.error, { status: 400 });
 
     try {
-      const source = parsed.isRemote
-        ? await this.#fetchRemoteImage(parsed.href)
-        : await this.#readLocalImage(parsed.href);
-      const optimized = await this.#getOptimizedImage(source, parsed);
-      return this.#imageResponse(req, optimized);
+      return this.#imageResponse(req, await this.#loadOptimizedImage(parsed));
     } catch (error) {
       const message = error instanceof ImageOptimizerError ? error.message : "Unable to optimize image";
       const status = error instanceof ImageOptimizerError ? error.status : 500;
       return new Response(message, { status });
     }
+  }
+
+  // A cold srcSet requests one width several times before its cache file exists: identical requests join one run.
+  async #loadOptimizedImage(parsed: ParsedImageRequest): Promise<OptimizedImage> {
+    const key = `${parsed.href}|${parsed.width}|${parsed.quality}|${parsed.outputType}`;
+    const joined = this.#inflight.get(key);
+    if (joined) return await joined;
+
+    const pending = this.#optimizeRequest(parsed);
+    this.#inflight.set(key, pending);
+    try {
+      return await pending;
+    } finally {
+      this.#inflight.delete(key);
+    }
+  }
+
+  async #optimizeRequest(parsed: ParsedImageRequest): Promise<OptimizedImage> {
+    const usePointer = parsed.isRemote && this.#prodMode;
+    if (usePointer) {
+      const fresh = await this.#readRemotePointer(parsed);
+      if (fresh) return fresh;
+    }
+    const source = parsed.isRemote
+      ? await this.#fetchRemoteImage(parsed.href)
+      : await this.#readLocalImage(parsed.href);
+    const optimized = await this.#getOptimizedImage(source, parsed);
+    if (usePointer) await this.#writeRemotePointer(parsed, optimized);
+    return optimized;
+  }
+
+  // Keyed by the request alone (the bytes are keyed by the source etag, which costs a re-download), so a warm remote
+  // image skips the origin until its TTL. Dev skips it so an upstream edit shows up immediately.
+  async #readRemotePointer(parsed: ParsedImageRequest): Promise<OptimizedImage | null> {
+    let pointer: RemoteCachePointer;
+    try {
+      pointer = (await Bun.file(this.#getPointerPath(parsed)).json()) as RemoteCachePointer;
+    } catch {
+      return null;
+    }
+    if (!pointer.file || pointer.expireAt <= Date.now()) return null;
+    const file = Bun.file(pointer.file);
+    if (!(await file.exists())) return null;
+    const buffer = Buffer.from(await file.arrayBuffer());
+    return {
+      buffer,
+      contentType: pointer.contentType,
+      etag: ImageOptimizer.#hashBuffer(buffer),
+      maxAge: pointer.maxAge,
+      cacheFile: pointer.file,
+    };
+  }
+
+  async #writeRemotePointer(parsed: ParsedImageRequest, optimized: OptimizedImage) {
+    if (!optimized.cacheFile) return;
+    const pointer: RemoteCachePointer = {
+      file: optimized.cacheFile,
+      contentType: optimized.contentType,
+      maxAge: optimized.maxAge,
+      expireAt: Date.now() + optimized.maxAge * 1000,
+    };
+    await Bun.write(this.#getPointerPath(parsed), JSON.stringify(pointer));
+  }
+
+  #getPointerPath(parsed: ParsedImageRequest) {
+    const key = ImageOptimizer.#getCacheKey({
+      href: parsed.href,
+      width: parsed.width,
+      quality: parsed.quality,
+      outputType: parsed.outputType,
+    });
+    return path.join(this.#cacheDir, `${key}.remote.json`);
   }
 
   #parseRequest(req: Request): ParsedImageRequest | { error: string } {
@@ -144,18 +236,19 @@ export class ImageOptimizer {
       return { error: `"q" parameter (quality) of ${quality} is not allowed` };
     }
 
+    const accept = req.headers.get("accept") ?? "";
     return {
       href,
       width,
       quality,
-      outputType: ImageOptimizer.#getPreferredOutputType(req.headers.get("accept") ?? "", this.#config.formats),
+      outputType: this.#config.formats.find((format) => accept.includes(format)) ?? "",
       isRemote,
     };
   }
 
   async #readLocalImage(href: string): Promise<ImageSource> {
     const url = new URL(href, "http://local.akan");
-    const filePath = ImageOptimizer.#safeResolve(this.#publicDir, url.pathname);
+    const filePath = resolveStaticPath(this.#publicDir, url.pathname);
     if (!filePath) throw new ImageOptimizerError(400, '"url" parameter is not allowed');
     const file = Bun.file(filePath);
     if (!(await file.exists())) throw new ImageOptimizerError(404, "Image not found");
@@ -217,11 +310,13 @@ export class ImageOptimizer {
     const shouldBypass =
       inputType === ImageOptimizer.#svg ||
       ImageOptimizer.#bypassTypes.has(inputType) ||
-      (await ImageOptimizer.#isAnimated(source.buffer, inputType));
+      !ImageOptimizer.#isCodecAvailable(inputType) ||
+      isAnimatedImage(source.buffer, inputType);
     const outputType =
       shouldBypass || !params.outputType || inputType === ImageOptimizer.#webp || inputType === ImageOptimizer.#avif
         ? inputType
         : params.outputType;
+    const shouldEncode = !shouldBypass && ImageOptimizer.#encodableTypes.has(outputType);
     const cachePath = this.#getCachePath({
       href: params.href,
       width: params.width,
@@ -232,19 +327,27 @@ export class ImageOptimizer {
     const cached = Bun.file(cachePath);
     if (await cached.exists()) {
       const buffer = Buffer.from(await cached.arrayBuffer());
-      return { buffer, contentType: outputType, etag: ImageOptimizer.#hashBuffer(buffer), maxAge };
+      return {
+        buffer,
+        contentType: outputType,
+        etag: ImageOptimizer.#hashBuffer(buffer),
+        maxAge,
+        cacheFile: cachePath,
+      };
     }
 
     let buffer = source.buffer;
     let contentType = inputType;
     let cacheable = true;
-    if (!shouldBypass) {
+    if (shouldEncode) {
       try {
-        buffer = await ImageOptimizer.#optimizeWithSharp(source.buffer, {
-          width: params.width,
-          quality: params.quality,
-          contentType: outputType,
-        });
+        buffer = await this.#semaphore.run(() =>
+          ImageOptimizer.#optimize(source.buffer, {
+            width: params.width,
+            quality: params.quality,
+            contentType: outputType,
+          }),
+        );
         contentType = outputType;
       } catch {
         buffer = source.buffer;
@@ -257,7 +360,13 @@ export class ImageOptimizer {
       await fs.mkdir(this.#cacheDir, { recursive: true });
       await Bun.write(cachePath, buffer);
     }
-    return { buffer, contentType, etag: ImageOptimizer.#hashBuffer(buffer), maxAge };
+    return {
+      buffer,
+      contentType,
+      etag: ImageOptimizer.#hashBuffer(buffer),
+      maxAge,
+      cacheFile: cacheable ? cachePath : null,
+    };
   }
 
   #getCachePath(input: Record<string, string | number>) {
@@ -281,28 +390,17 @@ export class ImageOptimizer {
     return new Response(ImageOptimizer.#toArrayBuffer(image.buffer), { headers });
   }
 
-  static async #optimizeWithSharp(
+  static async #optimize(
     buffer: Buffer,
     options: { width: number; quality: number; contentType: string },
   ): Promise<Buffer> {
-    const sharp = await loadSharp();
-    if (sharp.concurrency() > 1) sharp.concurrency(Math.max(Math.floor(sharp.concurrency() / 2), 1));
-    const transformer = sharp(buffer, {
-      limitInputPixels: 268_402_689,
-      sequentialRead: true,
-    }).resize(options.width, undefined, { withoutEnlargement: true });
+    const image = new Bun.Image(buffer).resize(options.width, undefined, { withoutEnlargement: true });
 
-    if (options.contentType === ImageOptimizer.#avif)
-      return await transformer.avif({ quality: options.quality }).toBuffer();
-    if (options.contentType === ImageOptimizer.#webp)
-      return await transformer.webp({ quality: options.quality }).toBuffer();
-    if (options.contentType === ImageOptimizer.#png)
-      return await transformer.png({ quality: options.quality }).toBuffer();
-    return await transformer.jpeg({ quality: options.quality }).toBuffer();
-  }
-
-  static #getPreferredOutputType(accept: string, formats: AkanImageFormat[]): AkanImageFormat | "" {
-    return formats.find((format) => accept.includes(format)) ?? "";
+    if (options.contentType === ImageOptimizer.#avif) return await image.avif({ quality: options.quality }).toBuffer();
+    if (options.contentType === ImageOptimizer.#webp) return await image.webp({ quality: options.quality }).toBuffer();
+    // Bun's PNG encoder takes no quality — it is lossless unless you opt into palette quantization.
+    if (options.contentType === ImageOptimizer.#png) return await image.png().toBuffer();
+    return await image.jpeg({ quality: options.quality }).toBuffer();
   }
 
   static #hasRemoteMatch(patterns: AkanImagePattern[], url: URL): boolean {
@@ -342,22 +440,6 @@ export class ImageOptimizer {
     }
   }
 
-  static #safeResolve(baseDir: string, urlPath: string): string | null {
-    let decoded: string;
-    try {
-      decoded = decodeURIComponent(urlPath);
-    } catch {
-      return null;
-    }
-    if (decoded.includes("\0")) return null;
-    const normalizedBase = path.resolve(baseDir);
-    const rel = decoded.replace(/^[/\\]+/, "");
-    const resolved = path.resolve(normalizedBase, rel);
-    if (resolved === normalizedBase) return resolved;
-    const baseWithSep = normalizedBase.endsWith(path.sep) ? normalizedBase : normalizedBase + path.sep;
-    return resolved.startsWith(baseWithSep) ? resolved : null;
-  }
-
   static async #readResponseBuffer(res: Response, maxBytes: number): Promise<Buffer> {
     const contentLength = Number.parseInt(res.headers.get("content-length") ?? "0", 10);
     if (contentLength > maxBytes) throw new ImageOptimizerError(413, "Remote image is too large");
@@ -373,22 +455,6 @@ export class ImageOptimizer {
       chunks.push(value);
     }
     return Buffer.concat(chunks);
-  }
-
-  static async #isAnimated(buffer: Buffer, contentType: string): Promise<boolean> {
-    if (
-      contentType !== ImageOptimizer.#gif &&
-      contentType !== ImageOptimizer.#webp &&
-      contentType !== ImageOptimizer.#png
-    )
-      return false;
-    try {
-      const sharp = await loadSharp();
-      const metadata = await sharp(buffer, { animated: true }).metadata();
-      return Boolean(metadata.pages && metadata.pages > 1);
-    } catch {
-      return false;
-    }
   }
 
   static #detectContentType(buffer: Buffer): string | null {

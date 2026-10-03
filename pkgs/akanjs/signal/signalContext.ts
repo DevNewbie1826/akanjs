@@ -1,5 +1,6 @@
 import {
-  type BaseEnv,
+  Any,
+  type BackendEnv,
   type Cls,
   FIELD_META,
   INTERNAL_META,
@@ -7,6 +8,7 @@ import {
   type PromiseOrObject,
   Upload,
 } from "akanjs/base";
+import { clientPortFromHeaders, normalizeIpAddress, TrustedProxy } from "akanjs/common";
 import {
   type ConstantCls,
   type ConstantFieldTypeInput,
@@ -16,11 +18,23 @@ import {
 } from "akanjs/constant";
 import type { Adaptor, AdaptorCls, DatabaseService, InjectRegistry, LiveRegistry } from "akanjs/service";
 import type { Internal, InternalCls, InternalInfo, MiddlewareCls } from ".";
-import type { EndpointInfo } from "./endpointInfo";
-import { Exception } from "./exception";
-import { isTraceEnabled, runWithTrace, SignalTrace, traceSpan } from "./trace";
+import { CrossSiteGuard } from "./CrossSiteGuard";
+import { EndpointCache } from "./endpointCache";
+import type { ArgInfo, EndpointInfo, EndpointType } from "./endpointInfo";
+import { Exception, isExceptionLike } from "./exception";
+import { type GuardCls, guardOf } from "./guard";
+import { SignalFailure } from "./SignalFailure";
+import { getCurrentTrace, runTraced, SignalTrace, type TraceOrigin, traceSpan } from "./trace";
 
 export type SignalTransportType = "http" | "websocket";
+
+/** What `Bun.Server.requestIP` reports for the socket a request arrived on. */
+export type HttpPeerResolver = (req: Request) => { address: string; port: number } | null;
+
+const httpEndpointTypes = new Set<EndpointType>(["query", "mutation"]);
+
+const deserializeArg = (arg: ArgInfo, value: unknown) =>
+  deserialize(arg.argRef, arg.arrDepth, value, { key: arg.name, nullable: arg.option?.nullable, enum: arg.enum });
 
 interface WebSocketRequest {
   ws: Bun.ServerWebSocket<unknown>;
@@ -28,31 +42,21 @@ interface WebSocketRequest {
   eventType: WebSocketEventType;
 }
 type RuntimeRecord = Record<string, unknown>;
-
-interface ExceptionLike {
-  statusCode: number;
-  toJSON(): object;
-}
-
-const isExceptionLike = (error: unknown): error is ExceptionLike => {
-  return (
-    error instanceof Exception ||
-    (error instanceof Error &&
-      "statusCode" in error &&
-      typeof (error as { statusCode?: unknown }).statusCode === "number" &&
-      typeof (error as { toJSON?: unknown }).toJSON === "function")
-  );
-};
+type MiddlewareHandler = (context: SignalContext, next: () => Promise<unknown>) => PromiseOrObject<unknown>;
+/** Request-scoped: the outermost `resolveReturn` starts one and every recursion threads it down. */
+type ResolveCache = Map<ConstantFieldTypeInput, Map<string, Promise<unknown>>>;
 
 export class SignalContext<
   Ctx extends HttpExecutionContext | WebSocketExecutionContext = HttpExecutionContext | WebSocketExecutionContext,
-  Env extends BaseEnv = BaseEnv,
+  Env extends BackendEnv = BackendEnv,
 > {
   key: string;
   transport: SignalTransportType;
   ctx: Ctx;
   endpointInfo: EndpointInfo;
   adaptor: Adaptor;
+  /** `mcp` for a call through the MCP endpoint. Held here, not on the trace: a null trace would let a guard fail open. */
+  readonly origin: TraceOrigin;
   args: unknown[] = [];
   internalArgs: unknown[] = [];
   trace: SignalTrace | null = null;
@@ -60,6 +64,7 @@ export class SignalContext<
   #env: Env;
   #live: LiveRegistry;
   #middleware: Map<string, MiddlewareCls>;
+  static #reported = new WeakSet<object>();
   constructor(
     key: string,
     reqOrWsReq: Bun.BunRequest | WebSocketRequest,
@@ -70,6 +75,8 @@ export class SignalContext<
       env,
       live,
       middleware,
+      ctx,
+      origin,
     }: {
       endpointInfo: EndpointInfo;
       adaptor: Adaptor;
@@ -77,19 +84,28 @@ export class SignalContext<
       env: Env;
       live: LiveRegistry;
       middleware: Map<string, MiddlewareCls>;
+      /** A caller-built context: MCP's arguments arrive as one named object, not in a URL. */
+      ctx?: Ctx;
+      /** Defaults to the transport. */
+      origin?: TraceOrigin;
     },
   ) {
     this.key = key;
-    this.transport = endpointInfo.type === "query" || endpointInfo.type === "mutation" ? "http" : "websocket";
+    this.transport = httpEndpointTypes.has(endpointInfo.type) ? "http" : "websocket";
+    this.origin = origin ?? this.transport;
     this.endpointInfo = endpointInfo;
-    if (this.transport === "http") this.ctx = new HttpExecutionContext(reqOrWsReq as Bun.BunRequest) as Ctx;
+    if (ctx) this.ctx = ctx;
+    else if (this.transport === "http") this.ctx = new HttpExecutionContext(reqOrWsReq as Bun.BunRequest) as Ctx;
     else this.ctx = new WebSocketExecutionContext(reqOrWsReq as WebSocketRequest) as Ctx;
     this.adaptor = adaptor;
     this.#registry = registry;
     this.#env = env;
     this.#live = live;
     this.#middleware = middleware;
-    if (isTraceEnabled()) this.trace = new SignalTrace(key, endpointInfo.type);
+    // A trace already open (`SignalContext.run`) is its opener's to close; one started here is closed by `exec()`.
+    this.trace = getCurrentTrace() ?? SignalTrace.create(key, endpointInfo.type, origin ?? this.transport);
+    if (this.trace && this.transport === "http")
+      this.trace.applyDebugHeader((reqOrWsReq as { headers?: Headers }).headers?.get?.("x-akan-debug"));
   }
 
   getAdaptor<T extends Adaptor>(adaptorCls: AdaptorCls<T>): T {
@@ -105,31 +121,25 @@ export class SignalContext<
     return service as T;
   }
   async init() {
-    if (this.trace) {
-      const start = performance.now();
-      this.args = await this.ctx.getArgs(this.endpointInfo);
-      this.trace.recordSpan("argParse", performance.now() - start);
-    } else {
-      this.args = await this.ctx.getArgs(this.endpointInfo);
+    // Before the body is read. Only a mutation: a cross-origin caller cannot read a GET's response, and a websocket
+    // frame rides a socket whose upgrade route already refused a cross-site Origin (ApiRouter).
+    if (this.endpointInfo.type === "mutation" && this.transport === "http") {
+      const httpCtx = this.getHttpContext();
+      CrossSiteGuard.assertOrigin(httpCtx.req, httpCtx.url, this.key);
     }
+    const start = this.trace ? performance.now() : 0;
+    this.args = await this.ctx.getArgs(this.endpointInfo);
+    this.trace?.recordSpan("argParse", performance.now() - start);
     return this;
   }
+  // Sequential, not parallel: a call refused by two guards names the same one every time and stops at the first.
   async #checkGuards() {
-    const guards = this.endpointInfo.signalOption.guards ?? [];
-    if (guards.length === 0) return;
-    await Promise.all(
-      guards.map(async (GuardCls) => {
-        const guard = new GuardCls();
-        const canPass = await guard.canPass(this);
-        if (!canPass) throw new Exception.Forbidden(`Access denied by guard: ${GuardCls.name}`);
-      }),
-    );
+    for (const GuardCls of this.endpointInfo.signalOption.guards ?? []) {
+      if (!(await guardOf(GuardCls).canPass(this)))
+        throw new Exception.Forbidden(`Access denied by guard: ${GuardCls.name}`);
+    }
   }
-  /**
-   * Re-checks this context's guards outside of a request, for a websocket room that is already
-   * subscribed. Only global middlewares run: they carry the account resolution this depends on,
-   * while endpoint middlewares (cache/timeout/retry) would observe a call that never executes.
-   */
+  /** Re-checks the guards of a subscribed room outside a request; only global middlewares (account resolution) run. */
   async authorize(): Promise<boolean> {
     try {
       await this.#withMiddleware(async () => await this.#checkGuards(), { endpointMiddlewares: false })();
@@ -138,12 +148,54 @@ export class SignalContext<
       return false;
     }
   }
+  /**
+   * Evaluates only `scope = "account"` guards, to hide listing entries. Never an access gate: a resource guard fails
+   * closed without arguments, so it is left to `#checkGuards` at call time.
+   */
+  async canListForAccount(): Promise<boolean> {
+    const guards = (this.endpointInfo.signalOption.guards ?? []).filter((GuardCls) => GuardCls.scope === "account");
+    if (guards.length === 0) return true;
+    try {
+      // Without logging: a refusal is the expected answer for most of a catalogue, not an `Error …` line per listing.
+      await this.#withMiddleware(
+        async () => {
+          for (const GuardCls of guards) {
+            if (!(await this.#canListWith(GuardCls)))
+              throw new Exception.Forbidden(`Access denied by guard: ${GuardCls.name}`);
+          }
+        },
+        { endpointMiddlewares: false, skip: ["logging"] },
+      )();
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  // An account guard that throws anything but a refusal reached for arguments: a mismarked resource guard.
+  async #canListWith(GuardCls: GuardCls): Promise<boolean> {
+    try {
+      return await guardOf(GuardCls).canPass(this);
+    } catch (error) {
+      if (!isExceptionLike(error)) this.#warnMismarkedGuard(GuardCls, error);
+      throw error;
+    }
+  }
+  static #mismarkedWarned = new WeakMap<GuardCls, Set<string>>();
+  #warnMismarkedGuard(GuardCls: GuardCls, error: unknown) {
+    const keys = SignalContext.#mismarkedWarned.get(GuardCls) ?? new Set<string>();
+    if (keys.has(this.key)) return;
+    keys.add(this.key);
+    SignalContext.#mismarkedWarned.set(GuardCls, keys);
+    this.adaptor.logger.warn(
+      `Guard ${GuardCls.name} threw while listing "${this.key}" with no arguments: ${String(error)}. A guard that reads the call's arguments is \`static scope = "resource"\`; until then the entry is hidden from every listing.`,
+    );
+  }
   #withMiddleware(
     coreExec: () => Promise<unknown>,
-    { endpointMiddlewares = true }: { endpointMiddlewares?: boolean } = {},
+    { endpointMiddlewares = true, skip = [] as string[] }: { endpointMiddlewares?: boolean; skip?: string[] } = {},
   ): () => Promise<unknown> {
     const middlewares = [
-      ...this.#middleware.values(),
+      ...[...this.#middleware.entries()].filter(([name]) => !skip.includes(name)).map(([, cls]) => cls),
       ...(endpointMiddlewares ? (this.endpointInfo.signalOption.middlewares ?? []) : []),
     ];
     if (middlewares.length === 0) return coreExec;
@@ -151,28 +203,48 @@ export class SignalContext<
     for (let i = middlewares.length - 1; i >= 0; i--) {
       const MiddlewareCls = middlewares[i];
       if (!MiddlewareCls) continue;
-      const middleware = new MiddlewareCls();
       const currentNext = next;
-      next = async () => await (await middleware.use(this.getEnv()))(this, currentNext);
+      next = async () =>
+        await (await SignalContext.#getMiddlewareHandler(MiddlewareCls, this.getEnv()))(this, currentNext);
     }
     return next;
   }
+  static #httpPeer: HttpPeerResolver | null = null;
+  /** Registered by the listening `Bun.serve`, the only thing that can answer `requestIP`; unused behind the gateway. */
+  static setHttpPeerResolver(resolve: HttpPeerResolver | null) {
+    SignalContext.#httpPeer = resolve;
+  }
+  // `use(env)` takes no context, so a handler is a function of (class, env) and is built once per process.
+  static #middlewareHandlers = new WeakMap<MiddlewareCls, WeakMap<object, Promise<MiddlewareHandler>>>();
+  static #getMiddlewareHandler(MiddlewareCls: MiddlewareCls, env: BackendEnv): Promise<MiddlewareHandler> {
+    const byEnv =
+      SignalContext.#middlewareHandlers.get(MiddlewareCls) ?? new WeakMap<object, Promise<MiddlewareHandler>>();
+    SignalContext.#middlewareHandlers.set(MiddlewareCls, byEnv);
+    const cached = byEnv.get(env);
+    if (cached) return cached;
+    // A rejected setup is evicted, not cached, so the next request retries instead of the endpoint staying poisoned.
+    const handler = Promise.resolve(new MiddlewareCls().use(env) as PromiseOrObject<MiddlewareHandler>).catch(
+      (error: unknown) => {
+        byEnv.delete(env);
+        throw error;
+      },
+    );
+    byEnv.set(env, handler);
+    return handler;
+  }
   async exec() {
-    if (!this.trace) return await this.#exec();
-    return await runWithTrace(this.trace, async () => {
-      try {
-        return await this.#exec();
-      } finally {
-        this.trace?.finalize();
-      }
-    });
+    if (!this.trace || getCurrentTrace() === this.trace) return await this.#exec();
+    return await runTraced(this.trace, async () => await this.#exec());
   }
   async #exec() {
     if (!this.endpointInfo.execFn) throw new Exception.Error("Exec function is not set");
     const coreExec = async () => {
       if (!this.endpointInfo.execFn) throw new Exception.Error("Exec function is not set");
-      if (this.trace) await traceSpan("guards", () => this.#checkGuards());
-      else await this.#checkGuards();
+      if (this.trace) {
+        await traceSpan("guards", () => this.#checkGuards());
+        const account = this.get<{ id?: unknown }>("account");
+        if (typeof account?.id === "string") this.trace.setAttr("userId", account.id);
+      } else await this.#checkGuards();
       if (this.endpointInfo.internalArgs.length > 0) {
         this.internalArgs = await Promise.all(
           this.endpointInfo.internalArgs.map((arg) => {
@@ -183,45 +255,76 @@ export class SignalContext<
           }),
         );
       }
-      if (!this.trace) return await this.endpointInfo.execFn.call(this.adaptor, ...this.args, ...this.internalArgs);
-      return await traceSpan(
-        "handler",
-        async () => await this.endpointInfo.execFn?.call(this.adaptor, ...this.args, ...this.internalArgs),
-      );
+      const handle = async () => await this.endpointInfo.execFn?.call(this.adaptor, ...this.args, ...this.internalArgs);
+      return await EndpointCache.through(this, this.trace ? () => traceSpan("handler", handle) : handle);
     };
     const next = this.#withMiddleware(coreExec);
     const result = this.trace ? await traceSpan("execChain", () => next()) : await next();
-    if (this.endpointInfo.type === "pubsub") return;
+    // A pubsub's return is not sent; a live slice's exec returns the resolved query its room is routed by.
+    if (this.endpointInfo.type === "pubsub") return result;
     if (result instanceof Response) return result;
+    const resolveOption = {
+      signalContext: this,
+      returnRef: this.endpointInfo.returns.returnRef,
+      arrDepth: this.endpointInfo.returns.arrDepth,
+      registry: this.#registry,
+      live: this.#live,
+    };
     if (!this.trace) {
-      const resolved = await SignalContext.resolveReturn(result, {
-        signalContext: this,
-        returnRef: this.endpointInfo.returns.returnRef,
-        arrDepth: this.endpointInfo.returns.arrDepth,
-        registry: this.#registry,
-        live: this.#live,
-      });
-      return this.ctx.makeResponse(resolved, this.endpointInfo);
+      const resolved = await SignalContext.resolveReturn(result, resolveOption);
+      return this.ctx.makeResponse(this.#settleUndefined(resolved), this.endpointInfo);
     }
-    const resolved = await traceSpan("resolveReturn", () =>
-      SignalContext.resolveReturn(result, {
-        signalContext: this,
-        returnRef: this.endpointInfo.returns.returnRef,
-        arrDepth: this.endpointInfo.returns.arrDepth,
-        registry: this.#registry,
-        live: this.#live,
-      }),
+    const resolved = await traceSpan("resolveReturn", () => SignalContext.resolveReturn(result, resolveOption));
+    return await traceSpan("serialize", async () =>
+      this.ctx.makeResponse(this.#settleUndefined(resolved), this.endpointInfo),
     );
-    return await traceSpan("serialize", async () => this.ctx.makeResponse(resolved, this.endpointInfo));
+  }
+  //? A handler that falls off its end returns `undefined`, which Bun's `Response.json` refuses with an error naming
+  //? neither the endpoint nor its return. A nullable or `Any` return answers `null`; any other broke its contract.
+  #settleUndefined(resolved: unknown) {
+    if (resolved !== undefined) return resolved;
+    const { nullable, returnRef } = this.endpointInfo.returns;
+    if (nullable || returnRef === Any) return null;
+    throw new Error(
+      `${this.endpointInfo.type} ${this.key} returned undefined, but its return is not nullable: return a value, or declare { nullable: true } and return null`,
+    );
+  }
+  /** Whether `run` already logged this failure, so a transport's catch does not log it a second time. */
+  static wasReported(error: unknown) {
+    return typeof error === "object" && error !== null && SignalContext.#reported.has(error);
+  }
+  /** The 500 log is written in here, not in the transport, so it carries the call's traceId; rethrows after. */
+  static async run<T>(
+    endpoint: Adaptor,
+    endpointInfo: EndpointInfo,
+    key: string,
+    origin: TraceOrigin,
+    fn: () => Promise<T>,
+    { trace = true }: { trace?: boolean } = {},
+  ): Promise<T> {
+    return await runTraced(trace ? SignalTrace.create(key, endpointInfo.type, origin) : null, async () => {
+      try {
+        return await fn();
+      } catch (error) {
+        if (!isExceptionLike(error)) {
+          const message = error instanceof Error ? error.message : String(error);
+          const stack = error instanceof Error ? error.stack : undefined;
+          endpoint.logger.error(`Error ${endpointInfo.type}-${key}:\n${stack ?? message}`);
+          if (typeof error === "object" && error !== null) SignalContext.#reported.add(error);
+        }
+        throw error;
+      }
+    });
   }
   static async try(
     endpoint: Adaptor,
     endpointInfo: EndpointInfo,
     key: string,
     fn: () => Promise<Response | undefined>,
+    options: { trace?: boolean } = {},
   ): Promise<Response | undefined> {
     try {
-      return await fn();
+      return await SignalContext.run(endpoint, endpointInfo, key, "http", fn, options);
     } catch (error) {
       if (endpointInfo.type === "message" || endpointInfo.type === "pubsub") throw error;
       if (isExceptionLike(error)) {
@@ -234,19 +337,7 @@ export class SignalContext<
           { status: error.statusCode, headers: { "Content-Type": "application/json" } },
         );
       }
-      const message = error instanceof Error ? error.message : String(error);
-      const stack = error instanceof Error ? error.stack : undefined;
-      endpoint.logger.error(`Error ${endpointInfo.type}-${key}:\n${stack ?? message}`);
-      return new Response(
-        JSON.stringify({
-          error: message,
-          statusCode: 500,
-          path: endpointInfo.getPath(key),
-          timestamp: new Date().toISOString(),
-          stack: error instanceof Error ? error.stack : undefined,
-        }),
-        { status: 500, headers: { "Content-Type": "application/json" } },
-      );
+      return SignalFailure.response(error, { path: endpointInfo.getPath(key) });
     }
   }
   static async resolveReturn(
@@ -257,12 +348,14 @@ export class SignalContext<
       arrDepth,
       registry,
       live,
+      cache = new Map(),
     }: {
       signalContext: SignalContext | null;
       returnRef: ConstantFieldTypeInput;
       arrDepth: number;
       registry: InjectRegistry;
       live: LiveRegistry;
+      cache?: ResolveCache;
     },
   ): Promise<unknown> {
     if (value === null || value === undefined) return value;
@@ -270,56 +363,173 @@ export class SignalContext<
     else if (arrDepth)
       return await Promise.all(
         (value as unknown[]).map((v) =>
-          SignalContext.resolveReturn(v, { signalContext, returnRef, arrDepth: arrDepth - 1, registry, live }),
+          SignalContext.resolveReturn(v, { signalContext, returnRef, arrDepth: arrDepth - 1, registry, live, cache }),
         ),
       );
     const valueRecord = value as RuntimeRecord;
     const resolvedValue = {} as RuntimeRecord;
-    await Promise.all(
-      Object.entries((returnRef as ConstantCls)[FIELD_META]).map(async ([key, field]) => {
-        if (field.fieldType === "hidden" || field.fieldType === "secret") return;
-        else if (field.fieldType === "resolve") {
-          const refName = ConstantRegistry.getRefName(returnRef as ConstantCls);
-          const internal = live.internal.get(`${refName}Internal`);
-          if (!internal) throw new Error(`Internal ${refName} is not registered`);
-          const internalCls = internal.constructor as InternalCls;
-          const internalInfo = internalCls[INTERNAL_META][key] as InternalInfo<"resolveField"> | undefined;
-          if (!internalInfo) throw new Error(`Internal info ${key} is not found`);
-          const resolveFieldContext = new ResolveFieldContext(valueRecord, { signalContext, internalInfo, internal });
-          const resolved = await resolveFieldContext.exec();
-          resolvedValue[key] = await SignalContext.resolveReturn(resolved, {
+    // Only a field that loads or computes gets a promise: awaiting every field cost a microtask hop per field.
+    const pending: Promise<void>[] = [];
+    const assign = (key: string, resolved: Promise<unknown>) =>
+      pending.push(
+        resolved.then((v) => {
+          resolvedValue[key] = v;
+        }),
+      );
+    for (const [key, field] of Object.entries((returnRef as ConstantCls)[FIELD_META])) {
+      if (field.fieldType === "hidden" || field.fieldType === "secret") continue;
+      else if (field.fieldType === "resolve")
+        assign(
+          key,
+          SignalContext.#resolveComputed(key, valueRecord, {
+            signalContext,
+            returnRef,
+            field,
+            registry,
+            live,
+            cache,
+          }),
+        );
+      else if (!field.isClass) resolvedValue[key] = valueRecord[key];
+      else if (field.isScalar)
+        assign(
+          key,
+          SignalContext.resolveReturn(valueRecord[key], {
             signalContext,
             returnRef: field.modelRef,
             arrDepth: field.arrDepth,
             registry,
             live,
-          });
-        } else if (!field.isClass) resolvedValue[key] = valueRecord[key];
-        else if (field.isScalar) {
-          resolvedValue[key] = await SignalContext.resolveReturn(valueRecord[key], {
+            cache,
+          }),
+        );
+      else
+        assign(
+          key,
+          SignalContext.#resolveRelation(valueRecord[key], {
             signalContext,
-            returnRef: field.modelRef,
+            modelRef: field.modelRef,
             arrDepth: field.arrDepth,
+            nullable: field.nullable,
             registry,
             live,
-          });
-        } else {
-          const refName = ConstantRegistry.getRefName(field.modelRef);
-          const service = live.service.get(refName) as unknown as DatabaseService;
-          if (!service) throw new Error(`Service ${refName} is not registered`);
-          const loaded = await SignalContext.loadNested(valueRecord[key], service, field);
-          const resolved = await SignalContext.resolveReturn(loaded, {
-            signalContext,
-            returnRef: field.modelRef,
-            arrDepth: field.arrDepth,
-            registry,
-            live,
-          });
-          resolvedValue[key] = resolved;
-        }
-      }),
-    );
+            cache,
+          }),
+        );
+    }
+    if (pending.length) await Promise.all(pending);
     return resolvedValue;
+  }
+  static async #resolveComputed(
+    key: string,
+    valueRecord: RuntimeRecord,
+    {
+      signalContext,
+      returnRef,
+      field,
+      registry,
+      live,
+      cache,
+    }: {
+      signalContext: SignalContext | null;
+      returnRef: ConstantFieldTypeInput;
+      field: ConstantCls[typeof FIELD_META][string];
+      registry: InjectRegistry;
+      live: LiveRegistry;
+      cache: ResolveCache;
+    },
+  ): Promise<unknown> {
+    const refName = ConstantRegistry.getRefName(returnRef as ConstantCls);
+    const internal = live.internal.get(`${refName}Internal`);
+    if (!internal) throw new Error(`Internal ${refName} is not registered`);
+    const internalCls = internal.constructor as InternalCls;
+    const internalInfo = internalCls[INTERNAL_META][key] as InternalInfo<"resolveField"> | undefined;
+    if (!internalInfo) throw new Error(`Internal info ${key} is not found`);
+    const resolveFieldContext = new ResolveFieldContext(valueRecord, { signalContext, internalInfo, internal });
+    const resolved = await resolveFieldContext.exec();
+    return await SignalContext.resolveReturn(resolved, {
+      signalContext,
+      returnRef: field.modelRef,
+      arrDepth: field.arrDepth,
+      registry,
+      live,
+      cache,
+    });
+  }
+  static async #resolveRelation(
+    value: unknown,
+    {
+      signalContext,
+      modelRef,
+      arrDepth,
+      nullable,
+      registry,
+      live,
+      cache,
+    }: {
+      signalContext: SignalContext | null;
+      modelRef: ConstantFieldTypeInput;
+      arrDepth: number;
+      nullable: boolean;
+      registry: InjectRegistry;
+      live: LiveRegistry;
+      cache: ResolveCache;
+    },
+  ): Promise<unknown> {
+    if (arrDepth) {
+      if (value === null || value === undefined) {
+        if (nullable) return null;
+        throw new Error(`Document ${value} is not found`);
+      }
+      return await Promise.all(
+        (value as unknown[]).map((item) =>
+          SignalContext.#resolveRelation(item, {
+            signalContext,
+            modelRef,
+            arrDepth: arrDepth - 1,
+            nullable,
+            registry,
+            live,
+            cache,
+          }),
+        ),
+      );
+    }
+    const refName = ConstantRegistry.getRefName(modelRef as ConstantCls);
+    const service = live.service.get(refName) as unknown as DatabaseService;
+    if (!service) throw new Error(`Service ${refName} is not registered`);
+    // Cached as nullable so one entry serves every reference to the document; the refusal below is each field's own.
+    const resolved =
+      value === null || value === undefined
+        ? null
+        : await SignalContext.#resolveOnce(cache, modelRef, String(value), async () => {
+            const loaded = await SignalContext.loadNested(value, service, { arrDepth: 0, nullable: true });
+            return await SignalContext.resolveReturn(loaded, {
+              signalContext,
+              returnRef: modelRef,
+              arrDepth: 0,
+              registry,
+              live,
+              cache,
+            });
+          });
+    if (resolved === null && !nullable) throw new Error(`Document ${value} is not found`);
+    return resolved;
+  }
+  // Once per response per document; the promise is stored so rows asking together coalesce onto the first load.
+  static #resolveOnce(
+    cache: ResolveCache,
+    modelRef: ConstantFieldTypeInput,
+    id: string,
+    load: () => Promise<unknown>,
+  ): Promise<unknown> {
+    const byId = cache.get(modelRef) ?? new Map<string, Promise<unknown>>();
+    if (!cache.has(modelRef)) cache.set(modelRef, byId);
+    const cached = byId.get(id);
+    if (cached) return cached;
+    const resolving = load();
+    byId.set(id, resolving);
+    return resolving;
   }
   static async loadNested(
     value: unknown,
@@ -332,26 +542,21 @@ export class SignalContext<
     }
     if (arrDepth > 0 && Array.isArray(value) && value.length === 0) return [];
     if (arrDepth === 0)
-      return await service.__load(String(value)).then((doc) => {
-        if (doc === null) {
-          if (nullable) return null;
-          else throw new Error(`Document ${value} is not found`);
-        } else return doc.toJSON();
-      });
+      return await service.__load(String(value)).then((doc) => SignalContext.#loadedJson(doc, value, nullable));
     if (arrDepth === 1)
-      return await service.__loadMany(value as string[]).then((docs) =>
-        docs.map((doc) => {
-          if (doc === null) {
-            if (nullable) return null;
-            else throw new Error(`Document ${value} is not found`);
-          } else return doc.toJSON();
-        }),
-      );
+      return await service
+        .__loadMany(value as string[])
+        .then((docs) => docs.map((doc) => SignalContext.#loadedJson(doc, value, nullable)));
     return await Promise.all(
       (value as unknown[]).map(
         async (v) => await SignalContext.loadNested(v, service, { arrDepth: arrDepth - 1, nullable }),
       ),
     );
+  }
+  static #loadedJson(doc: { toJSON: () => unknown } | null, value: unknown, nullable: boolean) {
+    if (doc !== null) return doc.toJSON();
+    if (nullable) return null;
+    throw new Error(`Document ${value} is not found`);
   }
   getHttpContext<Appended = unknown>() {
     if (this.transport !== "http") throw new Error("Transport is not http");
@@ -365,10 +570,70 @@ export class SignalContext<
     if (this.transport === "http") return this.getHttpContext<{ [key: string]: T }>().req[key] ?? null;
     return this.getWebSocketContext<{ [key: string]: T }>().ws.data[key] ?? null;
   }
+  /**
+   * What a proxy recorded before the socket peer (behind the gateway every peer is the gateway), IPv4 unwrapped from
+   * `::ffff:`; `null`, never a placeholder, when neither is known.
+   */
+  getClientIp(): string | null {
+    if (this.transport === "http") {
+      const { req } = this.getHttpContext();
+      // A resolver answering `null` is an addressless unix socket (a local hop); no resolver is an unknown peer.
+      const peer = SignalContext.#httpPeer?.(req);
+      return TrustedProxy.clientAddress(req.headers, peer === undefined ? undefined : (peer?.address ?? null));
+    }
+    const { ws } = this.getWebSocketContext<{ headers?: Headers }>();
+    if (!ws.data.headers) return ws.remoteAddress ? normalizeIpAddress(ws.remoteAddress) : null;
+    return TrustedProxy.clientAddress(ws.data.headers, ws.remoteAddress);
+  }
+  /** The caller's source port as the nearest proxy recorded it, else this socket's own. */
+  getClientPort(): number | null {
+    if (this.transport === "http") {
+      const { req } = this.getHttpContext();
+      return clientPortFromHeaders(req.headers) ?? SignalContext.#httpPeer?.(req)?.port ?? null;
+    }
+    const { ws } = this.getWebSocketContext<{ headers?: Headers }>();
+    return (ws.data.headers ? clientPortFromHeaders(ws.data.headers) : null) ?? null;
+  }
   getRoomId(key: string) {
     if (this.transport !== "websocket") throw new Error("Transport is not websocket");
     else if (this.endpointInfo.type !== "pubsub") throw new Error("Endpoint is not pubsub");
     return `${key}${this.args.length ? "-" : ""}${this.args.join("-")}`;
+  }
+  /**
+   * Appends the caller's internal arguments so subscribers of an `inSelf` slice do not share a room — only for live
+   * rooms, whose sole publisher holds this id. A non-id token is digested so no credential is spelled out in a log.
+   */
+  getLiveRoomId(key: string) {
+    const base = this.getRoomId(key);
+    if (!this.internalArgs.length) return base;
+    return `${base}::${this.internalArgs.map((arg) => SignalContext.#liveRoomToken(arg)).join(".")}`;
+  }
+  static #liveRoomToken(value: unknown): string {
+    if (value === null || value === undefined) return "~";
+    if (typeof value === "object") {
+      const id = (value as { id?: unknown }).id;
+      if (typeof id === "string") return id;
+      return `h${SignalContext.#digest(JSON.stringify(value))}`;
+    }
+    const token = String(value);
+    return /^[A-Za-z0-9_@.:+-]{1,64}$/.test(token) ? token : `h${SignalContext.#digest(token)}`;
+  }
+  /** FNV-1a. Not a security boundary — only a stable, short, room-safe token for a value that is not an id. */
+  static #digest(value: string): string {
+    let hash = 0x811c9dc5;
+    for (let idx = 0; idx < value.length; idx += 1) {
+      hash ^= value.charCodeAt(idx);
+      hash = Math.imul(hash, 0x01000193) >>> 0;
+    }
+    return hash.toString(36);
+  }
+  /** Without guards or the handler: an unsubscribe needs the room id, and leaving a room authorizes nothing. */
+  async resolveInternalArgs() {
+    if (this.internalArgs.length || !this.endpointInfo.internalArgs.length) return this.internalArgs;
+    this.internalArgs = await Promise.all(
+      this.endpointInfo.internalArgs.map(async (arg) => (await new arg.argRef().getArg(this)) ?? null),
+    );
+    return this.internalArgs;
   }
   getEnv() {
     return this.#env;
@@ -394,10 +659,19 @@ export class HttpExecutionContext<Appended = unknown> {
     if (!this.#url) this.#url = new URL(this.req.url);
     return this.#url;
   }
+  /** The read side of `HttpClient.makeUrl`'s `Any` rule: the query string carries the value JSON-encoded. */
+  static #parseAny(name: string, raw: string | string[] | null): unknown {
+    if (raw === null) return null;
+    if (Array.isArray(raw)) return raw.map((value) => HttpExecutionContext.#parseAny(name, value));
+    try {
+      return JSON.parse(raw);
+    } catch {
+      throw new Exception.BadRequest(`Invalid JSON in "${name}"`);
+    }
+  }
   async getArgs(endpointInfo: EndpointInfo): Promise<unknown[]> {
     if (endpointInfo.args.length === 0) return [];
     this.params = this.req.params;
-    // TODO: Optimize the efficiency of this code
     const hasBodyArgs = endpointInfo.args.some((arg) => arg.type === "body");
     const hasUploadArgs = hasBodyArgs && endpointInfo.args.some((arg) => arg.type === "body" && arg.argRef === Upload);
     if (endpointInfo.type === "mutation" && hasBodyArgs && this.req.body) {
@@ -416,28 +690,23 @@ export class HttpExecutionContext<Appended = unknown> {
             this.body[key] = value as string;
           }
         }
-      } else this.body = (await this.req.json()) as RuntimeRecord;
+      } else {
+        CrossSiteGuard.assertJsonBody(this.req.headers.get("content-type"));
+        this.body = (await this.req.json()) as RuntimeRecord;
+      }
     }
 
     const args = endpointInfo.args.map((arg) => {
       switch (arg.type) {
         case "param":
-          return deserialize(arg.argRef, arg.arrDepth, this.params[arg.name], {
-            key: arg.name,
-            nullable: arg.option?.nullable,
-          });
+          return deserializeArg(arg, this.params[arg.name]);
         case "body":
           if (arg.argRef === Upload) return this.body[arg.name];
-          return deserialize(arg.argRef, arg.arrDepth, this.body[arg.name], {
-            key: arg.name,
-            nullable: arg.option?.nullable,
-          });
+          return deserializeArg(arg, this.body[arg.name]);
         case "search": {
-          const value = arg.arrDepth ? this.url.searchParams.getAll(arg.name) : this.url.searchParams.get(arg.name);
-          const result = deserialize(arg.argRef, arg.arrDepth, value, {
-            key: arg.name,
-            nullable: arg.option?.nullable,
-          });
+          const raw = arg.arrDepth ? this.url.searchParams.getAll(arg.name) : this.url.searchParams.get(arg.name);
+          const value = arg.argRef === Any ? HttpExecutionContext.#parseAny(arg.name, raw) : raw;
+          const result = deserializeArg(arg, value);
           this.searchParams[arg.name] = result;
           return result;
         }
@@ -476,15 +745,8 @@ export class WebSocketExecutionContext<Appended = unknown> {
     const args = endpointInfo.args.map((arg, idx) => {
       switch (arg.type) {
         case "msg":
-          return deserialize(arg.argRef, arg.arrDepth, this.data[idx], {
-            key: arg.name,
-            nullable: arg.option?.nullable,
-          });
         case "room":
-          return deserialize(arg.argRef, arg.arrDepth, this.data[idx], {
-            key: arg.name,
-            nullable: arg.option?.nullable,
-          });
+          return deserializeArg(arg, this.data[idx]);
         default:
           return undefined;
       }
@@ -496,14 +758,15 @@ export class WebSocketExecutionContext<Appended = unknown> {
       nullable: endpointInfo.returns.nullable,
     }) as unknown as Response;
   }
-  on(event: "disconnect" | "unsubscribe", handler: () => void) {
+  // Arrows, not methods: `Ws` hands these out detached, and a method would register into its wrapper object.
+  on = (event: "disconnect" | "unsubscribe", handler: () => PromiseOrObject<void>) => {
     if (event === "disconnect") this.onDisconnect.add(handler);
     else this.onUnsubscribe.add(handler);
-  }
-  off(event: "disconnect" | "unsubscribe", handler: () => void) {
+  };
+  off = (event: "disconnect" | "unsubscribe", handler: () => PromiseOrObject<void>) => {
     if (event === "disconnect") this.onDisconnect.delete(handler);
     else this.onUnsubscribe.delete(handler);
-  }
+  };
 }
 
 export class ResolveFieldContext {

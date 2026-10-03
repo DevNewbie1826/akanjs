@@ -1,116 +1,92 @@
 "use client";
-import { clsx, msg, usePage } from "akanjs/client";
+import { msg, usePage } from "akanjs/client";
 import { st } from "akanjs/store";
-import { type ReactNode, useEffect, useState } from "react";
-import {
-  AiOutlineCheckCircle,
-  AiOutlineInfoCircle,
-  AiOutlineLoading3Quarters,
-  AiOutlineQuestionCircle,
-} from "react-icons/ai";
-import { BsExclamationCircleFill } from "react-icons/bs";
+import { useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 
-type MessageType = "success" | "error" | "info" | "warning" | "loading";
+import { Toast, type ToastMessage } from "../Toast";
 
-interface MessageProps {
-  content: ReactNode;
-  type?: MessageType;
-  duration: number; // in seconds
-  keyForMessage: string;
-}
-
-interface TimeOutType {
-  key: string;
-  timeoutId: NodeJS.Timeout;
-}
 interface MsgOption {
   key?: string;
   duration?: number;
   data?: Record<string, string | number>;
 }
 
-let timeOuts: TimeOutType[] = [];
+interface ArmedMessage {
+  message: Omit<ToastMessage, "leaving">;
+  timeoutId: ReturnType<typeof setTimeout>;
+}
 
-const Message = ({ content, type = "info" as MessageType, duration, keyForMessage }: MessageProps) => {
-  const pageState = st.use.pageState();
-  const [preBlind, setPreBlind] = useState(false);
-  useEffect(() => {
-    if (!content) return;
-    // 기존의 timeouts에 key가 있으면, 기존의 timeout을 제거하고 새로운 timeout을 추가한다.
-    const existingTimeOut = timeOuts.find((item) => item.key === keyForMessage);
-    if (existingTimeOut) {
-      clearTimeout(existingTimeOut.timeoutId);
-      removeTimeOut(keyForMessage);
-    }
-
-    const timeoutId = setTimeout(() => {
-      setPreBlind(true);
-    }, duration * 1000);
-    addTimeOut(keyForMessage, timeoutId);
-
-    return () => {
-      clearTimeout(timeoutId);
-    };
-  }, [content, keyForMessage, type]);
-
-  useEffect(() => {
-    if (!preBlind) return;
-    setTimeout(() => {
-      st.do.hideMessage(keyForMessage);
-      removeTimeOut(keyForMessage);
-    }, 100);
-  }, [preBlind]);
-
-  const addTimeOut = (key: string, timeoutId: NodeJS.Timeout) => {
-    const filteredTimeOuts = timeOuts.filter((item) => item.key !== key);
-    timeOuts = [...filteredTimeOuts, { key, timeoutId }];
-  };
-
-  const removeTimeOut = (key: string) => {
-    timeOuts = timeOuts.filter((item) => item.key !== key);
-  };
-
-  const iconClassName = type === "loading" ? "text-info" : `text-${type}`;
-  const getIcon = (type: MessageType) => {
-    const icons: { [key in MessageType]: ReactNode } = {
-      info: <AiOutlineInfoCircle className={clsx("text-2xl", iconClassName)} />,
-      success: <AiOutlineCheckCircle className={clsx("text-2xl", iconClassName)} />,
-      error: <BsExclamationCircleFill className={clsx("text-2xl", iconClassName)} />,
-      warning: <AiOutlineQuestionCircle className={clsx("text-2xl", iconClassName)} />,
-      loading: <AiOutlineLoading3Quarters className={clsx("animate-spin text-2xl", iconClassName)} />,
-    };
-    return icons[type];
-  };
-
-  return (
-    <div
-      data-state={preBlind}
-      className="group w-screen animate-zoomIn px-6 duration-300 data-[state=true]:animate-smaller md:max-w-[60%]"
-      style={{
-        paddingTop: pageState.topSafeArea,
-      }}
-    >
-      <div
-        className={clsx(
-          "typo-body1 flex w-full items-center gap-2 rounded-[4px] border px-4 py-2 text-base-content drop-shadow-lg",
-          {
-            "border-[#EEEEEE] bg-primary-content stroke-base-content": type === "loading" || type === "info",
-            "border-success-border bg-success/80 stroke-success": type === "success",
-            "border-error-border bg-error/80 stroke-error": type === "error",
-            "border-warning-border bg-warning/80 stroke-warning": type === "warning",
-          },
-        )}
-      >
-        <div className="flex size-6 items-center justify-center rounded-full bg-base-100">{getIcon(type)}</div>
-        <span className="truncate whitespace-nowrap text-base-100">{content}</span>
-      </div>
-    </div>
-  );
-};
+// An override with no exit animation never fires `onClosed`, so a leaving message is dropped after this anyway.
+const exitGraceMs = 2000;
 
 export const Messages = () => {
-  const messages = st.use.messages();
+  const messages = st.use.messages({ agent: false });
+  const pageState = st.use.pageState({ agent: false });
   const { l } = usePage();
+  const [portalElement, setPortalElement] = useState<HTMLElement | null>(null);
+  const [leavingKeys, setLeavingKeys] = useState<string[]>([]);
+  const timers = useRef(new Map<string, ArmedMessage>());
+
+  const dropMessage = (key: string) => {
+    const armed = timers.current.get(key);
+    if (armed) {
+      clearTimeout(armed.timeoutId);
+      timers.current.delete(key);
+    }
+    setLeavingKeys((keys) => keys.filter((leavingKey) => leavingKey !== key));
+    st.do.hideMessage(key);
+  };
+
+  const startLeaving = (key: string) => {
+    const armed = timers.current.get(key);
+    if (armed) {
+      clearTimeout(armed.timeoutId);
+      timers.current.set(key, { message: armed.message, timeoutId: setTimeout(() => dropMessage(key), exitGraceMs) });
+    }
+    setLeavingKeys((keys) => (keys.includes(key) ? keys : [...keys, key]));
+  };
+
+  useEffect(() => {
+    if (typeof document === "undefined") return;
+    setPortalElement(document.body);
+  }, []);
+
+  useEffect(() => {
+    const running = timers.current;
+    const rearmed: string[] = [];
+    for (const message of messages) {
+      const armed = running.get(message.key);
+      // `showMessage` replaces the object for a re-shown key, so identity (not a list change) restarts a countdown.
+      if (armed?.message === message) continue;
+      if (armed) {
+        clearTimeout(armed.timeoutId);
+        rearmed.push(message.key);
+      }
+      running.set(message.key, {
+        message,
+        timeoutId: setTimeout(() => startLeaving(message.key), message.duration * 1000),
+      });
+    }
+    for (const [key, armed] of [...running]) {
+      if (messages.some((message) => message.key === key)) continue;
+      clearTimeout(armed.timeoutId);
+      running.delete(key);
+    }
+    setLeavingKeys((keys) => {
+      const alive = keys.filter((key) => !rearmed.includes(key) && messages.some((message) => message.key === key));
+      return alive.length === keys.length ? keys : alive;
+    });
+  }, [messages]);
+
+  useEffect(() => {
+    const running = timers.current;
+    return () => {
+      for (const armed of running.values()) clearTimeout(armed.timeoutId);
+      running.clear();
+    };
+  }, []);
+
   useEffect(() => {
     Object.assign(msg, {
       info: (msgKey: `${string}.${string}`, option = {} as MsgOption) => {
@@ -155,21 +131,19 @@ export const Messages = () => {
       },
     });
   }, []);
-  if (!messages.length) return null;
-  return (
-    <div
-      id="toast"
-      className="fixed top-0 left-0 z-[100] mt-[var(--safe-area-top)] flex h-fit w-screen flex-col items-center justify-start gap-2 pt-2"
-    >
-      {messages.map((message) => (
-        <Message
-          content={message.content}
-          type={message.type}
-          duration={message.duration}
-          key={message.key}
-          keyForMessage={message.key}
-        />
-      ))}
-    </div>
+  if (!messages.length || !portalElement) return null;
+  const toastMessages: ToastMessage[] = messages.map((message) => ({
+    ...message,
+    leaving: leavingKeys.includes(message.key),
+  }));
+  // Portalled: `#pageContainers` is `isolation: isolate`, so no z-index inside it rises above a body-level overlay.
+  return createPortal(
+    <Toast
+      messages={toastMessages}
+      topSafeArea={pageState.topSafeArea}
+      onClose={startLeaving}
+      onClosed={dropMessage}
+    />,
+    portalElement,
   );
 };

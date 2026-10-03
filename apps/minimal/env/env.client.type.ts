@@ -1,12 +1,4 @@
-import type { ClientEnv } from "akanjs/base";
-
-export type AppClientEnv = ClientEnv & {
-  google?: {
-    mapKey: string;
-  };
-  cloudflare?: {
-    siteKey: string;
-  };
+export type AppClientEnv = {
   firebase?: {
     apiKey: string;
     authDomain?: string;
@@ -16,5 +8,11 @@ export type AppClientEnv = ClientEnv & {
     appId: string;
     measurementId?: string;
     vapidKey?: string;
+  };
+  google?: {
+    mapKey: string;
+  };
+  cloudflare?: {
+    siteKey: string;
   };
 };

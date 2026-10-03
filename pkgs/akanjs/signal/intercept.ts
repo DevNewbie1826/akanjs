@@ -3,12 +3,15 @@ import { Logger } from "akanjs/common";
 import { type ExtractInjectInfoObject, type InjectBuilder, type InjectInfo, injectionBuilder } from "akanjs/service";
 import type { SignalContext } from "./signalContext";
 
-export type InterceptorCls<Methods = {}, InjectMap extends { [key: string]: InjectInfo } = {}> = Cls<
+export type InterceptorCls<
+  Methods = Record<never, never>,
+  InjectMap extends { [key: string]: InjectInfo } = Record<never, never>,
+> = Cls<
   Methods &
     ExtractInjectInfoObject<InjectMap> & {
       readonly logger: Logger;
-      onInit(): Promise<void>;
-      onDestroy(): Promise<void>;
+      onInit(): Promise<void> | void;
+      onDestroy(): Promise<void> | void;
       intercept(context: SignalContext): AsyncGenerator<unknown> | Promise<unknown>;
     },
   { readonly [INJECT_META]: InjectMap; readonly refName: string }
@@ -19,7 +22,7 @@ export function intercept<Name extends string>(name: Name): InterceptorCls;
 export function intercept<Name extends string, Injection extends InjectBuilder<"use" | "env" | "memory">>(
   refName: Name,
   injectBuilder: Injection,
-): InterceptorCls<{}, ReturnType<Injection>>;
+): InterceptorCls<Record<never, never>, ReturnType<Injection>>;
 
 export function intercept(refName: string, injectBuilder?: InjectBuilder) {
   const injectInfoMap = injectBuilder?.(injectionBuilder(refName)) ?? {};
@@ -31,10 +34,10 @@ export function intercept(refName: string, injectBuilder?: InjectBuilder) {
     intercept(context: SignalContext): AsyncGenerator | Promise<(res: Response) => Promise<Response>> {
       return Promise.resolve((res: Response) => Promise.resolve(res));
     }
-    async onInit() {
+    onInit(): Promise<void> | void {
       //
     }
-    async onDestroy() {
+    onDestroy(): Promise<void> | void {
       //
     }
   };

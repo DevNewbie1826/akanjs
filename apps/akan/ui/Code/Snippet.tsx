@@ -1,7 +1,7 @@
 import "./styles.css";
 
-import { clsx } from "akanjs/client";
-import type { BundledLanguage, BundledTheme } from "shiki";
+import { cn } from "akanjs/client";
+import type { BundledLanguage } from "shiki";
 
 import { CodeView } from "./CodeView";
 import { Raw } from "./Raw";
@@ -12,7 +12,6 @@ interface SnippetProps {
   language?: BundledLanguage;
   title?: string;
   copy?: boolean;
-  theme?: BundledTheme;
   showLineNumbers?: boolean;
   wrapperClassName?: string;
 }
@@ -23,27 +22,26 @@ export const Snippet = ({
   language = "typescript",
   title,
   copy = true,
-  theme,
   showLineNumbers = true,
   wrapperClassName,
 }: SnippetProps) => {
   const trimmedCode = code.trim();
-  const copyText = getCopyText(trimmedCode);
+  const copyText = getCopyText(trimmedCode, language);
   const lastCode = trimmedCode.slice(-10);
   return (
     <CodeView
-      className={clsx("my-3 w-fit", className)}
+      className={cn("my-3 w-fit", className)}
       key={`${title}-${lastCode}`}
       title={title}
       wrapperClassName={wrapperClassName}
       copyText={copy ? copyText : undefined}
     >
-      <Raw className="p-2" language={language} theme={theme} code={trimmedCode} showLineNumbers={showLineNumbers} />
+      <Raw className="px-2 py-3" language={language} code={trimmedCode} showLineNumbers={showLineNumbers} />
     </CodeView>
   );
 };
 
-function getCopyText(trimmedCode: string): string {
+function getCopyText(trimmedCode: string, language: BundledLanguage): string {
   const lines = trimmedCode.split("\n");
   const result: string[] = [];
   let skipCount = 0;
@@ -58,7 +56,8 @@ function getCopyText(trimmedCode: string): string {
       continue;
     }
     if (/\/\/\s*\[!code\s+--\]/.test(line)) continue;
-    if (/^\s*#/.test(line)) continue;
+    //? only a shell comment is dropped; in TS a leading # is a private field and in markdown a heading
+    if (language === "bash" && /^\s*#/.test(line)) continue;
     result.push(line.replace(/\s*\/\/\s*\[!code[^\]]*\]/g, ""));
   }
   return result.join("\n");

@@ -107,16 +107,20 @@ export class EndpointInfo<
     this.returns = EndpointInfo.getReturnInfo(returnRef, signalOption);
     this.signalOption = signalOption;
   }
+  #addArg(type: ArgType, name: string, arg: ConstantFieldTypeInput, option?: EndpointArgProps<boolean>) {
+    if (this.execFn) throw new Error("Query function is already set");
+    if (type !== "body" && type !== "search" && this.args.at(-1)?.option?.nullable)
+      throw new Error("Last argument is nullable");
+    this.argNames.push(name);
+    this.args.push(EndpointInfo.getArgInfo(type, name, arg, option));
+  }
   param<
     ArgName extends string,
     Arg extends ParamFieldType,
     _ClientArg = FieldToValue<Arg>,
     _ServerArg = DocumentModel<_ClientArg>,
   >(name: string, arg: Arg, option?: Omit<EndpointArgProps, "nullable">) {
-    if (this.execFn) throw new Error("Query function is already set");
-    else if (this.args.at(-1)?.option?.nullable) throw new Error("Last argument is nullable");
-    this.argNames.push(name);
-    this.args.push(EndpointInfo.getArgInfo("param", name, arg, option));
+    this.#addArg("param", name, arg, option);
     return this as unknown as EndpointInfo<
       ReqType,
       Srvs,
@@ -139,9 +143,7 @@ export class EndpointInfo<
     _ClientArg = UploadableClientArg<PurifiedModel<_ArgType>>,
     _ServerArg = DocumentModel<_ArgType>,
   >(name: ArgName, arg: Arg, option?: EndpointArgProps<Optional>) {
-    if (this.execFn) throw new Error("Query function is already set");
-    this.argNames.push(name);
-    this.args.push(EndpointInfo.getArgInfo("body", name, arg, option));
+    this.#addArg("body", name, arg, option);
     return this as unknown as EndpointInfo<
       ReqType,
       Srvs,
@@ -163,10 +165,7 @@ export class EndpointInfo<
     _ClientArg = PurifiedModel<_ArgType>,
     _ServerArg = DocumentModel<_ArgType>,
   >(name: string, arg: Arg, option?: Omit<EndpointArgProps, "nullable">) {
-    if (this.execFn) throw new Error("Query function is already set");
-    else if (this.args.at(-1)?.option?.nullable) throw new Error("Last argument is nullable");
-    this.argNames.push(name);
-    this.args.push(EndpointInfo.getArgInfo("room", name, arg, option));
+    this.#addArg("room", name, arg, option);
     return this as unknown as EndpointInfo<
       ReqType,
       Srvs,
@@ -189,10 +188,7 @@ export class EndpointInfo<
     _ClientArg = PurifiedModel<_ArgType>,
     _ServerArg = DocumentModel<_ArgType>,
   >(name: string, arg: Arg, option?: EndpointArgProps<Optional>) {
-    if (this.execFn) throw new Error("Query function is already set");
-    else if (this.args.at(-1)?.option?.nullable) throw new Error("Last argument is nullable");
-    this.argNames.push(name);
-    this.args.push(EndpointInfo.getArgInfo("msg", name, arg, option));
+    this.#addArg("msg", name, arg, option);
     return this as unknown as EndpointInfo<
       ReqType,
       Srvs,
@@ -214,9 +210,7 @@ export class EndpointInfo<
     _ClientArg = PurifiedModel<_ArgType>,
     _ServerArg = DocumentModel<_ArgType>,
   >(name: string, arg: Arg, option?: Omit<EndpointArgProps, "nullable">) {
-    if (this.execFn) throw new Error("Query function is already set");
-    this.argNames.push(name);
-    this.args.push(EndpointInfo.getArgInfo("search", name, arg, { ...option, nullable: true }));
+    this.#addArg("search", name, arg, { ...option, nullable: true });
     return this as unknown as EndpointInfo<
       ReqType,
       Srvs,
@@ -274,6 +268,15 @@ export class EndpointInfo<
       Nullable
     >;
   }
+  // Not `_addArgs` (it routes `search` back to `.search()`) nor `.room()` (it refuses a non-last nullable, which a
+  // positional room array does not need); nullability is kept so an absent optional argument still deserializes.
+  _addRoomArgs(args: ArgInfo<EndpointArgProps<boolean>>[]) {
+    for (const arg of args) {
+      this.argNames.push(arg.name);
+      this.args.push({ ...arg, type: "room" });
+    }
+    return this;
+  }
   _addInternalArgs(args: InternalArgInfo<boolean>[]) {
     for (const arg of args) this.with(arg.argRef, arg.option);
     return this;
@@ -323,11 +326,24 @@ export class EndpointInfo<
         ...this.args.filter((arg) => arg.type === "param").map((arg) => `:${arg.name}`),
       ].join("/")}`;
   }
+
+  /** The route the server mounts, below the global prefix; the fetch client is handed it to call the same one. */
+  getRoutePath(key: string, defaultPrefix?: string) {
+    return `${EndpointInfo.resolveServicePrefix(this.signalOption.prefix, defaultPrefix)}${this.getPath(key)}`;
+  }
+
+  static resolveServicePrefix(prefix: false | string | undefined, defaultPrefix?: string): string {
+    if (prefix === false || prefix === "") return "";
+    const resolved = prefix ?? defaultPrefix;
+    if (!resolved) return "";
+    const trimmed = resolved.trim().replace(/^\/+|\/+$/g, "");
+    return trimmed ? `/${trimmed}` : "";
+  }
 }
 
-// TODO: signal type 에 따라 기본 internal arg들 배정해주기
-// TODO: pubsub은 exec 없어도 되게하기
-// TODO: exec 없으면 타입에러 뜨게하기
+// TODO: assign the default internal args per endpoint type, so a `pubsub` need not name `Ws` by hand
+// TODO: let a `pubsub` declare no `exec` — subscribing is the whole behaviour for a room with no query
+// TODO: make a missing `exec` a type error rather than a null `execFn` the resolver skips at boot
 export type BuildEndpoint<SrvModule extends ServiceModel = ServiceModel> = {
   query: <Returns extends ConstantFieldTypeInput = ConstantFieldTypeInput, Nullable extends boolean = false>(
     returnRef: Returns,
@@ -370,10 +386,6 @@ export type EndpointBuilder<SrvModule extends ServiceModel = ServiceModel> = (bu
   [key: string]: EndpointInfo;
 };
 
-// --- Accessors ---
-// Named projections for EndpointInfo's 10 generics. Use these instead of
-// re-inferring the whole shape so that parameter-order refactors only need
-// to be reflected in one place.
 type EndpointInfoEmptyParts = {
   reqType: never;
   srvs: never;

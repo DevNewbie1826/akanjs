@@ -3,7 +3,6 @@ import type {
   LayoutModule,
   LayoutProps,
   PageProps,
-  PageState,
   PathRoute,
   ResolveHead,
   Route,
@@ -13,31 +12,26 @@ import type {
 import {
   assertUniqueRoutePatterns,
   compareRouteSpecificity,
+  getRouteExports,
+  Logger,
   matchRoutePattern,
-  parseBasePaths,
   parseRouteModuleKey,
+  type RouteLayer,
+  RouteLayering,
   routeSegmentToTreePath,
 } from "akanjs/common";
 import { createElement } from "react";
-import { validatePageConfig } from "../client/frameConfig";
-import { resolveHeadExport, resolveMetadataHead } from "./metadata";
+import { defaultPageState, validatePageConfig } from "../client/frameConfig";
+import {
+  type ResolvedRouteModule,
+  type RouteModuleSource,
+  resolveRouteModule,
+} from "../client/route/resolveRouteModule";
+import { matchRoutePrefix } from "../common/routeConvention";
 
 type RouteModuleKindWithOverrides = "page" | "layout" | "overrides";
 
-export type PagesContext = Record<string, () => Promise<RouteModule>>;
-
-export const defaultPageState: PageState = {
-  transition: "none",
-  topSafeArea: 0,
-  bottomSafeArea: 0,
-  topInset: 0,
-  bottomInset: 0,
-  gesture: true,
-  cache: false,
-  ssr: "stream",
-  topSafeAreaColor: "transparent",
-  bottomSafeAreaColor: "transparent",
-};
+export type PagesContext = Record<string, () => Promise<RouteModuleSource>>;
 
 export interface RouteModuleCacheStats {
   moduleCount: number;
@@ -49,44 +43,8 @@ export interface RouteModuleCacheStats {
 }
 
 export class RouteTreeBuilder {
-  static readonly #pageRouteExports = new Set([
-    "default",
-    "pageConfig",
-    "head",
-    "metadata",
-    "generateHead",
-    "generateMetadata",
-    "Loading",
-  ]);
-  static readonly #rootLayoutExports = new Set([
-    "default",
-    "pageConfig",
-    "head",
-    "metadata",
-    "generateHead",
-    "generateMetadata",
-    "fonts",
-    "manifest",
-    "theme",
-    "reconnect",
-    "wsConnect",
-    "layoutStyle",
-    "gaTrackingId",
-    "Loading",
-    "NotFound",
-    "Error",
-  ]);
-  static readonly #layoutRouteExports = new Set([
-    "default",
-    "pageConfig",
-    "head",
-    "metadata",
-    "generateHead",
-    "generateMetadata",
-    "Loading",
-    "NotFound",
-    "Error",
-  ]);
+  static readonly logger = new Logger("RouteTreeBuilder");
+  static readonly #legacyWarned = new Set<string>();
   static readonly #moduleCacheStats: RouteModuleCacheStats = {
     moduleCount: 0,
     loadedModuleCount: 0,
@@ -97,15 +55,12 @@ export class RouteTreeBuilder {
   };
 
   readonly #context: PagesContext;
-  readonly #baseLayoutPaths: string[];
   readonly #routeMap = new Map<string, Route>();
   readonly #pagePatterns: { key: string; pattern: string }[] = [];
   readonly #fallbackRoutes: LayoutFallbackRoute[] = [];
 
   constructor(context: PagesContext) {
     this.#context = context;
-    const basePaths = process.env.AKAN_PUBLIC_BASE_PATHS ? parseBasePaths(process.env.AKAN_PUBLIC_BASE_PATHS) : null;
-    this.#baseLayoutPaths = ["/", "/:lang", ...(basePaths?.map((bp) => `/:lang/${bp}`) ?? [])];
     this.#routeMap.set("/", { path: "/", children: new Map() });
   }
 
@@ -159,7 +114,7 @@ export class RouteTreeBuilder {
     const candidates = fallbackRoutes
       .map((fallbackRoute) => ({
         fallbackRoute,
-        params: RouteTreeBuilder.#matchRoutePrefix(fallbackRoute.path, pathname),
+        params: matchRoutePrefix(fallbackRoute.path, pathname),
       }))
       .filter((entry): entry is { fallbackRoute: LayoutFallbackRoute; params: Record<string, string> } =>
         Boolean(entry.params),
@@ -185,7 +140,7 @@ export class RouteTreeBuilder {
     return result;
   }
 
-  #addRouteModule(filePath: string, loader: () => Promise<RouteModule>) {
+  #addRouteModule(filePath: string, loader: () => Promise<RouteModuleSource>) {
     const parsed = parseRouteModuleKey(filePath);
     if (parsed.kind === "page") this.#pagePatterns.push({ key: filePath, pattern: parsed.pattern });
     const pathSegments = ["/", ...parsed.routeSegments.map(routeSegmentToTreePath)];
@@ -196,7 +151,6 @@ export class RouteTreeBuilder {
       if (!children) throw new Error("No children");
       return children;
     }, this.#routeMap);
-    if (!targetRouteMap) return;
 
     const targetPath = pathSegments[pathSegments.length - 1];
     if (!targetPath) return;
@@ -213,7 +167,7 @@ export class RouteTreeBuilder {
     targetRouteMap.set(targetPath, {
       ...(targetRouteMap.get(targetPath) ?? { path: targetPath, children: new Map<string, Route>() }),
       ...(parsed.kind === "layout"
-        ? { renderLayout: routeRender }
+        ? { renderLayout: routeRender, isRootLayout: parsed.isInternalRootLayout }
         : {
             renderPage: routeRender,
             pageIncludesOwnLayout: parsed.leaf === "_index",
@@ -222,51 +176,27 @@ export class RouteTreeBuilder {
     } as Route);
   }
 
-  #getPathRoutes(
-    route: Route,
-    parentRootLayouts: RouteRender[] = [],
-    parentLayouts: RouteRender[] = [],
-    parentPaths: string[] = [],
-    parentHead?: ResolveHead,
-  ): PathRoute[] {
-    const parentPath = parentPaths.filter((p) => p !== "/").join("");
-    const currentPathSegment = /^\/\(.*\)$/.test(route.path) ? "" : route.path;
-    const isRoot = this.#baseLayoutPaths.includes(parentPath + currentPathSegment) && parentRootLayouts.length < 2;
-    const routePath = parentPath + currentPathSegment;
-    const pathSegments = [...parentPaths, ...(currentPathSegment ? [currentPathSegment] : [])];
-    const currentRootLayout = isRoot && route.renderLayout ? route.renderLayout : null;
-    const currentLayout = !isRoot && route.renderLayout ? route.renderLayout : null;
-    // Overrides always ride the (non-root) layout stream so both SSR and CSR mount the provider, and sit just
-    // outside this node's own layout so the layout's UI is overridden too. Nested `_overrides.tsx` then stack
-    // into nested providers, so the closest declaration wins (the provider merges over ancestor context).
-    const currentOverrideRenders = route.renderOverrides ? [route.renderOverrides] : [];
-    const renderRootLayouts = [...parentRootLayouts, ...(currentRootLayout ? [currentRootLayout] : [])];
-    const renderLayouts = [...parentLayouts, ...currentOverrideRenders, ...(currentLayout ? [currentLayout] : [])];
+  #getPathRoutes(route: Route, parent: RouteLayer<RouteRender> | null = null, parentHead?: ResolveHead): PathRoute[] {
+    const layer = RouteLayering.of(route, parent);
     if (route.renderLayout) {
       this.#fallbackRoutes.push({
-        path: routePath,
-        pathSegments,
-        renderRootLayouts,
-        renderLayouts,
+        path: layer.path,
+        pathSegments: layer.pathSegments,
+        renderRootLayouts: layer.renderRootLayouts,
+        renderLayouts: layer.renderLayouts,
       });
     }
     const routeHead = RouteTreeBuilder.#composeHeadResolvers(route.renderLayout?.resolveHead, parentHead);
-    const pageRenderRootLayouts =
-      route.pageIncludesOwnLayout === false && currentRootLayout ? parentRootLayouts : renderRootLayouts;
-    const pageRenderLayouts =
-      route.pageIncludesOwnLayout === false && currentLayout
-        ? [...parentLayouts, ...currentOverrideRenders]
-        : renderLayouts;
     const pageHead = route.pageIncludesOwnLayout === false ? parentHead : routeHead;
     return [
       ...(route.renderPage
         ? [
             {
-              path: routePath,
-              pathSegments,
+              path: layer.path,
+              pathSegments: layer.pathSegments,
               renderPage: route.renderPage,
-              renderRootLayouts: pageRenderRootLayouts,
-              renderLayouts: pageRenderLayouts,
+              renderRootLayouts: layer.pageRenderRootLayouts,
+              renderLayouts: layer.pageRenderLayouts,
               resolveHead: RouteTreeBuilder.#composeHeadResolvers(route.renderPage.resolveHead, pageHead),
               isSpecialRoute: route.isSpecialRoute,
               pageState: route.pageState ?? defaultPageState,
@@ -274,15 +204,13 @@ export class RouteTreeBuilder {
           ]
         : []),
       ...(route.children.size
-        ? [...route.children.values()].flatMap((child) =>
-            this.#getPathRoutes(child, renderRootLayouts, renderLayouts, pathSegments, routeHead),
-          )
+        ? [...route.children.values()].flatMap((child) => this.#getPathRoutes(child, layer, routeHead))
         : []),
     ];
   }
 
-  static #makeLazyModule(key: string, kind: RouteModuleKindWithOverrides, loader: () => Promise<RouteModule>) {
-    let cached: RouteModule | null = null;
+  static #makeLazyModule(key: string, kind: RouteModuleKindWithOverrides, loader: () => Promise<RouteModuleSource>) {
+    let cached: ResolvedRouteModule | null = null;
     let loaded = false;
     RouteTreeBuilder.#moduleCacheStats.moduleCount += 1;
     return async () => {
@@ -291,32 +219,39 @@ export class RouteTreeBuilder {
         return cached;
       }
       RouteTreeBuilder.#moduleCacheStats.cacheMisses += 1;
-      const mod = await loader();
-      RouteTreeBuilder.#validateRouteModuleExports(key, kind, mod);
-      validatePageConfig(key, "pageConfig" in mod ? mod.pageConfig : undefined);
+      const resolved = RouteTreeBuilder.#resolveModule(key, kind, await loader());
+      RouteTreeBuilder.#validateRouteModuleExports(key, kind, resolved.module);
+      validatePageConfig(key, "pageConfig" in resolved.module ? resolved.module.pageConfig : undefined);
       if (!loaded) {
         RouteTreeBuilder.#moduleCacheStats.loadedModuleCount += 1;
         RouteTreeBuilder.#moduleCacheStats.loadedModuleKeys.push(key);
         loaded = true;
       }
-      if (process.env.AKAN_ROUTE_MODULE_CACHE !== "0") cached = mod;
-      return mod;
+      if (process.env.AKAN_ROUTE_MODULE_CACHE !== "0") cached = resolved;
+      return resolved;
     };
+  }
+
+  static #resolveModule(key: string, kind: RouteModuleKindWithOverrides, mod: RouteModuleSource): ResolvedRouteModule {
+    if (kind === "overrides") return { module: mod as RouteModule };
+    const parsed = parseRouteModuleKey(key);
+    const resolved = resolveRouteModule(mod, key, { kind, pattern: parsed.pattern });
+    if (!resolved.definition && !parsed.isInternalRootLayout && !RouteTreeBuilder.#legacyWarned.has(key)) {
+      RouteTreeBuilder.#legacyWarned.add(key);
+      RouteTreeBuilder.logger.warn(
+        `${key} uses the legacy route shape (a default function beside named exports). Write \`export default ${kind === "layout" ? "layout()" : "page()"}…\` instead — see the "Migrating page/" recipe.`,
+      );
+    }
+    return resolved;
   }
 
   static #validateRouteModuleExports(key: string, kind: RouteModuleKindWithOverrides, mod: RouteModule) {
     if (kind === "overrides") {
-      // The loaded module is the generated `"use client"` override wrapper, whose default mounts the provider.
       if (!mod.default) throw new Error(`[route-convention] ${key} generated override wrapper has no default export`);
       return;
     }
     const parsed = parseRouteModuleKey(key);
-    const allowed =
-      kind === "page"
-        ? RouteTreeBuilder.#pageRouteExports
-        : parsed.isInternalRootLayout
-          ? RouteTreeBuilder.#rootLayoutExports
-          : RouteTreeBuilder.#layoutRouteExports;
+    const allowed = getRouteExports(kind, { rootLayout: parsed.isInternalRootLayout });
     for (const exportName of Object.keys(mod)) {
       if (!allowed.has(exportName)) {
         throw new Error(`[route-convention] unsupported export "${exportName}" in ${key}`);
@@ -326,95 +261,59 @@ export class RouteTreeBuilder {
     if ("head" in mod && "generateHead" in mod) {
       throw new Error(`[route-convention] head and generateHead cannot both be exported in ${key}`);
     }
-    if (
-      !parsed.isInternalRootLayout &&
-      ("head" in mod || "generateHead" in mod) &&
-      ("metadata" in mod || "generateMetadata" in mod)
-    ) {
-      throw new Error(
-        `[route-convention] head/generateHead and metadata/generateMetadata cannot both be exported in ${key}`,
-      );
-    }
-    if ("metadata" in mod && "generateMetadata" in mod) {
-      throw new Error(`[route-convention] metadata and generateMetadata cannot both be exported in ${key}`);
-    }
   }
 
-  static #makeRouteRender(key: string, kind: "page" | "layout", loader: () => Promise<RouteModule>): RouteRender {
+  static #makeRouteRender(key: string, kind: "page" | "layout", loader: () => Promise<RouteModuleSource>): RouteRender {
     const loadModule = RouteTreeBuilder.#makeLazyModule(key, kind, loader);
+    const syncFallbacks = (mod: LayoutModule) => {
+      routeRender.NotFound = mod.NotFound;
+      routeRender.Error = mod.Error;
+      return mod;
+    };
+    const loadSynced = async () => {
+      const { module: mod } = await loadModule();
+      routeRender.Loading = mod.Loading as never;
+      if (kind === "layout") syncFallbacks(mod as LayoutModule);
+      return mod;
+    };
+    const pageConfigOf = async () => {
+      const { module: mod } = await loadModule();
+      return "pageConfig" in mod ? mod.pageConfig : undefined;
+    };
     const routeRender: RouteRender = {
       isAsync: true,
       resolveLoading: async () => {
-        const mod = await loadModule();
+        const { module: mod } = await loadModule();
         routeRender.Loading = mod.Loading as never;
       },
       render: async (props: LayoutProps | PageProps) => {
-        const mod = await loadModule();
-        routeRender.Loading = mod.Loading as never;
-        if (kind === "layout") {
-          const layoutMod = mod as LayoutModule;
-          routeRender.NotFound = layoutMod.NotFound;
-          routeRender.Error = layoutMod.Error;
-        }
+        const mod = await loadSynced();
         if (!mod.default) throw new Error(`[route-convention] ${key} has no default export`);
         return mod.default(props as never);
       },
       resolveHead: async (props: PageProps) => {
-        const mod = await loadModule();
-        routeRender.Loading = mod.Loading as never;
-        if (kind === "layout") {
-          const layoutMod = mod as LayoutModule;
-          routeRender.NotFound = layoutMod.NotFound;
-          routeRender.Error = layoutMod.Error;
-        }
-        if (mod.generateHead) {
-          const head = await mod.generateHead(props);
-          if (head !== null && head !== undefined) return resolveHeadExport(head, { includeHeadSnapshot: false });
-        }
-        if (mod.generateMetadata) {
-          const metadata = await mod.generateMetadata(props);
-          return metadata === null || metadata === undefined ? metadata : resolveMetadataHead(metadata);
-        }
-        if (mod.head !== undefined)
-          return mod.head === null ? null : resolveHeadExport(mod.head, { includeHeadSnapshot: false });
-        return mod.metadata === undefined ? undefined : resolveMetadataHead(mod.metadata);
+        const mod = await loadSynced();
+        return mod.generateHead ? await mod.generateHead(props) : mod.head;
       },
     };
     if (kind === "page") {
-      routeRender.getPageConfig = async () => {
-        const mod = await loadModule();
-        return "pageConfig" in mod ? mod.pageConfig : undefined;
-      };
+      routeRender.getPageConfig = pageConfigOf;
+      routeRender.getRouteDefinition = async () => (await loadModule()).definition;
     } else {
-      routeRender.getLayoutPageConfig = async () => {
-        const mod = await loadModule();
-        return "pageConfig" in mod ? mod.pageConfig : undefined;
-      };
-      routeRender.resolveNotFound = async () => {
-        const mod = (await loadModule()) as LayoutModule;
-        routeRender.NotFound = mod.NotFound;
-        routeRender.Error = mod.Error;
-        return mod.NotFound;
-      };
-      routeRender.resolveError = async () => {
-        const mod = (await loadModule()) as LayoutModule;
-        routeRender.NotFound = mod.NotFound;
-        routeRender.Error = mod.Error;
-        return mod.Error;
-      };
+      routeRender.getLayoutPageConfig = pageConfigOf;
+      routeRender.resolveNotFound = async () => syncFallbacks((await loadModule()).module as LayoutModule).NotFound;
+      routeRender.resolveError = async () => syncFallbacks((await loadModule()).module as LayoutModule).Error;
     }
     return routeRender;
   }
 
-  // A `_overrides.tsx` renders through its generated `"use client"` wrapper layout: the wrapper's default mounts
-  // the `UiOverrideProvider` (with the manifest's slot bindings) around the subtree. On the server the wrapper is
-  // a client reference, on the client the real component — `createElement` handles both. No head/config/fallback.
-  #makeOverridesRender(key: string, loader: () => Promise<RouteModule>): RouteRender {
+  // `_overrides.tsx` renders via its generated "use client" wrapper, a client reference on the server: createElement.
+  #makeOverridesRender(key: string, loader: () => Promise<RouteModuleSource>): RouteRender {
     const loadModule = RouteTreeBuilder.#makeLazyModule(key, "overrides", loader);
     return {
       isAsync: true,
       render: (async ({ children }: LayoutProps) => {
-        const mod = await loadModule();
+        const { module: mod } = await loadModule();
         if (!mod.default) throw new Error(`[route-convention] ${key} generated override wrapper has no default export`);
         return createElement(mod.default as never, { children } as never);
       }) as RouteRender["render"],
@@ -431,23 +330,5 @@ export class RouteTreeBuilder {
       }
       return undefined;
     };
-  }
-
-  static #matchRoutePrefix(pattern: string, pathname: string): Record<string, string> | null {
-    const patternParts = pattern.split("/").filter(Boolean);
-    const pathParts = pathname.split("/").filter(Boolean);
-    if (patternParts.length > pathParts.length) return null;
-    const params: Record<string, string> = {};
-    for (let index = 0; index < patternParts.length; index++) {
-      const patternPart = patternParts[index];
-      const pathPart = pathParts[index];
-      if (!patternPart || !pathPart) return null;
-      if (patternPart.startsWith(":")) {
-        params[patternPart.slice(1)] = decodeURIComponent(pathPart);
-        continue;
-      }
-      if (patternPart !== pathPart) return null;
-    }
-    return params;
   }
 }

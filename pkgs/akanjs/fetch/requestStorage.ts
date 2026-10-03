@@ -12,11 +12,20 @@ export interface AkanDynamicUsage {
   cookies: boolean;
 }
 
+/** One `fetch.*` query a request made, by endpoint and argument — what a page's data footprint is read off. */
+export interface RequestQueryRecord {
+  key: string;
+  args: Record<string, unknown>;
+  returns: { refName: string; modelType?: string; arrDepth?: number; nullable?: boolean };
+  value: Promise<unknown>;
+}
+
 export interface AkanRequestStore {
   request: Request;
   theme?: AkanTheme;
   frameState?: unknown;
   queryCache: Map<string, Promise<unknown>>;
+  queryLog: RequestQueryRecord[];
   policy: AkanRequestPolicy;
   dynamicUsage: AkanDynamicUsage;
 }
@@ -34,11 +43,8 @@ declare global {
 let _requestStorage: RequestStorage | null = null;
 if (typeof window === "undefined") {
   try {
-    // Keep this module synchronous. CSR builds import `akanjs/fetch` through
-    // Bun's HMR runtime, and a top-level `await import("node:async_hooks")`
-    // turns the whole `export *` chain into an async module. Named imports
-    // from that chain can then be observed as `null` during evaluation
-    // (notably `FetchClient` in `akanjs/client/useClient.ts`).
+    // Synchronous on purpose: a top-level `await import()` makes the CSR `export *` chain async under Bun's HMR,
+    // where named imports (`FetchClient` in `akanjs/client/useClient.ts`) read `null` mid-evaluation.
     const { AsyncLocalStorage } = require("node:async_hooks") as typeof import("node:async_hooks");
     const als = new AsyncLocalStorage<AkanRequestStore>();
     globalThis.__AKAN_REQUEST_STORAGE__ ??= {
@@ -55,10 +61,6 @@ if (typeof window === "undefined") {
 
 export const requestStorage: RequestStorage | null = _requestStorage;
 
-function createRequestPolicy(): AkanRequestPolicy {
-  return { tags: new Set() };
-}
-
 export function createRequestStore(
   request: Request,
   policy: Partial<Omit<AkanRequestPolicy, "tags">> = {},
@@ -66,7 +68,8 @@ export function createRequestStore(
   return {
     request,
     queryCache: new Map(),
-    policy: { ...createRequestPolicy(), ...policy },
+    queryLog: [],
+    policy: { tags: new Set(), ...policy },
     dynamicUsage: { headers: false, cookies: false },
   };
 }
@@ -79,13 +82,6 @@ function normalizeRequestStore(store: Request | AkanRequestStore): AkanRequestSt
   return isRequestStore(store) ? store : createRequestStore(store);
 }
 
-function getActiveRequestStore(): AkanRequestStore | undefined {
-  const store = requestStorage?.getStore() as Request | AkanRequestStore | undefined;
-  if (store) return isRequestStore(store) ? store : createRequestStore(store);
-  return globalThis.__AKAN_REQUEST_FALLBACK_STACK__?.at(-1);
-}
-
-/** Stores theme preference on the active request when server rendering. */
 export function setRequestTheme(theme: AkanTheme | undefined): void {
   const store = getRequestStore();
   if (!store || theme === undefined) return;
@@ -117,16 +113,13 @@ export function pushRequestFallback(storeOrRequest: Request | AkanRequestStore):
   };
 }
 
-// Lightweight server-side helpers for server components to read the incoming
-// request's headers/cookies. Kept in akanjs/fetch (no heavy client deps) so
-// they can be imported from inside the RSC worker without pulling `akanjs/
-// client`'s useClient macro chain.
-/** Returns the active server request store from AsyncLocalStorage or the fallback stack. */
+// Here, free of client deps, so the RSC worker reads request headers/cookies without `akanjs/client`'s macro chain.
 export function getRequestStore(): AkanRequestStore | undefined {
-  return getActiveRequestStore();
+  const store = requestStorage?.getStore() as Request | AkanRequestStore | undefined;
+  if (store) return normalizeRequestStore(store);
+  return globalThis.__AKAN_REQUEST_FALLBACK_STACK__?.at(-1);
 }
 
-/** Returns the active server request from AsyncLocalStorage or the fallback stack. */
 export function getRequest(options: { trackDynamic?: boolean } = {}): Request | undefined {
   const store = getRequestStore();
   if (!store) return undefined;
@@ -177,18 +170,27 @@ export function getRequestDynamicUsage(): AkanDynamicUsage | undefined {
   return getRequestStore()?.dynamicUsage;
 }
 
-/** Deduplicates a promise-producing query within the active request. */
-export function memoizeRequestQuery<T>(key: string, factory: () => Promise<T>): Promise<T> {
+/** Deduplicates within the active request; `owned` means this caller started it and may skip the defensive copy. */
+export function claimRequestQuery<T>(key: string, factory: () => Promise<T>): { value: Promise<T>; owned: boolean } {
   const store = getRequestStore();
-  if (!store) return factory();
+  if (!store) return { value: factory(), owned: true };
   const existing = store.queryCache.get(key);
-  if (existing) return existing as Promise<T>;
+  if (existing) return { value: existing as Promise<T>, owned: false };
   const promise = factory();
   store.queryCache.set(key, promise);
-  return promise;
+  return { value: promise, owned: true };
 }
 
-/** Returns current request headers as a Map, or an empty Map outside a request. */
+/** Appends to the active request's query log; outside a request there is nothing to read it, so nothing is kept. */
+export function recordRequestQuery(record: RequestQueryRecord): void {
+  getRequestStore()?.queryLog.push(record);
+}
+
+export function memoizeRequestQuery<T>(key: string, factory: () => Promise<T>): Promise<T> {
+  return claimRequestQuery(key, factory).value;
+}
+
+/** An empty Map outside a request. */
 export function headers(options: { trackDynamic?: boolean } = {}): Map<string, string> {
   const store = getRequestStore();
   const map = new Map<string, string>();
@@ -234,7 +236,7 @@ export function parseCookieHeader(cookieHeader: string): Map<string, CookieEntry
   return out;
 }
 
-/** Returns parsed cookies from the current request, or an empty Map outside a request. */
+/** An empty Map outside a request. */
 export function cookies(options: { trackDynamic?: boolean } = {}): Map<string, CookieEntry> {
   const store = getRequestStore();
   if (!store) return new Map();

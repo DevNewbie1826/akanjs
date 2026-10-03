@@ -7,5 +7,6 @@ export * from "./documentSchema";
 export * from "./filterMeta";
 export * from "./into";
 export * from "./loaderInfo";
-export * from "./schema";
+export * from "./noDocumentError";
+export * from "./queryEvaluator";
 export * from "./types";

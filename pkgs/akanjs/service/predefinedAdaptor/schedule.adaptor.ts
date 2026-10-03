@@ -1,10 +1,17 @@
-import { Cron } from "croner";
+import { hostname } from "node:os";
+import { dayjs } from "akanjs/base";
 import { adapt } from "../adapt";
 import { CacheAdaptorRole } from "./role.adaptor";
 
+/** The scheduler's own job handle, so the cron backend stays behind this interface. `Bun.cron` satisfies it. */
+export interface AkanCronJob {
+  readonly cron: string;
+  stop(): void;
+}
+
 export interface ScheduleAdaptor {
-  getCron(key: string): Cron | undefined;
-  registerCron(key: string, cronStr: string, callback: () => Promise<void>, option?: { lock?: boolean }): Cron;
+  getCron(key: string): AkanCronJob | undefined;
+  registerCron(key: string, cronStr: string, callback: () => Promise<void>, option?: { lock?: boolean }): AkanCronJob;
   unregisterCron(key: string): void;
   getInterval(key: string): NodeJS.Timeout | undefined;
   registerInterval(
@@ -23,7 +30,7 @@ export interface ScheduleAdaptor {
   ): NodeJS.Timeout;
   unregisterTimeout(key: string): void;
   getInit(key: string): (() => Promise<void>) | undefined;
-  registerInit(key: string, callback: () => Promise<void>): void;
+  registerInit(key: string, callback: () => Promise<void>, option?: { once?: boolean }): void;
   unregisterInit(key: string): void;
   _runInit(): Promise<void>;
   getDestroy(key: string): (() => Promise<void>) | undefined;
@@ -38,8 +45,14 @@ export class Scheduler
   }))
   implements ScheduleAdaptor
 {
+  //* A lease in the shared cache lets one instance run a cron tick, interval period or `once` init as others skip it;
+  //* `lockMap` still keeps a job from overlapping itself inside one process.
+  static readonly #topic = "akan:schedule";
+  static readonly #minuteMs = 60_000;
+  static readonly #runningLeaseMs = 30_000;
+  readonly #owner = `${hostname()}-${process.pid}-${Bun.randomUUIDv7()}`;
   readonly lockMap = new Map<string, boolean>();
-  readonly cronMap = new Map<string, Cron>();
+  readonly cronMap = new Map<string, AkanCronJob>();
   readonly intervalMap = new Map<string, NodeJS.Timeout>();
   readonly timeoutMap = new Map<string, NodeJS.Timeout>();
   readonly initMap = new Map<string, () => Promise<void>>();
@@ -48,17 +61,26 @@ export class Scheduler
     return this.cronMap.get(key);
   }
   registerCron(key: string, cronStr: string, callback: () => Promise<void>, { lock = true }: { lock?: boolean } = {}) {
-    const cron = new Cron(cronStr, async () => {
+    // Bun.cron schedules the next fire only after the callback settles, so `lock: false` cannot be honoured.
+    if (!lock) this.logger.warn(`Schedule ${key} requested lock:false, but Bun.cron never overlaps a job`);
+    const cron = Bun.cron(cronStr, async () => {
       if (this.lockMap.get(key) && lock) {
         this.logger.warn(`Schedule ${key} is locked, skipped`);
         return;
       }
       try {
         this.lockMap.set(key, true);
+        // Bun.cron fires on minute boundaries, so rounding names the same tick on instances whose clocks disagree.
+        const tick = Math.round(Date.now() / Scheduler.#minuteMs) * Scheduler.#minuteMs;
+        const claimed = await this.cache.setIfAbsent(Scheduler.#topic, `cron:${key}@${tick}`, this.#owner, {
+          expireAt: dayjs(tick + 10 * Scheduler.#minuteMs),
+        });
+        if (!claimed) return;
         const now = Date.now();
         this.logger.debug(`Schedule ${key} started`);
-        await callback();
-        this.logger.debug(`Schedule ${key} finished ${Date.now() - now}ms`);
+        const ran = await this.#holding(`cron:${key}`, Scheduler.#runningLeaseMs, { release: true }, callback);
+        if (!ran) this.logger.warn(`Schedule ${key} is still running on another instance, skipped`);
+        else this.logger.debug(`Schedule ${key} finished ${Date.now() - now}ms`);
       } catch (e) {
         this.logger.error(`Schedule ${key} error: ${e}`);
       } finally {
@@ -91,9 +113,9 @@ export class Scheduler
       try {
         this.lockMap.set(key, true);
         const now = Date.now();
-        this.logger.debug(`Schedule interval ${key} started`);
-        await callback();
-        this.logger.debug(`Schedule interval ${key} finished ${Date.now() - now}ms`);
+        // Held for a period and kept, so the next run anywhere is a period later; a locked job renews it while running.
+        const ran = await this.#holding(`interval:${key}`, scheduleTime, { release: false, renew: lock }, callback);
+        if (ran) this.logger.debug(`Schedule interval ${key} finished ${Date.now() - now}ms`);
       } catch (e) {
         this.logger.error(`Schedule interval ${key} error: ${e}`);
       } finally {
@@ -135,12 +157,13 @@ export class Scheduler
   getInit(key: string) {
     return this.initMap.get(key);
   }
-  registerInit(key: string, callback: () => Promise<void>) {
+  registerInit(key: string, callback: () => Promise<void>, { once = false }: { once?: boolean } = {}) {
     this.initMap.set(key, async () => {
       try {
         const now = Date.now();
         this.logger.debug(`Schedule init ${key} started`);
-        await callback();
+        if (once) await this.#once(key, callback);
+        else await callback();
         this.logger.debug(`Schedule init ${key} finished ${Date.now() - now}ms`);
       } catch (e) {
         this.logger.error(`Schedule init ${key} error: ${e}`);
@@ -173,6 +196,51 @@ export class Scheduler
   }
   async _runDestroy() {
     await Promise.all([...this.destroyMap.values()].map((callback) => callback()));
+  }
+  async #holding(
+    lease: string,
+    ttlMs: number,
+    { release, renew = true }: { release: boolean; renew?: boolean },
+    run: () => Promise<void>,
+  ) {
+    if (!(await this.cache.acquireLease(Scheduler.#topic, lease, this.#owner, ttlMs))) return false;
+    const stopRenewing = renew ? this.#renewing(lease, ttlMs) : null;
+    try {
+      await run();
+      return true;
+    } finally {
+      stopRenewing?.();
+      if (release) await this.cache.releaseLease(Scheduler.#topic, lease, this.#owner);
+    }
+  }
+  #renewing(lease: string, ttlMs: number) {
+    const timer = setInterval(
+      () => {
+        void this.cache
+          .renewLease(Scheduler.#topic, lease, this.#owner, ttlMs)
+          .catch((e: unknown) => this.logger.warn(`Schedule lease ${lease} was not renewed: ${String(e)}`));
+      },
+      Math.max(ttlMs / 3, 10),
+    );
+    return () => clearInterval(timer);
+  }
+  // One instance at a time; a waiter lets the finished run stand for it, so concurrent boots create one root admin.
+  async #once(key: string, run: () => Promise<void>) {
+    const lease = `init:${key}`;
+    let waited = false;
+    while (!(await this.cache.acquireLease(Scheduler.#topic, lease, this.#owner, Scheduler.#runningLeaseMs))) {
+      waited = true;
+      await Bun.sleep(250);
+    }
+    const stopRenewing = this.#renewing(lease, Scheduler.#runningLeaseMs);
+    try {
+      if (waited && (await this.cache.get(Scheduler.#topic, `${lease}:done`))) return;
+      await run();
+      await this.cache.set(Scheduler.#topic, `${lease}:done`, this.#owner, { expireAt: dayjs().add(1, "minute") });
+    } finally {
+      stopRenewing();
+      await this.cache.releaseLease(Scheduler.#topic, lease, this.#owner);
+    }
   }
   override async onDestroy() {
     for (const cron of this.cronMap.values()) cron.stop();

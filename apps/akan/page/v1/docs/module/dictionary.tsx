@@ -1,8 +1,9 @@
 import { usePage } from "@apps/akan/client";
 import { Code, Docs, type IntroItem } from "@apps/akan/ui";
 import { Scroll } from "@libs/util/ui";
+import { page } from "akanjs/client";
 
-export default function Page() {
+export default page().render(() => {
   const { l } = usePage();
 
   const coreMethods: IntroItem[] = [
@@ -142,7 +143,7 @@ export const dictionary = modelDictionary(["en", "ko"])
           />
         </Docs.Description>
       </Scroll.Slide>
-      <div className="divider" />
+      <div className="my-4 h-px w-full bg-border" />
 
       <Scroll.Slide id="translation-methods" title={l.trans({ en: "Core Translations", ko: "핵심 번역" })}>
         <Docs.Title>{l.trans({ en: "Core Translations", ko: "핵심 번역" })}</Docs.Title>
@@ -182,7 +183,7 @@ export const dictionary = modelDictionary(["en", "ko"])
         </Docs.Description>
         <Docs.IntroTable type="method" items={utilityMethods} />
       </Scroll.Slide>
-      <div className="divider" />
+      <div className="my-4 h-px w-full bg-border" />
 
       <Scroll.Slide id="usage-examples" title={l.trans({ en: "Translation Usage", ko: "번역 사용" })}>
         <Docs.Title>{l.trans({ en: "Translation Usage", ko: "번역 사용" })}</Docs.Title>
@@ -196,7 +197,7 @@ export const dictionary = modelDictionary(["en", "ko"])
         </Docs.Description>
 
         <div className="mb-4" />
-        <div className="rounded-lg bg-base-200 p-3 lg:p-4">
+        <div className="rounded-lg bg-muted p-3 lg:p-4">
           <div className="mb-2">
             <span className="font-bold font-mono text-primary text-sm">Manual Access</span>
           </div>
@@ -219,7 +220,7 @@ l("product.sellSuccess"); // "Sale completed!" or "판매가 완료되었습니�
           />
         </div>
       </Scroll.Slide>
-      <div className="divider" />
+      <div className="my-4 h-px w-full bg-border" />
 
       <Scroll.Slide
         id="best-practices"
@@ -283,9 +284,9 @@ l("product.sellSuccess"); // "Sale completed!" or "판매가 완료되었습니�
           </div>
         </Docs.Description>
       </Scroll.Slide>
-      <div className="divider" />
+      <div className="my-4 h-px w-full bg-border" />
 
-      <Scroll.TitleNavigator className="fixed top-32 right-0 hidden w-[250px] flex-col gap-2 lg:flex" />
+      <Scroll.TitleNavigator className="fixed top-32 right-0 hidden w-[250px] flex-col gap-2 xl:flex" />
     </Scroll>
   );
-}
+});

@@ -1,9 +1,11 @@
 import { afterEach, beforeAll, describe, expect, mock, test } from "bun:test";
+import { interpolateTranslation } from "../common/interpolateTranslation";
+import { pathGetLoose } from "../common/objectPath";
+import { cn } from "./cn";
 import { createFont, Inter, Nanum_Gothic_Coding, Noto_Sans_KR, Roboto } from "./createFont";
-import { clearRscNavigationCache, isRscNavigationFromCache, navigateRsc } from "./rscNavigation";
+import { clearRscNavigationCache, isRscNavigationFromCache, navigateRsc, refreshRsc } from "./rscNavigation";
 import { Translator } from "./translator";
 import {
-  clsx,
   getFontFaces,
   getFontFallbackName,
   getFontStyles,
@@ -22,6 +24,8 @@ beforeAll(() => {
         if (!acc || typeof acc !== "object") return fallback;
         return (acc as Record<string, unknown>)[key] ?? fallback;
       }, obj),
+    interpolateTranslation,
+    pathGetLoose,
     Logger: { log: () => undefined, verbose: () => undefined, error: () => undefined },
     parseAkanI18nEnv: () => ({ locales: ["en", "ko"], defaultLocale: "en" }),
     parseBasePaths: (value?: string) => (value ? value.split(",").filter(Boolean) : []),
@@ -33,11 +37,12 @@ afterEach(() => {
   globalThis.__AKAN_RSC_CLEAR_CACHE__ = undefined;
   globalThis.__AKAN_RSC_IS_FROM_CACHE__ = undefined;
   globalThis.__AKAN_RSC_NAVIGATE__ = undefined;
+  globalThis.__AKAN_RSC_REFRESH__ = undefined;
 });
 
 describe("client pure exports and utilities", () => {
   test("exports class composition and font helpers through the package surface", () => {
-    expect(clsx("base", null, ["nested"], { active: true })).toBe("base nested active");
+    expect(cn("base", null, ["nested"], "active")).toBe("base nested active");
     expect(typeof loadFonts).toBe("function");
     expect(typeof getFontFaces).toBe("function");
     expect(typeof Translator).toBe("function");
@@ -107,6 +112,24 @@ describe("client pure exports and utilities", () => {
     expect(calls).toEqual(["clear", { href: "/next", options: { replace: true, scrollToTop: false } }]);
   });
 
+  test("refreshRsc refetches through the rsc refresh, never the cache-restoring clear", async () => {
+    const calls: unknown[] = [];
+
+    expect(refreshRsc()).toBeUndefined();
+
+    globalThis.__AKAN_RSC_CLEAR_CACHE__ = () => calls.push("clear");
+    globalThis.__AKAN_RSC_NAVIGATE__ = async (href) => {
+      calls.push({ navigate: href });
+    };
+    globalThis.__AKAN_RSC_REFRESH__ = async (options) => {
+      calls.push({ refresh: options });
+    };
+
+    await refreshRsc();
+
+    expect(calls).toEqual([{ refresh: undefined }]);
+  });
+
   test("reports a replayed page tree only when the rsc client says so", () => {
     expect(isRscNavigationFromCache()).toBe(false);
 
@@ -119,7 +142,7 @@ describe("client pure exports and utilities", () => {
 });
 
 describe("Translator", () => {
-  test("merges dictionaries, translates nested paths, replaces params, and falls back to keys", async () => {
+  test("merges dictionaries, translates nested paths, replaces params, and falls back to the default locale", async () => {
     const translator = new Translator({
       en: {
         user: {
@@ -144,8 +167,10 @@ describe("Translator", () => {
     expect(translator.translate("en", "user.greeting", { name: "Ada" })).toBe("Hello Ada");
     expect(translator.translate("en", "user.nested.title")).toBe("Nested title");
     expect(translator.translate("ko", "user.greeting", { name: "민" })).toBe("안녕 민");
-    expect(translator.translate("ja", "user.greeting")).toBe("user.greeting");
+    expect(translator.translate("ja", "user.greeting", { name: "Ada" })).toBe("Hello Ada");
+    expect(translator.translate("ja", "user.missing")).toBe("user.missing");
     expect(translator.translate("en", "user.missing")).toBe("user.missing");
+    expect(translator.translate("en", "user.greeting")).toBe("Hello {name}");
     expect(await translator.getDictionary("en")).toMatchObject({
       user: {
         greeting: { t: "Hello {name}" },
@@ -212,5 +237,32 @@ describe("Translator", () => {
     Translator.replace("en", snapshot);
 
     expect(await translator.getDictionary("en")).toBe(firstDictionary);
+  });
+
+  test("fills the default locale's text into the one locale an SSR client is seeded with", () => {
+    const allDictionary = {
+      en: {
+        libOnly: { signin: { t: "Sign In" } },
+        app: { title: { t: "Title" }, partial: { t: "Partial" }, nested: { label: { t: "Label" } } },
+      },
+      ja: {
+        app: { title: { t: "タイトル" }, nested: {} },
+      },
+    };
+    const filled = Translator.withDefaultLocale(allDictionary, "ja");
+
+    expect(filled).toEqual({
+      libOnly: { signin: { t: "Sign In" } },
+      app: { title: { t: "タイトル" }, partial: { t: "Partial" }, nested: { label: { t: "Label" } } },
+    });
+    expect(allDictionary.ja).toEqual({ app: { title: { t: "タイトル" }, nested: {} } });
+    expect(Translator.withDefaultLocale(allDictionary, "ja")).toBe(filled);
+    expect(Translator.withDefaultLocale(allDictionary, "en")).toBe(allDictionary.en);
+    expect(Translator.withDefaultLocale(allDictionary, "th")).toEqual(allDictionary.en);
+
+    Translator.replace("ja", filled);
+    Translator.replace("en", {});
+    expect(Translator.translateByLocale("ja", "libOnly.signin")).toBe("Sign In");
+    expect(Translator.translateByLocale("ja", "app.title")).toBe("タイトル");
   });
 });

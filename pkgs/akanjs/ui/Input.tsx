@@ -1,10 +1,12 @@
 "use client";
-import { clsx, usePage } from "akanjs/client";
+import { cn, usePage } from "akanjs/client";
 import { isEmail } from "akanjs/common";
+import { useFieldTool } from "akanjs/store";
 import React, {
   type ChangeEvent,
   type InputHTMLAttributes,
   type KeyboardEvent,
+  type ReactNode,
   type RefObject,
   type TextareaHTMLAttributes,
   useEffect,
@@ -12,32 +14,63 @@ import React, {
   useState,
 } from "react";
 import { AiOutlineEye, AiOutlineEyeInvisible } from "react-icons/ai";
+import { agentAttrs } from "./agentAttrs";
+import { inputRecipe } from "./recipe";
+import { createOverridable, useUiRecipe } from "./UiOverride";
 
-import { createOverridable } from "./UiOverride";
+const statusClassOf = (status: string, firstFocus: boolean) =>
+  status === "error"
+    ? "border-destructive"
+    : !firstFocus && status === "warning"
+      ? "border-warning"
+      : status === "success"
+        ? "border-success"
+        : "";
+
+const blurOnEscape =
+  (
+    onPressEnter?: (value: string, event: KeyboardEvent<HTMLInputElement>) => void,
+    onPressEscape?: (e: KeyboardEvent<HTMLInputElement>) => void,
+  ) =>
+  (e: KeyboardEvent<HTMLInputElement>) => {
+    if (onPressEnter && e.key === "Enter") onPressEnter(e.currentTarget.value, e);
+    if (e.key === "Escape") {
+      e.currentTarget.blur();
+      onPressEscape?.(e);
+    }
+  };
+
+const LeadingIcon = ({ icon, className }: { icon: ReactNode; className?: string }) => {
+  if (!icon) return null;
+  return <div className={cn("absolute inset-y-0 left-4 z-10 flex items-center justify-center", className)}>{icon}</div>;
+};
+
+export const invalidMessageOf = (
+  skip: unknown,
+  result: boolean | string | undefined,
+  l: (key: "base.invalidValueError") => string,
+) => (skip || result === true ? null : result === false ? l("base.invalidValueError") : result);
+
+export const InvalidMessage = ({ message }: { message: ReactNode }) => {
+  if (!message) return null;
+  return <div className="absolute -bottom-4 animate-fadeIn text-destructive text-xs">{message}</div>;
+};
 
 export type InputProps = Omit<InputHTMLAttributes<HTMLInputElement>, "value" | "onChange"> & {
-  /** Visual input style. */
   inputStyleType?: "bordered" | "borderless" | "underline";
-  /** Ref forwarded to the native input element. */
   inputRef?: RefObject<HTMLInputElement | null>;
-  /** Controlled input value. */
   value: string;
-  /** Allow empty value without warning status. */
+  /** Allows an empty value without the warning status. */
   nullable?: boolean;
-  /** Session storage key used to persist typed text. */
-  cacheKey?: string;
-  /** Optional leading icon. */
   icon?: React.ReactNode;
   iconClassName?: string;
   inputClassName?: string;
   inputWrapperClassName?: string;
-  /** Called when Enter is pressed. */
   onPressEnter?: (value: any, event: KeyboardEvent<HTMLInputElement>) => void;
-  /** Returns true for valid input, false/string for invalid input. */
+  /** `true` is valid; `false` or a message string is invalid. */
   validate?: (value: string) => boolean | string;
-  /** Controlled value change callback. */
   onChange?: (value: string, e?: ChangeEvent<HTMLInputElement>) => void;
-  /** Called when Escape is pressed after blurring the input. */
+  /** Called after Escape blurs the input. */
   onPressEscape?: (e: KeyboardEvent<HTMLInputElement>) => void;
 };
 const DefaultInput = ({
@@ -45,7 +78,6 @@ const DefaultInput = ({
   nullable,
   inputRef,
   value,
-  cacheKey,
   inputStyleType = "bordered",
   icon,
   iconClassName,
@@ -57,75 +89,45 @@ const DefaultInput = ({
   validate,
   ...rest
 }: InputProps) => {
+  useFieldTool(onChange, { disabled: rest.disabled });
   const { l } = usePage();
   const [firstFocus, setFirstFocus] = useState(true);
   const validateResult = validate ? validate(value) : undefined;
-  const status: "error" | "warning" | "success" | null =
-    !nullable && !value ? null : !value.length ? "warning" : validateResult === true ? "success" : "error";
-  const invalidMessage =
-    (value && !value.length) || validateResult === true || firstFocus
-      ? null
-      : validateResult === false
-        ? l("base.invalidValueError")
-        : validateResult;
-  // const invalidMessage = l("base.invalidValueError");
-  const statusClass =
-    inputStyleType === "bordered"
-      ? status === "error"
-        ? "input-error"
-        : !firstFocus && status === "warning"
-          ? "input-warning"
-          : status === "success"
-            ? "input-success"
-            : ""
-      : "";
-  const inputType =
-    inputStyleType === "bordered"
-      ? "input"
-      : inputStyleType === "borderless"
-        ? "input-ghost"
-        : "border-0  border-b rounded-none";
-  const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
-    if (onPressEnter && e.key === "Enter") onPressEnter(e.currentTarget.value, e);
-    if (e.key === "Escape") {
-      e.currentTarget.blur();
-
-      onPressEscape?.(e);
-    }
-  };
-
-  useEffect(() => {
-    if (!cacheKey) return;
-    sessionStorage.setItem(cacheKey, value);
-  }, [value]);
+  const inputBase = (useUiRecipe("input") ?? inputRecipe)();
+  const invalidMessage = invalidMessageOf((value && !value.length) || firstFocus, validateResult, l);
+  const inputType = cn(
+    inputBase,
+    inputStyleType === "borderless"
+      ? "border-transparent bg-transparent"
+      : inputStyleType === "underline"
+        ? "rounded-none border-0 border-b"
+        : "",
+  );
 
   return (
-    <div className={clsx("relative isolate flex items-center", className)}>
-      {icon ? <div className={clsx("flex items-center justify-center", iconClassName)}>{icon}</div> : null}
+    <div className={cn("relative isolate flex items-center", className)}>
+      {icon ? <div className={cn("flex items-center justify-center", iconClassName)}>{icon}</div> : null}
       <input
         {...rest}
+        {...agentAttrs(onChange)}
         ref={inputRef}
         value={value}
         onChange={(e) => {
-          if (cacheKey) {
-            sessionStorage.setItem(cacheKey, e.target.value);
-          }
           onChange?.(e.target.value, e);
         }}
         onBlur={(e) => {
           if (firstFocus && value) setFirstFocus(false);
         }}
-        onKeyDown={handleKeyDown}
-        className={clsx(
-          `b-5 text-base-content outline-hidden duration-300 focus:border-primary focus:outline-hidden ${icon && ""}`,
+        onKeyDown={blurOnEscape(onPressEnter, onPressEscape)}
+        className={cn(
+          "text-foreground outline-hidden duration-300 focus:border-primary focus:outline-hidden",
           inputType,
-          // statusClass,
           inputClassName,
         )}
       />
       <div
         data-validate={!!validateResult}
-        className="absolute -bottom-4 whitespace-nowrap text-error text-xs duration-300"
+        className="absolute -bottom-4 whitespace-nowrap text-destructive text-xs duration-300"
       >
         {invalidMessage}
       </div>
@@ -142,7 +144,6 @@ export type TextAreaProps = Omit<
   nullable?: boolean;
   inputClassName?: string;
   inputWrapperClassName?: string;
-  cacheKey?: string;
   onPressEnter?: (value: string, event: KeyboardEvent<HTMLTextAreaElement>) => void;
   onChange?: (value: string, e?: ChangeEvent<HTMLTextAreaElement>) => void;
   validate: (value: string) => boolean | string;
@@ -151,73 +152,53 @@ export type TextAreaProps = Omit<
 const DefaultTextArea = ({
   className,
   nullable,
+  inputRef,
   value,
   inputClassName,
   inputWrapperClassName,
-  cacheKey,
   onPressEnter,
   onPressEscape,
   onChange,
   validate,
   ...rest
 }: TextAreaProps) => {
+  useFieldTool(onChange, { disabled: rest.disabled });
   const { l } = usePage();
-  const inputRef = useRef<HTMLTextAreaElement>(null);
   const validateResult = validate(value);
+  const textareaBase = (useUiRecipe("input") ?? inputRecipe)({ kind: "area" });
   const [firstFocus, setFirstFocus] = useState(true);
   const status: "error" | "warning" | "success" =
     !nullable && !value.length ? "warning" : validateResult === true ? "success" : "error";
-  const invalidMessage =
-    !value.length || validateResult === true || firstFocus
-      ? null
-      : validateResult === false
-        ? l("base.invalidValueError")
-        : validateResult;
-  const statusClass =
-    status === "error"
-      ? "textarea-error"
-      : !firstFocus && status === "warning"
-        ? "textarea-warning"
-        : status === "success"
-          ? "textarea-success"
-          : "";
+  const invalidMessage = invalidMessageOf(!value.length || firstFocus, validateResult, l);
+  const statusClass = statusClassOf(status, firstFocus);
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (onPressEnter && e.key === "Enter") onPressEnter(e.currentTarget.value, e);
   };
 
-  useEffect(() => {
-    if (!cacheKey) return;
-    const value = sessionStorage.getItem(cacheKey);
-    if (value) {
-      onChange?.(value);
-    }
-  }, []);
-
   return (
-    <div className={clsx("relative mb-5", className)}>
+    <div className={cn("relative mb-5", className)}>
       <textarea
         {...rest}
+        {...agentAttrs(onChange)}
         ref={inputRef}
         value={value}
         onChange={(e) => {
-          if (cacheKey) {
-            sessionStorage.setItem(cacheKey, e.target.value);
-          }
           onChange?.(e.target.value, e);
         }}
         onKeyDown={handleKeyDown}
         onBlur={(e) => {
           if (firstFocus && value) setFirstFocus(false);
         }}
-        className={clsx(
-          `textarea textarea-bordered resize-none text-base-content outline-hidden duration-300 focus:border-primary focus:outline-hidden`,
+        className={cn(
+          cn(
+            textareaBase,
+            "resize-none text-foreground outline-hidden duration-300 focus:border-primary focus:outline-hidden",
+          ),
           statusClass,
           inputClassName,
         )}
       />
-      {invalidMessage ? (
-        <div className="absolute -bottom-4 animate-fadeIn text-error text-xs">{invalidMessage}</div>
-      ) : null}
+      <InvalidMessage message={invalidMessage} />
     </div>
   );
 };
@@ -229,7 +210,6 @@ export type PasswordProps = Omit<InputHTMLAttributes<HTMLInputElement>, "value" 
   iconClassName?: string;
   inputClassName?: string;
   inputWrapperClassName?: string;
-  cacheKey?: string;
   onPressEnter?: (value: any, event: KeyboardEvent<HTMLInputElement>) => void;
   onPressEscape?: (e: KeyboardEvent<HTMLInputElement>) => void;
   onChange?: (value: string, e?: ChangeEvent<HTMLInputElement>) => void;
@@ -243,56 +223,35 @@ const DefaultPassword = ({
   iconClassName,
   inputClassName,
   inputWrapperClassName,
-  cacheKey,
   onPressEnter,
   onPressEscape,
   onChange,
   validate,
   ...rest
 }: PasswordProps) => {
+  useFieldTool(onChange, { disabled: rest.disabled });
   const { l } = usePage();
   const inputRef = useRef<HTMLInputElement>(null);
   const validateResult = validate(value);
   const [firstFocus, setFirstFocus] = useState(true);
   const [showPassword, setShowPassword] = useState(false);
+  const inputBase = (useUiRecipe("input") ?? inputRecipe)();
   const status: "error" | "warning" | "success" =
     !nullable && !value.length ? "warning" : validateResult === true ? "success" : "error";
-  const invalidMessage =
-    !value.length || validateResult === true || firstFocus
-      ? ""
-      : validateResult === false
-        ? l("base.invalidValueError")
-        : validateResult;
-  const statusClass =
-    status === "error"
-      ? "input-error"
-      : !firstFocus && status === "warning"
-        ? "input-warning"
-        : status === "success"
-          ? "input-success"
-          : "";
+  const invalidMessage = invalidMessageOf(!value.length || firstFocus, validateResult, l) ?? "";
+  const statusClass = statusClassOf(status, firstFocus);
   const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
     if (onPressEnter && e.key === "Enter") onPressEnter(e.currentTarget.value, e);
     if (onPressEscape && e.key === "Escape") onPressEscape(e);
   };
 
-  useEffect(() => {
-    if (!cacheKey) return;
-    const value = sessionStorage.getItem(cacheKey);
-    if (value) {
-      onChange?.(value);
-    }
-  }, []);
   return (
-    <div className={clsx("relative isolate pb-2", className)}>
-      <div className={clsx("relative flex items-center justify-between", inputWrapperClassName)}>
-        {icon ? (
-          <div className={clsx("absolute inset-y-0 left-4 z-10 flex items-center justify-center", iconClassName)}>
-            {icon}
-          </div>
-        ) : null}
+    <div className={cn("relative isolate pb-2", className)}>
+      <div className={cn("relative flex items-center justify-between", inputWrapperClassName)}>
+        <LeadingIcon icon={icon} className={iconClassName} />
         <input
           {...rest}
+          {...agentAttrs(onChange)}
           type={showPassword ? "text" : "password"}
           ref={inputRef}
           value={value}
@@ -301,13 +260,12 @@ const DefaultPassword = ({
           }}
           onKeyDown={handleKeyDown}
           onChange={(e) => {
-            if (cacheKey) {
-              sessionStorage.setItem(cacheKey, e.target.value);
-            }
             onChange?.(e.target.value, e);
           }}
-          className={clsx(
-            `input text-base-content duration-300 focus:border-primary focus:outline-hidden ${icon && "pl-12"}`,
+          className={cn(
+            inputBase,
+            "text-foreground duration-300 focus:border-primary focus:outline-hidden",
+            icon && "pl-12",
             statusClass,
             inputClassName,
           )}
@@ -324,7 +282,7 @@ const DefaultPassword = ({
       </div>
       <div
         data-validate={!!invalidMessage.length}
-        className="h-2 text-error text-xs duration-300 data-[validate=false]:opacity-0 data-[validate=true]:opacity-100"
+        className="h-2 text-destructive text-xs duration-300 data-[validate=false]:opacity-0 data-[validate=true]:opacity-100"
       >
         {invalidMessage}
       </div>
@@ -335,7 +293,6 @@ const DefaultPassword = ({
 export type EmailProps = Omit<InputHTMLAttributes<HTMLInputElement>, "value" | "type" | "onChange"> & {
   inputStyleType?: "bordered" | "borderless" | "underline";
   value: string;
-  cacheKey?: string;
   nullable?: boolean;
   icon?: React.ReactNode;
   iconClassName?: string;
@@ -351,7 +308,6 @@ const DefaultEmail = ({
   className,
   nullable,
   value,
-  cacheKey,
   onPressEnter,
   onPressEscape,
   onChange,
@@ -362,85 +318,46 @@ const DefaultEmail = ({
   inputWrapperClassName,
   ...rest
 }: EmailProps) => {
+  useFieldTool(onChange, { disabled: rest.disabled });
   const { l } = usePage();
   const inputRef = useRef<HTMLInputElement>(null);
   const isValidEmail = isEmail(value);
+  const inputBase = (useUiRecipe("input") ?? inputRecipe)();
   const [firstFocus, setFirstFocus] = useState(true);
   const validateResult = !isValidEmail ? l("base.emailInvalidError") : validate(value);
   const status: "error" | "warning" | "success" =
     !nullable && !value.length ? "warning" : !isValidEmail ? "error" : validateResult === true ? "success" : "error";
-  const invalidMessage =
-    !value.length || validateResult === true || firstFocus
-      ? null
-      : validateResult === false
-        ? l("base.invalidValueError")
-        : validateResult;
-  const statusClass =
-    status === "error"
-      ? "input-error"
-      : !firstFocus && status === "warning"
-        ? "input-warning"
-        : status === "success"
-          ? "input-success"
-          : "";
-  const inputType =
-    inputStyleType === "bordered"
-      ? "input-bordered"
-      : inputStyleType === "borderless"
-        ? "input"
-        : "input-bordered rounded-none";
-  const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
-    if (onPressEnter && e.key === "Enter") onPressEnter(e.currentTarget.value, e);
-    if (e.key === "Escape") {
-      e.currentTarget.blur();
-      onPressEscape?.(e);
-    }
-  };
-
-  useEffect(() => {
-    if (!cacheKey) return;
-    const value = sessionStorage.getItem(cacheKey);
-    if (value) {
-      onChange?.(value);
-    }
-  }, []);
+  const invalidMessage = invalidMessageOf(!value.length || firstFocus, validateResult, l);
+  const statusClass = statusClassOf(status, firstFocus);
+  const inputType = cn(inputBase, inputStyleType === "underline" ? "rounded-none" : "");
 
   return (
-    <div className={clsx("relative isolate mb-5", className)}>
-      <div className={clsx("flex items-center", inputWrapperClassName)}>
-        {icon ? (
-          <div className={clsx("absolute inset-y-0 left-4 z-10 flex items-center justify-center", iconClassName)}>
-            {icon}
-          </div>
-        ) : null}
+    <div className={cn("relative isolate mb-5", className)}>
+      <div className={cn("flex items-center", inputWrapperClassName)}>
+        <LeadingIcon icon={icon} className={iconClassName} />
         <input
           {...rest}
+          {...agentAttrs(onChange)}
           type="email"
           value={value}
           ref={inputRef}
-          onKeyDown={handleKeyDown}
+          onKeyDown={blurOnEscape(onPressEnter, onPressEscape)}
           onBlur={(e) => {
             if (firstFocus && value) setFirstFocus(false);
           }}
           onChange={(e) => {
-            if (cacheKey) {
-              sessionStorage.setItem(cacheKey, e.target.value);
-            }
             onChange?.(e.target.value, e);
           }}
-          className={clsx(
-            `input text-base-content outline-hidden duration-300 focus:border-primary focus:outline-hidden ${
-              icon && "pl-12"
-            }`,
+          className={cn(
+            "text-foreground outline-hidden duration-300 focus:border-primary focus:outline-hidden",
+            icon && "pl-12",
             inputType,
             statusClass,
             inputClassName,
           )}
         />
       </div>
-      {invalidMessage ? (
-        <div className="absolute -bottom-4 animate-fadeIn text-error text-xs">{invalidMessage}</div>
-      ) : null}
+      <InvalidMessage message={invalidMessage} />
     </div>
   );
 };
@@ -449,7 +366,6 @@ export type NumberProps = Omit<InputHTMLAttributes<HTMLInputElement>, "value" | 
   value: number | null;
   nullable?: boolean;
   icon?: React.ReactNode;
-  cacheKey?: string;
   iconClassName?: string;
   inputClassName?: string;
   inputWrapperClassName?: string;
@@ -467,7 +383,6 @@ const DefaultNumber = ({
   nullable,
   value,
   icon,
-  cacheKey,
   iconClassName,
   inputClassName,
   inputWrapperClassName,
@@ -480,11 +395,13 @@ const DefaultNumber = ({
   parser,
   ...rest
 }: NumberProps) => {
+  useFieldTool(onChange, { disabled: rest.disabled });
   const { l } = usePage();
   const inputRef = useRef<HTMLInputElement>(null);
   const validateResult = validate ? validate(value) : undefined;
+  const inputBase = (useUiRecipe("input") ?? inputRecipe)();
   const generateFormat = () => {
-    return isNaN(value ?? 0) ? "" : formatter ? formatter(value?.toString() ?? "") : (value?.toString() ?? "");
+    return Number.isNaN(value ?? 0) ? "" : formatter ? formatter(value?.toString() ?? "") : (value?.toString() ?? "");
   };
 
   const [firstFocus, setFirstFocus] = useState(true);
@@ -498,120 +415,72 @@ const DefaultNumber = ({
       : !nullable && value === null
         ? "warning"
         : "";
-  const invalidMessage =
-    value === null || validateResult === true
-      ? null
-      : validateResult === false
-        ? l("base.invalidValueError")
-        : validateResult;
-  const statusClass =
-    validate !== undefined
-      ? status === "error"
-        ? "input-error"
-        : !firstFocus && status === "warning"
-          ? "input-warning"
-          : status === "success"
-            ? "input-success"
-            : "input"
-      : "input";
+  const invalidMessage = invalidMessageOf(value === null, validateResult, l);
+  const statusClass = validate !== undefined ? statusClassOf(status, firstFocus) : "";
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key !== "Enter" && e.key !== "Escape") return;
     const numberValue = parseFloat(e.currentTarget.value.replace(/[^\d-]/g, ""));
-    if (e.key === "Enter") {
-      if (isNaN(numberValue)) {
-        e.currentTarget.value = "";
-        setFormatValue("");
-        onChange(null);
-        return;
-      }
-      if (rest.max !== undefined && numberValue > parseFloat(rest.max as string)) {
-        const maxValue = formatter ? formatter(String(rest.max)) : String(rest.max);
-        e.currentTarget.value = maxValue;
-        setFormatValue(maxValue);
-        onPressEnter?.(parseFloat(maxValue), e);
-        return;
-      } else if (rest.min !== undefined && numberValue < parseFloat(rest.min as string)) {
-        const minValue = formatter ? formatter(String(rest.min)) : String(rest.min);
-        e.currentTarget.value = minValue;
-        setFormatValue(minValue);
-        onPressEnter?.(parseFloat(minValue), e);
-        return;
-      }
+    if (Number.isNaN(numberValue)) {
+      e.currentTarget.value = "";
+      setFormatValue("");
+      onChange(null);
+      return;
+    }
+    const bound =
+      rest.max !== undefined && numberValue > parseFloat(rest.max as string)
+        ? rest.max
+        : rest.min !== undefined && numberValue < parseFloat(rest.min as string)
+          ? rest.min
+          : undefined;
+    const boundValue = bound === undefined ? undefined : formatter ? formatter(String(bound)) : String(bound);
+    if (e.key === "Escape") {
+      if (boundValue !== undefined) e.currentTarget.value = boundValue;
+      e.currentTarget.blur();
+      onPressEscape?.(e);
+    } else if (boundValue !== undefined) {
+      e.currentTarget.value = boundValue;
+      setFormatValue(boundValue);
+      onPressEnter?.(parseFloat(boundValue), e);
+    } else {
       setFormatValue(formatter ? formatter(String(numberValue)) : String(numberValue));
       onPressEnter?.(numberValue, e);
     }
-    if (e.key === "Escape") {
-      if (isNaN(numberValue)) {
-        e.currentTarget.value = "";
-        setFormatValue("");
-        onChange(null);
-        return;
-      }
-      if (rest.max !== undefined && numberValue > parseFloat(rest.max as string)) {
-        e.currentTarget.value = formatter ? formatter(String(rest.max)) : String(rest.max);
-      } else if (rest.min !== undefined && numberValue < parseFloat(rest.min as string)) {
-        e.currentTarget.value = formatter ? formatter(String(rest.min)) : String(rest.min);
-      }
-      e.currentTarget.blur();
-      onPressEscape?.(e);
-    }
   };
-
-  useEffect(() => {
-    if (cacheKey) {
-      const value = sessionStorage.getItem(cacheKey);
-      if (value) {
-        setFormatValue(value);
-        onChange(parser ? parseFloat(value) : parseFloat(value));
-      }
-    } else {
-      setFormatValue(generateFormat());
-    }
-  }, []);
 
   useEffect(() => {
     setFormatValue(generateFormat());
   }, [value]);
 
   return (
-    <div className={clsx("relative isolate", className)}>
-      <div className={clsx("flex items-center", inputWrapperClassName)}>
-        {icon ? (
-          <div className={clsx("absolute inset-y-0 left-4 z-10 flex items-center justify-center", iconClassName)}>
-            {icon}
-          </div>
-        ) : null}
+    <div className={cn("relative isolate", className)}>
+      <div className={cn("flex items-center", inputWrapperClassName)}>
+        <LeadingIcon icon={icon} className={iconClassName} />
         <input
           {...rest}
+          {...agentAttrs(onChange)}
           ref={inputRef}
           value={formatValue}
           onKeyDown={handleKeyDown}
           onBlur={(e) => {
-            // if (rest.max !== undefined && parsedValue > parseFloat(rest.max as string)) {
-            //   e.target.value = formatter ? formatter(String(rest.max)) : String(rest.max);
-            // } else if (rest.min !== undefined && parsedValue < parseFloat(rest.min as string)) {
-            //   e.target.value = formatter ? formatter(String(rest.min)) : String(rest.min);
-            // }
             if (firstFocus && value) setFirstFocus(false);
           }}
           onChange={(e) => {
-            //string만 허용
             const parsedValue = parser ? parser(e.target.value) : e.target.value;
             setFormatValue(formatter ? formatter(parsedValue) : e.target.value);
             onChange(parser ? parseFloat(parsedValue) : parseFloat(e.target.value), e);
-            if (cacheKey) sessionStorage.setItem(cacheKey, parsedValue);
           }}
-          className={clsx(
-            `input text-base-content duration-300 focus:border-primary focus:outline-hidden ${icon && "pl-12"}`,
+          className={cn(
+            inputBase,
+            "text-foreground duration-300 focus:border-primary focus:outline-hidden",
+            icon && "pl-12",
             statusClass,
             inputClassName,
           )}
         />
       </div>
 
-      {invalidMessage ? (
-        <div className="absolute -bottom-4 animate-fadeIn text-error text-xs">{invalidMessage}</div>
-      ) : null}
+      <InvalidMessage message={invalidMessage} />
     </div>
   );
 };
@@ -623,12 +492,15 @@ export type CheckboxProps = Omit<InputHTMLAttributes<HTMLInputElement>, "onChang
 };
 
 const DefaultCheckbox = ({ checked, onChange, className, ...rest }: CheckboxProps) => {
+  useFieldTool(onChange, { disabled: rest.disabled });
   return (
     <input
       {...rest}
+      {...agentAttrs(onChange)}
       type="checkbox"
       checked={checked}
-      className={clsx("checkbox", className)}
+      // Native with `accent-color`: the browser keeps the focus ring, keyboard toggle and indeterminate state.
+      className={cn("size-5 accent-primary", className)}
       onChange={(e) => {
         onChange(e.target.checked, e);
       }}
@@ -637,11 +509,6 @@ const DefaultCheckbox = ({ checked, onChange, className, ...rest }: CheckboxProp
 };
 const InputBase = createOverridable("Input", DefaultInput);
 
-/**
- * Text input plus its field variants. Each leaf resolves to a route-scoped override when a
- * `page/**\/_overrides.tsx` in the route's ancestry declares one (slots `Input`, `InputTextArea`,
- * `InputPassword`, `InputEmail`, `InputNumber`, `InputCheckbox`), otherwise renders the default.
- */
 export const Input = Object.assign(InputBase, {
   TextArea: createOverridable("InputTextArea", DefaultTextArea),
   Password: createOverridable("InputPassword", DefaultPassword),

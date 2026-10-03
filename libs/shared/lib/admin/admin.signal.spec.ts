@@ -25,11 +25,12 @@ export const getAdminAgentWithInitialize = async <Fetch = SharedFetch>(): Promis
   // 2. 초기 Admin 생성
   const adminInput = sampleOf(cnst.AdminInput);
   const password = "password";
-  let admin = await fetch.createAdminWithInitialize(adminInput);
-  expect(admin.accountId).toEqual(adminInput.accountId);
-  expect(admin.password).toBeFalsy();
+  await expect(fetch.createAdminWithInitialize(adminInput)).rejects.toThrow();
   const rootAccessToken = await fetch.signinAdmin("admin@akanjs.com", "admin1234");
   const rootFetch = fetch.clone({ jwt: rootAccessToken.jwt }) as SharedFetch;
+  let admin = await rootFetch.createAdminWithInitialize(adminInput);
+  expect(admin.accountId).toEqual(adminInput.accountId);
+  expect(admin.password).toBeFalsy();
   await rootFetch.setAdminPassword(admin.id, password);
   expect(await fetch.isAdminSystemInitialized()).toBeTruthy();
   // 3. Admin 로그인
@@ -41,6 +42,22 @@ export const getAdminAgentWithInitialize = async <Fetch = SharedFetch>(): Promis
   admin = await adminFetch.me();
   expect(admin.accountId).toEqual(adminInput.accountId);
 
+  return { admin, fetch: adminFetch as Fetch, accessToken, adminInput, password };
+};
+
+/**
+ * An admin with no role granted, which is what a `SuperAdmin` guard has to refuse.
+ *
+ * `getAdminAgentFromSuperAdmin` grants both `admin` and `superAdmin`, so it cannot answer whether a guard fires.
+ */
+export const getPlainAdminAgent = async <Fetch = SharedFetch>(agent: AdminAgent): Promise<AdminAgent<Fetch>> => {
+  const fetch = await getFetch();
+  const adminInput = sampleOf(cnst.AdminInput);
+  const password = "password";
+  const admin = await agent.fetch.createAdmin(adminInput);
+  await agent.fetch.setAdminPassword(admin.id, password);
+  const accessToken = await fetch.signinAdmin(adminInput.accountId, password);
+  const adminFetch = fetch.clone({ jwt: accessToken.jwt }) as SharedFetch;
   return { admin, fetch: adminFetch as Fetch, accessToken, adminInput, password };
 };
 

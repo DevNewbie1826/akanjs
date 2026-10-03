@@ -1,19 +1,23 @@
 "use client";
 import { type ClientEnv, dayjs, getEnv, logo } from "akanjs/base";
 import {
-  clearRscNavigationCache,
-  clsx,
+  type CsrPageType,
+  cn,
   Device,
   debugFrame,
   defaultPageState,
   fetch,
+  getCookie,
   getPathInfo,
   initAuth,
   type Location,
   navigateRsc,
+  type PageActivity,
   type PageState,
   type PathRoute,
+  pageActivityContext,
   pathContext,
+  refreshRsc,
   router,
   setCookie,
   type TransitionStyle,
@@ -23,7 +27,7 @@ import {
 import { Logger } from "akanjs/common";
 import type { AkanTheme } from "akanjs/fetch";
 import type { SerializedSignal } from "akanjs/signal";
-import { getBaseSearchParam, st } from "akanjs/store";
+import { DraftStore, getBaseSearchParam, st } from "akanjs/store";
 import { animated } from "akanjs/ui";
 import {
   Children,
@@ -33,17 +37,14 @@ import {
   useCallback,
   useEffect,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
 } from "react";
-import { getFrameCssVars } from "./frameCssVars";
-import { Gtag } from "./Gtag";
+import { AgentActivity } from "use-agentic";
+import { getFrameCssVars } from "./Common";
 import { Messages } from "./Messages";
 import { Reconnect } from "./Reconnect";
-
-declare global {
-  var __AKAN_GET_SYNC_ROUTE_HREF__: ((href: string) => string) | undefined;
-}
 
 export const Client = () => {
   return <></>;
@@ -66,16 +67,10 @@ export const ClientWrapper = ({
   signals = [],
   reconnect = true,
 }: ClientWrapperProps) => {
-  // Replace the active locale snapshot before children render.
-  // SSR provides the active-locale dictionary as a prop (serialized via the RSC Flight payload);
-  // this runs in both the SSR render process and the browser, so the first paint is translated
-  // without shipping every locale in the client JS bundle. CSR seeds via the build-time macro instead.
+  // Seeded before children render, in the SSR pass and the browser alike; CSR seeds from the build-time macro.
   if (dictionary) {
     Translator.replace(lang, dictionary);
-    // On the browser, record the server-resolved locale as the source of truth for usePage()/l().
-    // This keeps client lookups aligned with the seeded + server-rendered locale (no hydration
-    // mismatch) for base-path / cloud routing where the URL segment is not a reliable locale.
-    // Skipped on the server (typeof window === "undefined") where locale is request-scoped.
+    // The server-resolved locale is the truth for `l()`: under base-path routing the URL segment is not.
     Translator.setActiveLocale(lang);
   }
   Translator.setActivePath(path);
@@ -87,7 +82,6 @@ export const ClientWrapper = ({
   }, []);
   return (
     <>
-      {/* <ThemeProvider defaultTheme={theme}> */}
       {Children.toArray(children)}
       {reconnect ? <Reconnect key="reconnect" /> : null}
     </>
@@ -98,7 +92,9 @@ Client.Wrapper = ClientWrapper;
 interface ClientPathWrapperProps extends Omit<HTMLAttributes<HTMLDivElement>, "style"> {
   bind?: () => HTMLAttributes<HTMLDivElement>;
   wrapperRef?: RefObject<HTMLDivElement | null> | null;
-  pageType?: "current" | "prev" | "cached" | "pending";
+  pageType?: CsrPageType;
+  pageKey?: string;
+  activity?: PageActivity;
   location?: Location;
   initialHref?: string;
   initialPath?: string;
@@ -118,6 +114,8 @@ export const ClientPathWrapper = ({
   bind,
   wrapperRef,
   pageType = "current",
+  pageKey,
+  activity = "current",
   location,
   initialHref,
   initialPath,
@@ -158,24 +156,21 @@ export const ClientPathWrapper = ({
     [csr.registerFrameSlot, pathRoute.path, pageType],
   );
 
-  // const { initialize, codepush, statManager } = useCodepush({ serverUrl: process.env.AKAN_PUBLIC_SERVER_URL ?? "" });
-
   const [gestureEnabled, setGestureEnabled] = useState(true);
+  //? A page that became current is focused once its entrance settles; one leaving loses focus as it starts to go.
+  const focused = activity === "current" && csr.phase !== "transitioning";
+  const pageActivity = useMemo(() => ({ activity, focused }), [activity, focused]);
   const frameCssVars = getFrameCssVars(pathRoute.pageState);
   const bindProps = bind && pageType !== "pending" && pathRoute.pageState.gesture && gestureEnabled ? bind() : {};
   useEffect(() => {
     debugFrame("pathWrapper.mount", { path: pathRoute.path, pageType, href });
     return () => debugFrame("pathWrapper.unmount", { path: pathRoute.path, pageType, href });
   }, []);
-  // useEffect(() => {
-  //   void initialize();
-  //   void codepush();
-  //   void statManager();
-  // }, []);
   return (
     <pathContext.Provider
       value={{
         pageType,
+        pageKey,
         location: {
           href,
           hash,
@@ -191,57 +186,47 @@ export const ClientPathWrapper = ({
         registerFrameSlot,
       }}
     >
-      <animated.div
-        {...bindProps}
-        {...props}
-        className={clsx("group/path", className)}
-        ref={wrapperRef}
-        style={{ ...frameCssVars, ...(bindProps.style ?? {}), ...(style ?? {}) } as TransitionStyle}
-        data-lang={lang}
-        data-basepath={prefix}
-        data-firstpath={firstPath}
-      >
-        {children}
-      </animated.div>
+      <pageActivityContext.Provider value={pageActivity}>
+        <animated.div
+          {...bindProps}
+          {...props}
+          className={cn("group/path", className)}
+          ref={wrapperRef}
+          style={{ ...frameCssVars, ...(bindProps.style ?? {}), ...(style ?? {}) } as TransitionStyle}
+          data-lang={lang}
+          data-basepath={prefix}
+          data-firstpath={firstPath}
+        >
+          <AgentActivity active={activity === "current"}>{children}</AgentActivity>
+        </animated.div>
+      </pageActivityContext.Provider>
     </pathContext.Provider>
   );
 };
 
 interface ClientBridgeProps {
-  env: ClientEnv;
+  env?: object;
   lang?: string;
   theme?: AkanTheme;
   prefix?: string;
-  gaTrackingId?: string;
   wsConnect?: boolean;
 }
 
-export const ClientBridge = ({ env, lang, theme, prefix, gaTrackingId, wsConnect = true }: ClientBridgeProps) => {
-  (globalThis as typeof globalThis & { __AKAN_CLIENT_ENV__?: ClientEnv }).__AKAN_CLIENT_ENV__ = env;
-  const uiOperation = st.use.uiOperation();
-  const pathname = st.use.pathname();
-  const params = st.use.params();
-  const searchParams = st.use.searchParams();
+export const ClientBridge = ({ env, lang, theme, prefix, wsConnect = true }: ClientBridgeProps) => {
+  // Base env is recomputed here rather than taken from the app's `env/env.client.ts`: that file is imported
+  // by a server component, so its `getEnv()` would resolve to the server's own hosts and ship them to the browser.
+  (globalThis as typeof globalThis & { __AKAN_CLIENT_ENV__?: ClientEnv }).__AKAN_CLIENT_ENV__ = {
+    ...getEnv(),
+    ...env,
+  };
+  const uiOperation = st.use.uiOperation({ agent: false });
+  const pathname = st.use.pathname({ agent: false });
+  const params = st.use.params({ agent: false });
+  const searchParams = st.use.searchParams({ agent: false });
   const language = (params.lang as string | undefined) ?? lang;
   const path = `/${pathname.split("/").slice(2).join("/")}`;
-  // const { setTheme, themes, theme: nextTheme } = useTheme();
   useEffect(() => {
     if (uiOperation !== "sleep") return;
-    // const initTheme = async () => {
-    //   console.log("initTheme1", theme);
-    //   if (theme) {
-    //     setTheme(theme);
-    //     return;
-    //   }
-    //   const localTheme = await storage.getItem("theme");
-    //   console.log("localTheme2", localTheme);
-    //   if (typeof localTheme === "string" && themes.includes(localTheme)) {
-    //     console.log("setTheme3", localTheme);
-    //     setTheme(localTheme);
-    //   } else setTheme("system");
-    // };
-
-    // void initTheme();
     setCookie("siteurl", window.location.origin);
     dayjs.locale(language);
     initAuth({ jwt: getBaseSearchParam(searchParams, "jwt") });
@@ -256,25 +241,25 @@ export const ClientBridge = ({ env, lang, theme, prefix, gaTrackingId, wsConnect
     (fetch.instance as { connect: () => void }).connect();
   }, [wsConnect]);
 
+  useLayoutEffect(() => {
+    restoreDocumentTheme(theme);
+  }, [theme, pathname]);
+
   useEffect(() => {
-    if (getThemeCookie() !== undefined) return;
-    applyThemePolicy(theme ?? "system");
+    const onPageShow = (event: PageTransitionEvent) => {
+      if (event.persisted) restoreDocumentTheme(theme);
+    };
+    window.addEventListener("pageshow", onPageShow);
+    return () => window.removeEventListener("pageshow", onPageShow);
   }, [theme]);
-
-  // useEffect(() => {
-  //   if (storeTheme !== nextTheme) setTheme(storeTheme);
-  // }, [nextTheme]);
-
-  useEffect(() => {
-    //theme가 잇으면 theme부터
-    //theme가 있는데 nextTheme가 있으면
-    // if (nextTheme) setTheme(nextTheme);
-    // else if (theme) setTheme(theme);
-  }, []);
 
   useEffect(() => {
     const devMode = localStorage.getItem("devMode");
     if (devMode) st.do.setDevMode(devMode === "true");
+  }, []);
+
+  useEffect(() => {
+    void DraftStore.reconcileIdentity().then(() => DraftStore.sweep());
   }, []);
 
   useEffect(() => {
@@ -291,30 +276,27 @@ export const ClientBridge = ({ env, lang, theme, prefix, gaTrackingId, wsConnect
 
   useEffect(() => {
     setCookie("path", path);
-    Logger.log(`pathChange-finished:${path}`);
+    Logger.info(`pathChange-finished:${path}`);
   }, [pathname]);
-  return gaTrackingId && <Gtag trackingId={gaTrackingId} />;
+  return null;
 };
 Client.Bridge = ClientBridge;
 
-function getThemeCookie(): string | undefined {
-  return document.cookie
-    .split(";")
-    .find((cookie) => cookie.trim().startsWith("theme="))
-    ?.split("=")[1];
-}
-
-function applyThemePolicy(theme: AkanTheme): void {
-  if (theme === "css") {
+function restoreDocumentTheme(layoutTheme: AkanTheme | undefined): void {
+  // RSC cache replay and bfcache can restore a stale data-theme; the cookie is the live preference.
+  const theme = getCookie("theme") ?? resolveThemePolicy(layoutTheme ?? "system");
+  if (theme === null) {
     document.documentElement.removeAttribute("data-theme");
     return;
   }
-  if (theme === "system") {
-    const dark = window.matchMedia("(prefers-color-scheme: dark)").matches;
-    document.documentElement.setAttribute("data-theme", dark ? "dark" : "light");
-    return;
-  }
   document.documentElement.setAttribute("data-theme", theme);
+  st.do.setTheme(theme);
+}
+
+function resolveThemePolicy(theme: AkanTheme): string | null {
+  if (theme === "css") return null;
+  if (theme === "system") return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+  return theme;
 }
 
 function buildSearchParams(entries: Iterable<[string, string]>): Record<string, string | string[]> {
@@ -328,7 +310,7 @@ function buildSearchParams(entries: Iterable<[string, string]>): Record<string, 
 }
 
 export const ClientInner = () => {
-  const uiOperation = st.use.uiOperation();
+  const uiOperation = st.use.uiOperation({ agent: false });
   return (
     <>
       <div key="modal-root" id="modal-root" />
@@ -362,7 +344,14 @@ export const ClientSsrBridge = ({ lang, prefix = "", initialPageState }: ClientS
         fallback();
         return;
       }
-      void navigation.catch((error) => {
+      return navigation.catch((error: unknown) => {
+        // By name, not `instanceof`: the RSC client is inlined into more than one browser bundle.
+        if (error instanceof Error && error.name === "RscRouteNotFound") {
+          // `syncHref` already moved the store to the refused page; a document navigation would land on the 404.
+          syncHref(window.location.href);
+          Logger.error(`No route at ${href}; the page was left where it was.`);
+          throw error;
+        }
         Logger.warn(`RSC navigation failed, falling back to document navigation: ${String(error)}`);
         fallback();
       });
@@ -386,22 +375,18 @@ export const ClientSsrBridge = ({ lang, prefix = "", initialPageState }: ClientS
       router: {
         push: (href, routeOptions) => {
           syncHref(href);
-          navigateRscWithFallback(href, routeOptions, () => window.location.assign(href));
+          return navigateRscWithFallback(href, routeOptions, () => window.location.assign(href));
         },
         replace: (href, routeOptions) => {
           syncHref(href);
-          navigateRscWithFallback(href, { ...routeOptions, replace: true }, () => window.location.replace(href));
+          return navigateRscWithFallback(href, { ...routeOptions, replace: true }, () => window.location.replace(href));
         },
         back: () => {
           window.history.back();
         },
         refresh: () => {
-          clearRscNavigationCache();
           syncHref(window.location.href);
-          void navigateRsc(window.location.href, {
-            replace: true,
-            scrollToTop: false,
-          });
+          void refreshRsc();
         },
       },
     });
