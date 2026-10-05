@@ -100,4 +100,84 @@ describe("McpDispatcher account listing", () => {
 
     expect(result as unknown).toBe("admin-ok");
   });
+
+  test("scopes shared account-guard verdicts to each endpoint middleware chain", async () => {
+    class RedStamp extends middleware("redStamp") {
+      override async use() {
+        return async (context: SignalContext, next: () => Promise<unknown>) => {
+          const req = context.getHttpContext().req;
+          Object.assign(req, {
+            account: req.headers.get("authorization") === "Bearer red-token" ? { roles: ["admin"] } : null,
+          });
+          return await next();
+        };
+      }
+    }
+    class BlueStamp extends middleware("blueStamp") {
+      override async use() {
+        return async (context: SignalContext, next: () => Promise<unknown>) => {
+          const req = context.getHttpContext().req;
+          Object.assign(req, {
+            account: req.headers.get("authorization") === "Bearer blue-token" ? { roles: ["admin"] } : null,
+          });
+          return await next();
+        };
+      }
+    }
+    class ColoredEndpoint extends adapt("coloredEndpoint", () => ({})) {
+      static [ENDPOINT_META] = {
+        redTool: buildEndpoint.query(String, { guards: [AdminOnly], middlewares: [RedStamp] }).exec(() => "red"),
+        blueTool: buildEndpoint.query(String, { guards: [AdminOnly], middlewares: [BlueStamp] }).exec(() => "blue"),
+      };
+    }
+    const { props } = makeDispatcher();
+    props.registry.endpoint.clear();
+    props.registry.endpoint.set(
+      ColoredEndpoint as unknown as EndpointCls,
+      new ColoredEndpoint() as unknown as Endpoint,
+    );
+    const dispatcher = new McpDispatcher(props);
+
+    for (const [token, tool] of [
+      ["red-token", "redTool"],
+      ["blue-token", "blueTool"],
+    ]) {
+      const req = new Request("http://localhost/mcp", { headers: { authorization: `Bearer ${token}` } });
+      const listed = await dispatcher.filterForAccount([{ name: "redTool" }, { name: "blueTool" }], req);
+
+      expect(listed.map(({ name }) => name)).toEqual([tool]);
+    }
+  });
+
+  test("keeps an argument-dependent middleware tool listed and callable with its argument", async () => {
+    class ArgumentWork extends middleware("argumentWork") {
+      override async use() {
+        return async (context: SignalContext, next: () => Promise<unknown>) => {
+          if (context.args.length === 0) throw new Error("Missing call argument");
+          return await next();
+        };
+      }
+    }
+    const endpointInfo = buildEndpoint
+      .query(String, { guards: [AdminOnly], middlewares: [ArgumentWork] })
+      .param("value", String)
+      .exec((value) => value);
+    const { endpoint, props } = makeDispatcher(endpointInfo);
+    props.middleware.set("adminStamp", AdminStamp);
+    const dispatcher = new McpDispatcher(props);
+    const req = new Request("http://localhost/mcp", { headers: { authorization: "Bearer admin-token" } });
+
+    const listed = await dispatcher.filterForAccount([{ name: "adminTool" }], req);
+    const context = await new SignalContext("adminTool", req as Bun.BunRequest, {
+      ...props,
+      endpointInfo,
+      adaptor: endpoint,
+      ctx: new McpExecutionContext(req, { value: "argument-ok" }),
+      origin: "mcp",
+    }).init();
+    const result = await context.exec();
+
+    expect(result as unknown).toBe("argument-ok");
+    expect(listed).toEqual([{ name: "adminTool" }]);
+  });
 });

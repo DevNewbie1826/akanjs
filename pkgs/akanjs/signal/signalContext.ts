@@ -150,25 +150,31 @@ export class SignalContext<
   }
   /**
    * Evaluates only `scope = "account"` guards after endpoint middlewares prepare the caller principal as in normal
-   * execution. Never an access gate: resource guards fail closed without arguments and are left to call time.
+   * execution. A guard refusal or error hides the entry. Middleware errors keep it listed unless they explicitly
+   * refuse with 401/403. Never an access gate: resource guards are left to call time with the call's arguments.
    */
   async canListForAccount(): Promise<boolean> {
     const guards = (this.endpointInfo.signalOption.guards ?? []).filter((GuardCls) => GuardCls.scope === "account");
     if (guards.length === 0) return true;
+    let canList = true;
     try {
       // Without logging: a refusal is the expected answer for most of a catalogue, not an `Error …` line per listing.
       await this.#withMiddleware(
         async () => {
           for (const GuardCls of guards) {
-            if (!(await this.#canListWith(GuardCls)))
-              throw new Exception.Forbidden(`Access denied by guard: ${GuardCls.name}`);
+            if (!(await this.#canListWith(GuardCls))) {
+              canList = false;
+              return;
+            }
           }
         },
         { endpointMiddlewares: true, skip: ["logging"] },
       )();
+      return canList;
+    } catch (error) {
+      if (!canList || (isExceptionLike(error) && (error.statusCode === 401 || error.statusCode === 403))) return false;
+      this.#warnListingMiddleware(error);
       return true;
-    } catch {
-      return false;
     }
   }
   // An account guard that throws anything but a refusal reached for arguments: a mismarked resource guard.
@@ -177,7 +183,7 @@ export class SignalContext<
       return await guardOf(GuardCls).canPass(this);
     } catch (error) {
       if (!isExceptionLike(error)) this.#warnMismarkedGuard(GuardCls, error);
-      throw error;
+      return false;
     }
   }
   static #mismarkedWarned = new WeakMap<GuardCls, Set<string>>();
@@ -188,6 +194,14 @@ export class SignalContext<
     SignalContext.#mismarkedWarned.set(GuardCls, keys);
     this.adaptor.logger.warn(
       `Guard ${GuardCls.name} threw while listing "${this.key}" with no arguments: ${String(error)}. A guard that reads the call's arguments is \`static scope = "resource"\`; until then the entry is hidden from every listing.`,
+    );
+  }
+  static #listingMiddlewareWarned = new Set<string>();
+  #warnListingMiddleware(error: unknown) {
+    if (SignalContext.#listingMiddlewareWarned.has(this.key)) return;
+    SignalContext.#listingMiddlewareWarned.add(this.key);
+    this.adaptor.logger.warn(
+      `Middleware threw while listing "${this.key}" with no arguments: ${String(error)}. Argument-dependent endpoint work must not run at listing; gate the tool with a resource-scope guard instead. The entry stays listed and is checked at call time.`,
     );
   }
   #withMiddleware(

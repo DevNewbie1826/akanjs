@@ -62,13 +62,13 @@ export class McpDispatcher {
   // Not `init()`-ed: a listing has no arguments, and a resource guard reached here reads undefined and fails closed.
   async filterForAccount<T extends { name: string }>(items: T[], req: Request): Promise<T[]> {
     const index = this.#index();
-    // One verdict per distinct account-guard set, since each runs the middleware chain (a JWT verification). Sound
-    // because an account guard reads only the caller; one reading `context.key` is a mismarked resource guard.
-    const ids = new Map<GuardCls, number>();
-    const idOf = (GuardCls: GuardCls) => {
-      const id = ids.get(GuardCls);
+    // Share a verdict only for the same account-guard set and ordered endpoint middleware chain, since middleware
+    // prepares the caller. An account guard reads only the caller; one reading `context.key` is a resource guard.
+    const ids = new Map<GuardCls | MiddlewareCls, number>();
+    const idOf = (cls: GuardCls | MiddlewareCls) => {
+      const id = ids.get(cls);
       if (id !== undefined) return id;
-      ids.set(GuardCls, ids.size);
+      ids.set(cls, ids.size);
       return ids.size - 1;
     };
     const cached = new Map<string, Promise<boolean>>();
@@ -80,10 +80,12 @@ export class McpDispatcher {
           (GuardCls) => GuardCls.scope === "account",
         );
         if (!guards.length) return true;
-        const key = guards
+        const guardKey = guards
           .map(idOf)
           .sort((a, b) => a - b)
           .join(",");
+        const middlewareKey = (found.endpointInfo.signalOption.middlewares ?? []).map(idOf).join(">");
+        const key = `${guardKey}|${middlewareKey}`;
         const verdict =
           cached.get(key) ??
           new SignalContext(item.name, req as Bun.BunRequest, {
