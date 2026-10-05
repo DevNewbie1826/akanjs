@@ -60,6 +60,7 @@ export class McpDispatcher {
 
   // A UX filter, never the access decision: entries without an account guard stay listed and are stopped at call time.
   // Not `init()`-ed: a listing has no arguments, and a resource guard reached here reads undefined and fails closed.
+  // Evaluations are request-isolated so asynchronous guards cannot read another endpoint's prepared principal.
   async filterForAccount<T extends { name: string }>(items: T[], req: Request): Promise<T[]> {
     const index = this.#index();
     // Share a verdict only for the same account-guard set and ordered endpoint middleware chain, since middleware
@@ -74,6 +75,8 @@ export class McpDispatcher {
     const cached = new Map<string, Promise<boolean>>();
     const verdicts = await Promise.all(
       items.map(async (item) => {
+        // The router already consumed the JSON-RPC body; listing needs only the request metadata.
+        const itemReq = req.bodyUsed ? new Request(req, { body: null }) : req.clone();
         const found = index.get(item.name);
         if (!found) return true;
         const guards = (found.endpointInfo.signalOption.guards ?? []).filter(
@@ -88,11 +91,11 @@ export class McpDispatcher {
         const key = `${guardKey}|${middlewareKey}`;
         const verdict =
           cached.get(key) ??
-          new SignalContext(item.name, req as Bun.BunRequest, {
+          new SignalContext(item.name, itemReq as Bun.BunRequest, {
             ...this.#props,
             endpointInfo: found.endpointInfo,
             adaptor: found.endpoint,
-            ctx: new McpExecutionContext(req, {}),
+            ctx: new McpExecutionContext(itemReq, {}),
             origin: "mcp",
           }).canListForAccount();
         cached.set(key, verdict);

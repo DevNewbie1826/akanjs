@@ -180,4 +180,65 @@ describe("McpDispatcher account listing", () => {
     expect(result as unknown).toBe("argument-ok");
     expect(listed).toEqual([{ name: "adminTool" }]);
   });
+
+  test("isolates async account-guard evaluations across endpoint middleware chains in either catalogue order", async () => {
+    class AsyncAdminOnly implements Guard {
+      static scope = "account" as const;
+      async canPass(context: SignalContext) {
+        await Promise.resolve();
+        return context.get<{ roles: string[] }>("account")?.roles.includes("admin") ?? false;
+      }
+    }
+    class RedStamp extends middleware("asyncRedStamp") {
+      override async use() {
+        return async (context: SignalContext, next: () => Promise<unknown>) => {
+          const req = context.getHttpContext().req;
+          Object.assign(req, {
+            account: req.headers.get("authorization") === "Bearer red-token" ? { roles: ["admin"] } : null,
+          });
+          return await next();
+        };
+      }
+    }
+    class BlueStamp extends middleware("asyncBlueStamp") {
+      override async use() {
+        return async (context: SignalContext, next: () => Promise<unknown>) => {
+          const req = context.getHttpContext().req;
+          Object.assign(req, {
+            account: req.headers.get("authorization") === "Bearer blue-token" ? { roles: ["admin"] } : null,
+          });
+          return await next();
+        };
+      }
+    }
+    class ColoredEndpoint extends adapt("asyncColoredEndpoint", () => ({})) {
+      static [ENDPOINT_META] = {
+        aRedTool: buildEndpoint.query(String, { guards: [AsyncAdminOnly], middlewares: [RedStamp] }).exec(() => "red"),
+        bBlueTool: buildEndpoint
+          .query(String, { guards: [AsyncAdminOnly], middlewares: [BlueStamp] })
+          .exec(() => "blue"),
+      };
+    }
+    const { props } = makeDispatcher();
+    props.registry.endpoint.clear();
+    props.registry.endpoint.set(
+      ColoredEndpoint as unknown as EndpointCls,
+      new ColoredEndpoint() as unknown as Endpoint,
+    );
+    const dispatcher = new McpDispatcher(props);
+    const listings = await Promise.all(
+      [
+        [{ name: "aRedTool" }, { name: "bBlueTool" }],
+        [{ name: "bBlueTool" }, { name: "aRedTool" }],
+      ].flatMap((items) =>
+        ["red-token", "blue-token"].map(async (token) => {
+          const req = new Request("http://localhost/mcp", { headers: { authorization: `Bearer ${token}` } });
+          const listed = await dispatcher.filterForAccount(items, req);
+          return listed.map(({ name }) => name);
+        }),
+      ),
+    );
+
+    expect(listings).toEqual([["aRedTool"], ["bBlueTool"], ["aRedTool"], ["bBlueTool"]]);
+  });
 });
