@@ -60,7 +60,8 @@ export class McpDispatcher {
 
   // A UX filter, never the access decision: entries without an account guard stay listed and are stopped at call time.
   // Not `init()`-ed: a listing has no arguments, and a resource guard reached here reads undefined and fails closed.
-  // Evaluations are request-isolated so asynchronous guards cannot read another endpoint's prepared principal.
+  // Evaluations are sequential and stamp-state is cleared between items: the original request and its native peer
+  // metadata are shared, but an endpoint's prepared principal is never carried across evaluations.
   async filterForAccount<T extends { name: string }>(items: T[], req: Request): Promise<T[]> {
     const index = this.#index();
     // Share a verdict only for the same account-guard set and ordered endpoint middleware chain, since middleware
@@ -73,16 +74,22 @@ export class McpDispatcher {
       return ids.size - 1;
     };
     const cached = new Map<string, Promise<boolean>>();
-    const verdicts = await Promise.all(
-      items.map(async (item) => {
-        // The router already consumed the JSON-RPC body; listing needs only the request metadata.
-        const itemReq = req.bodyUsed ? new Request(req, { body: null }) : req.clone();
+    const verdicts: boolean[] = [];
+    for (const item of items) {
+      const ownKeys = new Set(Object.keys(req));
+      try {
         const found = index.get(item.name);
-        if (!found) return true;
+        if (!found) {
+          verdicts.push(true);
+          continue;
+        }
         const guards = (found.endpointInfo.signalOption.guards ?? []).filter(
           (GuardCls) => GuardCls.scope === "account",
         );
-        if (!guards.length) return true;
+        if (!guards.length) {
+          verdicts.push(true);
+          continue;
+        }
         const guardKey = guards
           .map(idOf)
           .sort((a, b) => a - b)
@@ -91,17 +98,21 @@ export class McpDispatcher {
         const key = `${guardKey}|${middlewareKey}`;
         const verdict =
           cached.get(key) ??
-          new SignalContext(item.name, itemReq as Bun.BunRequest, {
+          new SignalContext(item.name, req as Bun.BunRequest, {
             ...this.#props,
             endpointInfo: found.endpointInfo,
             adaptor: found.endpoint,
-            ctx: new McpExecutionContext(itemReq, {}),
+            ctx: new McpExecutionContext(req, {}),
             origin: "mcp",
           }).canListForAccount();
         cached.set(key, verdict);
-        return await verdict;
-      }),
-    );
+        verdicts.push(await verdict);
+      } finally {
+        for (const key of Object.keys(req)) {
+          if (!ownKeys.has(key)) Reflect.deleteProperty(req, key);
+        }
+      }
+    }
     return items.filter((_item, idx) => verdicts[idx]);
   }
 
