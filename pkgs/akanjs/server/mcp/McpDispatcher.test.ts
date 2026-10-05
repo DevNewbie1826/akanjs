@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { type BackendEnv, ENDPOINT_META } from "akanjs/base";
 import { adapt, getDefaultInjectRegistry, getDefaultLiveRegistry } from "akanjs/service";
 import type { Endpoint, EndpointCls } from "../../signal/endpoint";
@@ -43,7 +43,156 @@ const makeDispatcher = (endpointInfo: EndpointInfo = adminEndpoint) => {
   return { dispatcher: new McpDispatcher(props), endpoint, props };
 };
 
+const makeIsolationDispatcher = (stamp: EndpointInfo, victim: EndpointInfo) => {
+  class IsolationEndpoint extends adapt("isolationEndpoint", () => ({})) {
+    static [ENDPOINT_META] = { stampTool: stamp, victimTool: victim };
+  }
+  const { props } = makeDispatcher();
+  props.registry.endpoint.clear();
+  props.registry.endpoint.set(
+    IsolationEndpoint as unknown as EndpointCls,
+    new IsolationEndpoint() as unknown as Endpoint,
+  );
+  return new McpDispatcher(props);
+};
+
 describe("McpDispatcher account listing", () => {
+  test("lists remaining items without evaluating them when a non-configurable stamp cannot be removed", async () => {
+    let guardCalls = 0;
+    class CountedAdmin implements Guard {
+      static scope = "account" as const;
+      canPass(context: SignalContext) {
+        guardCalls++;
+        return context.get<{ roles: string[] }>("account")?.roles.includes("admin") ?? false;
+      }
+    }
+    class FixedStamp extends middleware("fixedStamp") {
+      override async use() {
+        return async (context: SignalContext, next: () => Promise<unknown>) => {
+          Object.defineProperty(context.getHttpContext().req, "account", {
+            value: { roles: ["admin"] },
+            configurable: false,
+          });
+          return await next();
+        };
+      }
+    }
+    const dispatcher = makeIsolationDispatcher(
+      buildEndpoint.query(String, { guards: [CountedAdmin], middlewares: [FixedStamp] }).exec(() => "stamp"),
+      buildEndpoint.query(String, { guards: [CountedAdmin] }).exec(() => "victim"),
+    );
+    const warnings = spyOn(McpDispatcher.logger, "warn").mockImplementation(() => {});
+    try {
+      const req = new Request("http://localhost/mcp");
+      const listed = await dispatcher.filterForAccount(
+        [{ name: "victimTool" }, { name: "stampTool" }, { name: "victimTool" }],
+        req,
+      );
+
+      expect({ listed, guardCalls, warnings: warnings.mock.calls.length }).toEqual({
+        listed: [{ name: "stampTool" }, { name: "victimTool" }],
+        guardCalls: 2,
+        warnings: 1,
+      });
+      expect(Object.getOwnPropertyDescriptor(req, "account")?.configurable).toBe(false);
+      const warning = String(warnings.mock.calls[0]?.[0]);
+      expect(warning).toContain(FixedStamp.name);
+      expect(warning).toContain("account");
+      await dispatcher.filterForAccount(
+        [{ name: "stampTool" }, { name: "victimTool" }],
+        new Request("http://localhost/mcp"),
+      );
+      expect(guardCalls).toBe(3);
+      expect(warnings).toHaveBeenCalledTimes(1);
+    } finally {
+      warnings.mockRestore();
+    }
+  });
+
+  test("restores an overwritten pre-existing principal before evaluating the next item", async () => {
+    const dispatcher = makeIsolationDispatcher(
+      adminEndpoint,
+      buildEndpoint.query(String, { guards: [AdminOnly] }).exec(() => "victim"),
+    );
+    const req = new Request("http://localhost/mcp", { headers: { authorization: "Bearer admin-token" } });
+    const original = { roles: [] };
+    Object.assign(req, { account: original });
+    const before = Object.getOwnPropertyDescriptor(req, "account");
+
+    const listed = await dispatcher.filterForAccount([{ name: "stampTool" }, { name: "victimTool" }], req);
+
+    expect({ listed, descriptor: Object.getOwnPropertyDescriptor(req, "account") }).toEqual({
+      listed: [{ name: "stampTool" }],
+      descriptor: before,
+    });
+    expect(Reflect.get(req, "account")).toBe(original);
+  });
+
+  test("removes a symbol principal before evaluating the next item", async () => {
+    const account = Symbol.for("account");
+    const observed: unknown[] = [];
+    class SymbolStamp extends middleware("symbolStamp") {
+      override async use() {
+        return async (context: SignalContext, next: () => Promise<unknown>) => {
+          Reflect.set(context.getHttpContext().req, account, { roles: ["admin"] });
+          return await next();
+        };
+      }
+    }
+    class SymbolAdmin implements Guard {
+      static scope = "account" as const;
+      canPass(context: SignalContext) {
+        const req = context.getHttpContext().req;
+        const principal = Reflect.get(req, account) as { roles: string[] } | undefined;
+        observed.push({ normal: context.get("account"), symbol: principal ?? null });
+        return principal?.roles.includes("admin") ?? false;
+      }
+    }
+    const dispatcher = makeIsolationDispatcher(
+      buildEndpoint.query(String, { guards: [SymbolAdmin], middlewares: [SymbolStamp] }).exec(() => "stamp"),
+      buildEndpoint.query(String, { guards: [SymbolAdmin] }).exec(() => "victim"),
+    );
+    const req = new Request("http://localhost/mcp");
+
+    const listed = await dispatcher.filterForAccount([{ name: "stampTool" }, { name: "victimTool" }], req);
+
+    expect({ listed, observed, hasSymbol: Object.hasOwn(req, account) }).toEqual({
+      listed: [{ name: "stampTool" }],
+      observed: [
+        { normal: null, symbol: { roles: ["admin"] } },
+        { normal: null, symbol: null },
+      ],
+      hasSymbol: false,
+    });
+  });
+
+  test("removes a non-enumerable principal before evaluating the next item", async () => {
+    class HiddenStamp extends middleware("hiddenStamp") {
+      override async use() {
+        return async (context: SignalContext, next: () => Promise<unknown>) => {
+          Object.defineProperty(context.getHttpContext().req, "account", {
+            value: { roles: ["admin"] },
+            enumerable: false,
+            configurable: true,
+          });
+          return await next();
+        };
+      }
+    }
+    const dispatcher = makeIsolationDispatcher(
+      buildEndpoint.query(String, { guards: [AdminOnly], middlewares: [HiddenStamp] }).exec(() => "stamp"),
+      buildEndpoint.query(String, { guards: [AdminOnly] }).exec(() => "victim"),
+    );
+    const req = new Request("http://localhost/mcp");
+
+    const listed = await dispatcher.filterForAccount([{ name: "stampTool" }, { name: "victimTool" }], req);
+
+    expect({ listed, hasAccount: Object.hasOwn(req, "account") }).toEqual({
+      listed: [{ name: "stampTool" }],
+      hasAccount: false,
+    });
+  });
+
   test("lists an account-guarded tool for a caller whose credential an endpoint middleware verifies", async () => {
     const { dispatcher } = makeDispatcher();
     const req = new Request("http://localhost/mcp", { headers: { authorization: "Bearer admin-token" } });

@@ -34,6 +34,7 @@ export class McpDispatcher {
   #endpoints: Map<string, { endpointInfo: EndpointInfo; endpoint: Endpoint }> | null = null;
   // Lazy: the dictionary merge is not free, and only a failing call needs it.
   #lookup: DictionaryLookup | null = null;
+  static #listingRestoreWarned = new Set<string>();
 
   constructor(props: McpDispatcherProps) {
     this.#props = props;
@@ -60,8 +61,8 @@ export class McpDispatcher {
 
   // A UX filter, never the access decision: entries without an account guard stay listed and are stopped at call time.
   // Not `init()`-ed: a listing has no arguments, and a resource guard reached here reads undefined and fails closed.
-  // Evaluations are sequential and stamp-state is cleared between items: the original request and its native peer
-  // metadata are shared, but an endpoint's prepared principal is never carried across evaluations.
+  // Sequential evaluations restore all own-property descriptors on the original request, preserving its native peer.
+  // If restoration fails, remaining items stay listed without evaluation: contaminated state cannot prove denial.
   async filterForAccount<T extends { name: string }>(items: T[], req: Request): Promise<T[]> {
     const index = this.#index();
     // Share a verdict only for the same account-guard set and ordered endpoint middleware chain, since middleware
@@ -75,10 +76,17 @@ export class McpDispatcher {
     };
     const cached = new Map<string, Promise<boolean>>();
     const verdicts: boolean[] = [];
+    let contaminated = false;
     for (const item of items) {
-      const ownKeys = new Set(Object.keys(req));
+      if (contaminated) {
+        verdicts.push(true);
+        continue;
+      }
+      const before: Record<PropertyKey, PropertyDescriptor> = Object.getOwnPropertyDescriptors(req);
+      const found = index.get(item.name);
+      let cacheKey: string | undefined;
+      let evaluated: Promise<boolean> | undefined;
       try {
-        const found = index.get(item.name);
         if (!found) {
           verdicts.push(true);
           continue;
@@ -105,11 +113,48 @@ export class McpDispatcher {
             ctx: new McpExecutionContext(req, {}),
             origin: "mcp",
           }).canListForAccount();
-        cached.set(key, verdict);
+        cacheKey = key;
+        evaluated = verdict;
         verdicts.push(await verdict);
       } finally {
-        for (const key of Object.keys(req)) {
-          if (!ownKeys.has(key)) Reflect.deleteProperty(req, key);
+        const after: Record<PropertyKey, PropertyDescriptor> = Object.getOwnPropertyDescriptors(req);
+        const leftovers: PropertyKey[] = [];
+        for (const key of Reflect.ownKeys(after)) {
+          if (!Object.hasOwn(before, key) && !Reflect.deleteProperty(req, key)) leftovers.push(key);
+        }
+        for (const key of Reflect.ownKeys(before)) {
+          const original = before[key];
+          const current = after[key];
+          if (
+            current &&
+            Object.is(current.value, original.value) &&
+            current.get === original.get &&
+            current.set === original.set &&
+            current.writable === original.writable &&
+            current.enumerable === original.enumerable &&
+            current.configurable === original.configurable
+          )
+            continue;
+          try {
+            Object.defineProperty(req, key, original);
+          } catch {
+            leftovers.push(key);
+          }
+        }
+        if (leftovers.length) {
+          contaminated = true;
+          if (!McpDispatcher.#listingRestoreWarned.has(item.name)) {
+            McpDispatcher.#listingRestoreWarned.add(item.name);
+            const middlewares = [
+              ...[...this.#props.middleware.entries()].filter(([name]) => name !== "logging").map(([, cls]) => cls),
+              ...(found?.endpointInfo.signalOption.middlewares ?? []),
+            ];
+            McpDispatcher.logger.warn(
+              `Middleware chain ${middlewares.map((cls) => cls.name).join(", ")} could not restore request keys ${leftovers.map(String).join(", ")} after listing "${item.name}". Remaining entries stay listed and are checked at call time.`,
+            );
+          }
+        } else if (cacheKey !== undefined && evaluated) {
+          cached.set(cacheKey, evaluated);
         }
       }
     }
