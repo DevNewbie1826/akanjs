@@ -149,8 +149,8 @@ export class SignalContext<
     }
   }
   /**
-   * Evaluates only `scope = "account"` guards, to hide listing entries. Never an access gate: a resource guard fails
-   * closed without arguments, so it is left to `#checkGuards` at call time.
+   * Evaluates only `scope = "account"` guards after endpoint middlewares prepare the caller principal as in normal
+   * execution. Never an access gate: resource guards fail closed without arguments and are left to call time.
    */
   async canListForAccount(): Promise<boolean> {
     const guards = (this.endpointInfo.signalOption.guards ?? []).filter((GuardCls) => GuardCls.scope === "account");
@@ -164,7 +164,7 @@ export class SignalContext<
               throw new Exception.Forbidden(`Access denied by guard: ${GuardCls.name}`);
           }
         },
-        { endpointMiddlewares: false, skip: ["logging"] },
+        { endpointMiddlewares: true, skip: ["logging"] },
       )();
       return true;
     } catch {
