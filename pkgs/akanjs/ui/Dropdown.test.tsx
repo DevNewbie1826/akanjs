@@ -66,6 +66,44 @@ describe("Dropdown", () => {
     unmount();
   });
 
+  test("an item whose own trigger stops the click still closes the menu", () => {
+    const { menu, unmount } = render(
+      <li>
+        <button type="button" onClick={(e) => e.stopPropagation()}>
+          Edit
+        </button>
+      </li>,
+    );
+    const menuItem = menu.querySelector("button");
+    if (!menuItem) throw new Error("menu item did not render");
+    act(() => menuItem.click());
+    expect(menu.hidden).toBe(true);
+    unmount();
+  });
+
+  test("a click into a field in the menu, such as a searchable Select's input that stops the click, leaves it open", () => {
+    const { menu, unmount } = render(
+      <>
+        <li>
+          <div role="combobox" aria-expanded="false" aria-controls="options" tabIndex={-1}>
+            <input type="text" aria-label="Search" onClick={(e) => e.stopPropagation()} />
+          </div>
+        </li>
+        <li>
+          <textarea aria-label="Note" />
+        </li>
+      </>,
+    );
+    const search = menu.querySelector("input");
+    const note = menu.querySelector("textarea");
+    if (!search || !note) throw new Error("menu fields did not render");
+    act(() => search.click());
+    expect(menu.hidden).toBe(false);
+    act(() => note.click());
+    expect(menu.hidden).toBe(false);
+    unmount();
+  });
+
   test("a keep-open item leaves the menu open", () => {
     const { menu, unmount } = render(
       <li data-dropdown-keep-open="">

@@ -690,6 +690,7 @@ describe("dependency injection resolution", () => {
       participants: {
         get: (key: string) => Promise<{ status: string; muted: boolean } | undefined>;
         set: (key: string, value: { status: string; muted: boolean }) => Promise<void>;
+        entries: () => Promise<[string, { status: string; muted: boolean }][]>;
       };
     };
     await InjectInfo.resolveInjection(instance, StateService, registry, {} as never);
@@ -700,7 +701,10 @@ describe("dependency injection resolution", () => {
     const stored = cache.calls.at(-1)?.args[3];
     expect(typeof stored).toBe("string");
     expect(JSON.parse(stored as string)).toMatchObject({ status: "speaking", muted: false });
-    expect(await instance.participants.get("user-1")).toMatchObject({ status: "speaking", muted: false });
+    const participant = await instance.participants.get("user-1");
+    expect(participant).toMatchObject({ status: "speaking", muted: false });
+    expect(participant).toBeInstanceOf(CallStateInput);
+    expect(await instance.participants.entries()).toEqual([["user-1", expect.any(CallStateInput)]]);
   });
 
   test("keeps each service's memory its own and applies the declared get, set and default", async () => {
@@ -755,13 +759,13 @@ describe("dependency injection resolution", () => {
     const database = makeFakeDatabaseModel();
     const registry = getDefaultInjectRegistry();
     const cacheAdaptor = cache as unknown as Adaptor;
-    const plugAdaptor = new PlugAdaptor() as unknown as PlugAdaptor & Adaptor;
+    const plugAdaptor = new PlugAdaptor();
     const depService = new DepService();
 
     registry.uses.set("plainUse", "use-value");
     registry.adaptorCls.set("solidCache", CacheAdaptorRef);
     registry.adaptor.set(CacheAdaptorRef, cacheAdaptor);
-    registry.adaptor.set(PlugAdaptor as unknown as AdaptorCls, plugAdaptor);
+    registry.adaptor.set(PlugAdaptor, plugAdaptor);
     registry.serviceCls.set("dep", DepService);
     registry.service.set(DepService, depService);
     registry.serverSignalCls.set("testSignal", SignalRef as unknown as ServerSignalCls);
@@ -776,7 +780,7 @@ describe("dependency injection resolution", () => {
     class TargetService extends serve("serviceTestTarget" as const, ({ use, env, plug, service, signal, memory }) => ({
       plainUse: use<string>(),
       envValue: env((env: { envValue: string }) => env.envValue),
-      plugValue: plug(PlugAdaptor as unknown as AdaptorCls<PlugAdaptor & Adaptor>, (adaptor) => adaptor.value),
+      plugValue: plug(PlugAdaptor, (adaptor) => adaptor.value),
       depService: service<DepService>(),
       testSignal: signal<typeof signal>(),
       localCounter: memory(Int, { local: true, default: 3 }),

@@ -1,5 +1,5 @@
 "use client";
-import { usePage } from "akanjs/client";
+import { fetch, usePage } from "akanjs/client";
 import { capitalize } from "akanjs/common";
 import type { SliceMeta } from "akanjs/fetch";
 import { st } from "akanjs/store";
@@ -14,12 +14,22 @@ import { Modal } from "../Modal";
 import Remove from "./Remove";
 import View from "./View";
 
-// Declared from whichever face is mounted, so the shared close verb is published once and withdrawn on close.
+// Declared from whichever face is mounted (the view's body when it offers no edit), so the shared close verb is
+// published once and withdrawn on close.
 const useCloseViewTool = (modelName: string, closeView: () => void) =>
   st
     .tool(`closeViewOf${capitalize(modelName)}`)
     .desc(`Close the open ${modelName} modal.`)
     .exec(closeView);
+
+interface CloseViewToolProps {
+  modelName: string;
+  closeView: () => void;
+}
+const CloseViewTool = ({ modelName, closeView }: CloseViewToolProps) => {
+  useCloseViewTool(modelName, closeView);
+  return null;
+};
 
 interface ActionProps {
   modelName: string;
@@ -104,6 +114,10 @@ export default function ViewEditModal({
   const modelLoading = storeUse[names.modelLoading]() as string | boolean;
   const modelFormLoading = storeUse[names.modelFormLoading]() as string | boolean;
   const modelFormId = storeSel<string, { id: string }>((state) => state[names.modelForm].id);
+  // A verb the slice's guards close is never mounted on the client, so its button would only fail.
+  const servedFetch = fetch as unknown as { [key: string]: unknown };
+  const canUpdate = typeof servedFetch[`update${ModelName}`] === "function";
+  const canRemove = typeof servedFetch[`remove${ModelName}`] === "function";
   const isModalOpen = modelModal === "view" || (modelModal === "edit" && (!!modelFormLoading || !!modelFormId));
   const Title = () => {
     if (!model || modelLoading || !renderTitle) return <></>;
@@ -125,7 +139,7 @@ export default function ViewEditModal({
       title={
         <div className="flex w-full items-center justify-between">
           <Title />
-          {menu === false
+          {menu === false || (menu === undefined && !canRemove)
             ? null
             : (menu ?? (
                 <Dropdown
@@ -151,14 +165,16 @@ export default function ViewEditModal({
       }
       action={
         modelModal === "view" ? (
-          <EditAction
-            modelName={modelName}
-            label={editLabel ?? l("base.edit")}
-            closeView={closeView}
-            onAct={() => {
-              if (model) storeDo[names.editModel](model.id);
-            }}
-          />
+          canUpdate ? (
+            <EditAction
+              modelName={modelName}
+              label={editLabel ?? l("base.edit")}
+              closeView={closeView}
+              onAct={() => {
+                if (model) storeDo[names.editModel](model.id);
+              }}
+            />
+          ) : null
         ) : (
           <SaveAction
             modelName={modelName}
@@ -172,7 +188,10 @@ export default function ViewEditModal({
       }
     >
       {modelModal === "view" ? (
-        <View className={viewClassName} model={model} modelLoading={modelLoading} render={renderView} />
+        <>
+          {canUpdate ? null : <CloseViewTool modelName={modelName} closeView={closeView} />}
+          <View className={viewClassName} model={model} modelLoading={modelLoading} render={renderView} />
+        </>
       ) : modelModal === "edit" ? (
         <Template />
       ) : null}

@@ -4,7 +4,8 @@
 /* akanjs 기본 팔레트는 브랜드-중립(pkgs/akanjs/ui/styles.css). dark 변형·런타임 전환도 프레임워크 소유.
    akan 은 젤리 별 스튜디오 팔레트로 토큰만 override 한다 — 라이트가 기본(rootLayout .theme("light")),
    다크는 같은 친구들이 사는 한밤의 남색 하늘이다. 별 빨강(--jelly)은 채움용이라 흰 글씨 대비가 4.5:1 에 못 미쳐,
-   글씨가 올라가는 --primary 는 한 단계 진한 빨강을 쓴다. */
+   글씨가 올라가는 --primary 는 한 단계 진한 빨강을 쓴다. 다크의 --primary 는 남색 하늘 위 글씨로도 쓰여 더 어둡게 하면
+   그쪽 대비가 4.5:1 아래로 떨어지므로, 다른 채움색처럼 그 위 글씨를 남색으로 둔다. */
 :root,
 [data-theme="light"] {
   --background: #f1f1ee;
@@ -48,7 +49,7 @@
   --background: #0f1129;
   --foreground: #f3f1fb;
   --primary: #f0392e;
-  --primary-foreground: #ffffff;
+  --primary-foreground: #0f1129;
   --secondary: #f3f1fb;
   --secondary-foreground: #0f1129;
   --accent: #a585e0;
@@ -724,6 +725,14 @@ html:has([data-akanjs-notice]) {
   :is(h1, h2, h3, h4, h5, h6) & {
     padding-block: 0.15em;
     margin-block: -0.15em;
+  }
+}
+
+/* 제 배경을 가진 자손은 오려 낸 설탕 결을 덮으므로, 물려받은 투명 글자색 그대로면 빈 상자가 된다. primary 색을
+   돌려주되 utilities 아래 층에 두어 자손이 직접 쓴 text-* 클래스가 이긴다. */
+@layer base {
+  .text-primary:not(svg, [class*="bg-"], [class*="jelly"], [class*="glass"], [class*="-current"]) [class*="bg-"]:not([class*="bg-clip"]) {
+    color: var(--primary);
   }
 }
 
