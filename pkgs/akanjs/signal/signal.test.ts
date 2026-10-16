@@ -651,6 +651,18 @@ describe("signal serialization and registry", () => {
     expect(QuietSlice.mcp).toEqual({ get: false, create: false, update: false, remove: false });
   });
 
+  test("ships an endpoint's errors declaration with it, and nothing for one that declares none", () => {
+    const declaring = endpoint(signalTestServiceModel, (builder) => ({
+      lock: builder
+        .mutation(Boolean, { guards: [Public], errors: { 409: ["signalTestItem.error.locked"] } })
+        .exec(() => true),
+      plain: builder.query(String, { guards: [Public] }).exec(() => "ok"),
+    }));
+    const serialized = FetchSerializer.serializeDatabaseSignal(RegistrySlice, declaring);
+    expect(serialized.endpoint.lock?.errors).toEqual({ 409: ["signalTestItem.error.locked"] });
+    expect(serialized.endpoint.plain && "errors" in serialized.endpoint.plain).toBe(false);
+  });
+
   test("serializes database and service signals", () => {
     const databaseSignal = FetchSerializer.serializeDatabaseSignal(RegistrySlice, RegistryEndpoint);
     const serviceEndpoint = endpoint(ServiceModel.from(SignalTestAuxService), (builder) => ({
@@ -804,6 +816,19 @@ describe("signal serialization and registry", () => {
 });
 
 describe("SignalContext execution", () => {
+  test("names the caller on a context-mode trace and times no stage", async () => {
+    const endpointInfo = buildEndpoint.query(String, { guards: [TestAdmin as GuardCls] }).exec(() => "ok");
+    const request = Object.assign(makeHttpRequest(), { account: { id: "u1" } }) as unknown as Bun.BunRequest;
+    const context = makeSignalContext({ endpointInfo, request });
+
+    await context.init();
+    await context.exec();
+
+    expect(context.trace?.mode).toBe("context");
+    expect(context.trace?.attrs).toMatchObject({ userId: "u1" });
+    expect(context.trace?.spans).toEqual([]);
+  });
+
   test("parses HTTP params, query arrays, nullable search args, and JSON body", async () => {
     const endpointInfo = buildEndpoint
       .mutation(String)
@@ -1580,6 +1605,106 @@ describe("SignalContext argument parsing", () => {
     expect(await statusWith([TestAdmin as GuardCls])).toBe(400);
   });
 
+  test("answers a malformed scalar argument with a 400 naming it, not a 500", async () => {
+    const responseWith = async (guards: GuardCls[], query: string) => {
+      const endpointInfo = buildEndpoint
+        .query(String, { guards })
+        .search("limit", Int)
+        .exec((limit) => `limit:${limit}`);
+      const adaptor = new (adapt("signalTestMalformedArgAdaptor"))();
+      const request = makeHttpRequest({ url: `http://localhost/items?${query}` });
+      return (await SignalContext.try(adaptor, endpointInfo, "malformedArg", async () => {
+        const context = makeSignalContext({ endpointInfo, adaptor, request });
+        await context.init();
+        return (await context.exec()) as Response;
+      })) as Response;
+    };
+
+    const malformed = await responseWith([TestAdmin as GuardCls], "limit=abc");
+    expect(malformed.status).toBe(400);
+    expect(await malformed.json()).toMatchObject({
+      error: "base.error.invalidArgument",
+      statusCode: 400,
+      data: { name: "limit" },
+    });
+    expect((await responseWith([AccountDeny as GuardCls], "limit=abc")).status).toBe(403);
+    expect(await (await responseWith([TestAdmin as GuardCls], "limit=3")).json()).toBe("limit:3");
+  });
+
+  test("answers a model body the schema refuses with a 400 naming the field, and drops undeclared keys", async () => {
+    const received: unknown[] = [];
+    const responseWith = async (guards: GuardCls[], data: Record<string, unknown>) => {
+      const endpointInfo = buildEndpoint
+        .mutation(String, { guards })
+        .body("data", SignalTestInput)
+        .exec((input) => {
+          received.push(input);
+          return "ok";
+        });
+      const adaptor = new (adapt("signalTestMalformedBodyAdaptor"))();
+      const request = makeHttpRequest({ url: "http://localhost/items", body: { data } });
+      return (await SignalContext.try(adaptor, endpointInfo, "malformedBody", async () => {
+        const context = makeSignalContext({ endpointInfo, adaptor, request });
+        await context.init();
+        return (await context.exec()) as Response;
+      })) as Response;
+    };
+    const valid = { ownerId: "65f0a1b2c3d4e5f6a7b8c9d0", title: "kit", nested: { label: "n" } };
+
+    const wrongType = await responseWith([TestAdmin as GuardCls], { ...valid, ownerId: "abc" });
+    expect(wrongType.status).toBe(400);
+    expect(await wrongType.json()).toMatchObject({
+      error: "base.error.invalidArgument",
+      data: { name: "data.ownerId", expected: "ID" },
+    });
+    const missing = await responseWith([TestAdmin as GuardCls], { ...valid, title: undefined });
+    expect(missing.status).toBe(400);
+    expect(await missing.json()).toMatchObject({ error: "base.error.requiredArgument", data: { name: "data.title" } });
+    expect((await responseWith([AccountDeny as GuardCls], { ...valid, ownerId: "abc" })).status).toBe(403);
+
+    expect(await (await responseWith([TestAdmin as GuardCls], { ...valid, role: "admin" })).json()).toBe("ok");
+    expect(received).toEqual([valid]);
+  });
+
+  test("refuses an errors declaration no response could carry, and serializes a valid one", () => {
+    const declare = (errors: Record<number, string[]>) => () =>
+      buildEndpoint.mutation(String, { guards: [TestAdmin as GuardCls], errors: errors as never }).exec(() => "ok");
+
+    expect(declare({ 302: ["item.error.moved"] })).toThrow("400–599");
+    expect(declare({ 409: ["locked"] })).toThrow("<module>.error.<key>");
+    const endpointInfo = declare({ 409: ["item.error.locked"] })();
+    expect(endpointInfo.signalOption.errors).toEqual({ 409: ["item.error.locked"] });
+  });
+
+  test("warns once, outside production, when an endpoint throws a key its errors declaration leaves out", async () => {
+    const warned: string[] = [];
+    const adaptor = new (adapt("signalTestErrorContractAdaptor"))();
+    Object.assign(adaptor, { logger: { ...adaptor.logger, warn: (message: string) => void warned.push(message) } });
+    const throwing = (errorKey: string) =>
+      buildEndpoint
+        .mutation(String, { guards: [TestAdmin as GuardCls], errors: { 409: ["item.error.locked"] } })
+        .exec(() => {
+          throw new Exception(409, errorKey);
+        });
+    const call = (endpointInfo: EndpointInfo) =>
+      SignalContext.try(adaptor, endpointInfo, "contractCall", async () => {
+        const context = makeSignalContext({ endpointInfo, adaptor, request: makeHttpRequest({ body: {} }) });
+        await context.init();
+        return (await context.exec()) as Response;
+      });
+
+    const declared = throwing("item.error.locked");
+    const undeclared = throwing("item.error.gone");
+    expect((await call(declared))?.status).toBe(409);
+    await call(undeclared);
+    await call(undeclared);
+    await call(throwing("base.error.gatewayTimeout"));
+
+    expect(warned).toEqual([
+      '"contractCall" threw item.error.gone, which its `errors` declaration leaves out: OpenAPI and the MCP catalogue do not publish it.',
+    ]);
+  });
+
   test("runs account guards before resource guards, which read the parsed arguments", async () => {
     const trace: string[] = [];
     class ResourceReads implements Guard {
@@ -1701,6 +1826,25 @@ describe("SignalContext return resolution", () => {
     expect(resolvedArray).toEqual([
       [{ title: "A", nested: { label: "N" }, relatedIds: [], resolvedLabel: "resolved:A" }],
     ]);
+  });
+
+  test("resolves a return that loads nothing: drops masked fields, copies scalars, keeps null rows", async () => {
+    const SyncPoint = via((f) => ({ x: f(Int), note: f.hidden(String) }));
+    ConstantRegistry.buildScalar("signalTestSyncPoint", SyncPoint, { SyncPoint });
+    const SyncRow = via((f) => ({ label: f(String), point: f(SyncPoint), grid: f([[SyncPoint]] as never) }));
+    ConstantRegistry.buildScalar("signalTestSyncRow", SyncRow, { SyncRow });
+    const rows = [{ label: "a", point: { x: 1, note: "n" }, grid: [[{ x: 2, note: "n" }, null]] }, null];
+
+    const resolved = (await SignalContext.resolveReturn(rows, {
+      signalContext: null,
+      returnRef: SyncRow,
+      arrDepth: 1,
+      registry: getDefaultInjectRegistry(),
+      live: getDefaultLiveRegistry(),
+    })) as { point: object }[];
+
+    expect(resolved).toEqual([{ label: "a", point: { x: 1 }, grid: [[{ x: 2 }, null]] }, null] as never);
+    expect(resolved[0]?.point).not.toBe(rows[0]?.point);
   });
 
   test("loads and walks a relation once per response, however many rows name it", async () => {

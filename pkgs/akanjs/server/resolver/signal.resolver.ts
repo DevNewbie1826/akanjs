@@ -10,11 +10,10 @@ import {
   ID,
   INTERNAL_META,
   Int,
-  PrimitiveRegistry,
   type PromiseOrObject,
   SLICE_META,
 } from "akanjs/base";
-import { capitalize, cookieHeaderHasAuthToken, Logger } from "akanjs/common";
+import { capitalize, Logger } from "akanjs/common";
 import {
   type ConstantField,
   deserialize,
@@ -23,8 +22,10 @@ import {
   resolvePageSkip,
   serialize,
 } from "akanjs/constant";
+import { DictionaryRegistry } from "akanjs/dictionary";
 import { baseDocumentColumns, documentQueryHelper, getFilterSortByKey, type QueryFieldMap } from "akanjs/document";
 import {
+  type AdaptorCls,
   type AkanJob,
   type AkanJobOptions,
   type DocumentStore,
@@ -36,8 +37,8 @@ import {
 } from "akanjs/service";
 import { websocketRoomContract } from "../../common/websocketContract";
 import { type Endpoint, type EndpointCls, sliceEndpoint } from "../../signal/endpoint";
+import { EndpointErrorContract } from "../../signal/endpointErrorContract";
 import type { EndpointInfo } from "../../signal/endpointInfo";
-import { EndpointRateLimit } from "../../signal/endpointRateLimit";
 import type { Internal, InternalCls } from "../../signal/internal";
 import { Machine } from "../../signal/internalArg";
 import type { InternalInfo } from "../../signal/internalInfo";
@@ -78,6 +79,7 @@ export class SignalResolver {
   static readonly #coalescingRooms = new Set<string>();
   static readonly #liveRoutes = new Map<string, { store: DocumentStore; route: LiveRoute }>();
   static readonly #everyRowAsked = new Set<string>();
+  static readonly #websockets = new WeakMap<InjectRegistry, { key: AdaptorCls; websocket: WebsocketAdaptor }>();
 
   static coalescesRoom(roomId: string): boolean {
     const separator = roomId.indexOf("-");
@@ -652,6 +654,7 @@ export class SignalResolver {
     const defaultPrefix = endpointCls.srv.cnst?.refName;
     SignalResolver.#warnUnguarded(endpointMeta);
     SignalResolver.#warnMachineKeyless(endpointMeta);
+    SignalResolver.#warnUndefinedErrors(endpointMeta);
     Object.entries(endpointMeta).forEach(([key, endpointInfo]) => {
       const path = endpointInfo.getRoutePath(key, defaultPrefix);
       if (endpointInfo.signalOption.globalPrefix !== undefined) {
@@ -676,32 +679,7 @@ export class SignalResolver {
         );
       switch (endpointInfo.type) {
         case "query":
-          SignalResolver.#mountHttpRoute(
-            routes,
-            path,
-            SignalResolver.#canUsePrimitiveQueryFastPath(key, endpointInfo, middleware)
-              ? {
-                  GET: async (req) => {
-                    if (req.headers.get("authorization") || cookieHeaderHasAuthToken(req.headers.get("cookie")))
-                      return await normalHttpHandler(req);
-                    // No trace by design: this fast path exists to skip per-request work.
-                    return await SignalContext.try(
-                      endpoint,
-                      endpointInfo,
-                      key,
-                      async () => {
-                        const result = await endpointInfo.execFn?.call(endpoint);
-                        return result instanceof Response ? result : Response.json(result);
-                      },
-                      { trace: false },
-                    );
-                  },
-                }
-              : {
-                  GET: normalHttpHandler,
-                },
-            key,
-          );
+          SignalResolver.#mountHttpRoute(routes, path, { GET: normalHttpHandler }, key);
           break;
         case "mutation":
           SignalResolver.#mountHttpRoute(
@@ -834,6 +812,21 @@ export class SignalResolver {
       `${open.join(", ")} declare${open.length === 1 ? "s" : ""} no guards, so anyone can call ${open.length === 1 ? "it" : "them"} over HTTP and WebSocket. Name the guards, or \`guards: [Public]\` to keep one open on purpose.`,
     );
   }
+  // A declared key no dictionary defines is published to OpenAPI and MCP as an error nobody can translate. Skipped when
+  // no dictionary is registered at all, as in a test that boots signals alone.
+  static #warnUndefinedErrors(endpointMeta: { [key: string]: EndpointInfo }) {
+    const declared = Object.entries(endpointMeta).flatMap(([key, endpointInfo]) =>
+      EndpointErrorContract.keysOf(endpointInfo.signalOption.errors).map((errorKey) => `${key} → ${errorKey}`),
+    );
+    if (!declared.length) return;
+    const known = new Set(DictionaryRegistry.getKeys());
+    if (!known.size) return;
+    const undefinedKeys = declared.filter((entry) => !known.has(entry.split(" → ")[1] ?? ""));
+    if (!undefinedKeys.length) return;
+    SignalResolver.logger.warn(
+      `${undefinedKeys.join(", ")}: declared in \`errors\`, defined in no dictionary's \`.error({})\`. Add the key, or drop it from the declaration.`,
+    );
+  }
   static #warnMachineKeyless(endpointMeta: { [key: string]: EndpointInfo }) {
     if (MachineToken.canVerify()) return;
     const machineOnly = Object.entries(endpointMeta)
@@ -853,24 +846,6 @@ export class SignalResolver {
     const select = Object.fromEntries(Object.keys(fields).map((field) => [field, true] as const));
     SignalResolver.#selectCache.set(constant, select);
     return select;
-  }
-
-  static #canUsePrimitiveQueryFastPath(
-    key: string,
-    endpointInfo: EndpointInfo,
-    middleware: Map<string, MiddlewareCls>,
-  ) {
-    return (
-      process.env.AKAN_TRACE !== "1" &&
-      !EndpointRateLimit.budgetOf(key, endpointInfo) &&
-      endpointInfo.args.length === 0 &&
-      endpointInfo.internalArgs.length === 0 &&
-      (endpointInfo.signalOption.guards?.length ?? 0) === 0 &&
-      (endpointInfo.signalOption.middlewares?.length ?? 0) === 0 &&
-      [...middleware.values()].every((MiddlewareCls) => MiddlewareCls.refName === "AccountMiddleware") &&
-      endpointInfo.returns.arrDepth === 0 &&
-      PrimitiveRegistry.has(endpointInfo.returns.returnRef as Cls)
-    );
   }
 
   // Rooms are authorized once at subscribe; without this re-check a signed-out socket would keep its old rooms.
@@ -921,17 +896,24 @@ export class SignalResolver {
     if ((live?.syncHub.roomCount ?? 0) < liveRooms) SignalResolver.#roomReplay?.forget(roomId);
     else SignalResolver.#roomReplay?.left(roomId);
   }
+  // Every subscribe and every live event reaches this, so the scan runs once per registry and the answer is kept while
+  // the registry still holds that same instance under that same key.
   static #getWebsocket(registry: InjectRegistry): WebsocketAdaptor {
+    const found = SignalResolver.#websockets.get(registry);
+    if (found && registry.adaptor.get(found.key) === (found.websocket as unknown)) return found.websocket;
+    const key = SignalResolver.#websocketKey(registry);
+    const websocket = key ? (registry.adaptor.get(key) as WebsocketAdaptor | undefined) : undefined;
+    if (!key || !websocket) throw new Error("WebSocket adaptor is not registered");
+    SignalResolver.#websockets.set(registry, { key, websocket });
+    return websocket;
+  }
+
+  static #websocketKey(registry: InjectRegistry): AdaptorCls | undefined {
+    if (registry.adaptor.has(WebsocketAdaptorRole)) return WebsocketAdaptorRole;
     const roleProvider = [...registry.adaptorRole.entries()].find(
       ([role]) => role.refName === WebsocketAdaptorRole.refName,
     )?.[1];
-    const websocket =
-      (registry.adaptor.get(WebsocketAdaptorRole) as WebsocketAdaptor | undefined) ??
-      (roleProvider ? (registry.adaptor.get(roleProvider) as WebsocketAdaptor | undefined) : undefined) ??
-      ([...registry.adaptor.entries()].find(([adaptorCls]) =>
-        ["solidPubsub", "wsRedis"].includes(adaptorCls.refName),
-      )?.[1] as WebsocketAdaptor | undefined);
-    if (!websocket) throw new Error("WebSocket adaptor is not registered");
-    return websocket;
+    if (roleProvider && registry.adaptor.has(roleProvider)) return roleProvider;
+    return [...registry.adaptor.keys()].find((adaptorCls) => ["solidPubsub", "wsRedis"].includes(adaptorCls.refName));
   }
 }

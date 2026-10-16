@@ -3,7 +3,7 @@ import {
   type BackendEnv,
   Binary,
   type Cls,
-  FIELD_META,
+  type FIELD_META,
   ID,
   INTERNAL_META,
   PrimitiveRegistry,
@@ -15,7 +15,9 @@ import {
   type ConstantCls,
   type ConstantFieldTypeInput,
   ConstantRegistry,
-  deserialize,
+  FieldPlan,
+  InputParser,
+  InvalidInputError,
   serialize,
 } from "akanjs/constant";
 import { Err } from "akanjs/dictionary";
@@ -23,11 +25,13 @@ import type { Adaptor, AdaptorCls, DatabaseService, InjectRegistry, LiveRegistry
 import type { Internal, InternalCls, InternalInfo, MiddlewareCls } from ".";
 import { CrossSiteGuard } from "./CrossSiteGuard";
 import { EndpointCache } from "./endpointCache";
+import { EndpointErrorContract } from "./endpointErrorContract";
 import { EndpointIdempotency } from "./endpointIdempotency";
 import type { ArgInfo, EndpointInfo, EndpointType } from "./endpointInfo";
 import { EndpointRateLimit } from "./endpointRateLimit";
 import { Exception, isExceptionLike } from "./exception";
 import { type GuardCls, type GuardScope, guardOf } from "./guard";
+import { MiddlewareChain } from "./middlewareChain";
 import { SignalFailure } from "./SignalFailure";
 import { getCurrentTrace, runTraced, SignalTrace, type TraceOrigin, traceSpan } from "./trace";
 
@@ -38,8 +42,22 @@ export type HttpPeerResolver = (req: Request) => { address: string; port: number
 
 const httpEndpointTypes = new Set<EndpointType>(["query", "mutation"]);
 
-const deserializeArg = (arg: ArgInfo, value: unknown) =>
-  deserialize(arg.argRef, arg.arrDepth, value, { key: arg.name, nullable: arg.option?.nullable, enum: arg.enum });
+const deserializeArg = (arg: ArgInfo, value: unknown) => {
+  try {
+    return InputParser.parse(arg.argRef, arg.arrDepth, value, {
+      key: arg.name,
+      nullable: arg.option?.nullable,
+      enum: arg.enum,
+    });
+  } catch (error) {
+    //? The parsers throw a plain `Error`, which `SignalFailure` would answer as a 500 for the caller's own input.
+    if (isExceptionLike(error)) throw error;
+    if (!(error instanceof InvalidInputError))
+      throw new Err.BadRequest("base.error.invalidArgument", { name: arg.name });
+    if (error.reason === "missing") throw new Err.BadRequest("base.error.requiredArgument", { name: error.path });
+    throw new Err.BadRequest("base.error.invalidArgument", { name: error.path, expected: error.expected });
+  }
+};
 
 interface WebSocketRequest {
   ws: Bun.ServerWebSocket<unknown>;
@@ -47,7 +65,6 @@ interface WebSocketRequest {
   eventType: WebSocketEventType;
 }
 type RuntimeRecord = Record<string, unknown>;
-type MiddlewareHandler = (context: SignalContext, next: () => Promise<unknown>) => PromiseOrObject<unknown>;
 /** Request-scoped: the outermost `resolveReturn` starts one and every recursion threads it down. */
 type ResolveCache = Map<ConstantFieldTypeInput, Map<string, Promise<unknown>>>;
 
@@ -134,10 +151,11 @@ export class SignalContext<
       CrossSiteGuard.assertOrigin(httpCtx.req, httpCtx.url, this.key);
     }
     // Leaving a room is never refused: a client held there could not get out.
-    if (!this.#isLeavingRoom()) await EndpointRateLimit.admit(this, "ip");
-    const start = this.trace ? performance.now() : 0;
+    const admitting = this.#isLeavingRoom() ? undefined : EndpointRateLimit.admit(this, "ip");
+    if (admitting) await admitting;
+    const start = this.#spanned ? performance.now() : 0;
     this.#rawArgs = await this.ctx.readArgs(this.endpointInfo);
-    this.trace?.recordSpan("argRead", performance.now() - start);
+    if (this.#spanned) this.trace?.recordSpan("argRead", performance.now() - start);
     return this;
   }
   /** Parsed on first read, so a guard or middleware that reads one still gets it; a parser runs at most once per call. */
@@ -151,9 +169,9 @@ export class SignalContext<
   #parseArgs(): unknown[] {
     const raw = this.#rawArgs;
     if (!raw) return [];
-    const start = this.trace ? performance.now() : 0;
+    const start = this.#spanned ? performance.now() : 0;
     const args = this.endpointInfo.args.map((arg, idx) => this.ctx.parseArg(arg, raw[idx]));
-    this.trace?.recordSpan("argParse", performance.now() - start);
+    if (this.#spanned) this.trace?.recordSpan("argParse", performance.now() - start);
     return args;
   }
   #isLeavingRoom() {
@@ -232,61 +250,42 @@ export class SignalContext<
     coreExec: () => Promise<unknown>,
     { endpointMiddlewares = true, skip = [] as string[] }: { endpointMiddlewares?: boolean; skip?: string[] } = {},
   ): () => Promise<unknown> {
-    const middlewares = [
-      ...[...this.#middleware.entries()].filter(([name]) => !skip.includes(name)).map(([, cls]) => cls),
-      ...(endpointMiddlewares ? (this.endpointInfo.signalOption.middlewares ?? []) : []),
-    ];
-    if (middlewares.length === 0) return coreExec;
-    let next = coreExec;
-    for (let i = middlewares.length - 1; i >= 0; i--) {
-      const MiddlewareCls = middlewares[i];
-      if (!MiddlewareCls) continue;
-      const currentNext = next;
-      next = async () =>
-        await (await SignalContext.#getMiddlewareHandler(MiddlewareCls, this.getEnv()))(this, currentNext);
-    }
-    return next;
+    const chain = MiddlewareChain.of(
+      this.#middleware,
+      this.getEnv(),
+      endpointMiddlewares ? this.endpointInfo : null,
+      skip,
+    );
+    return () => chain.run(this, coreExec);
   }
   static #httpPeer: HttpPeerResolver | null = null;
   /** Registered by the listening `Bun.serve`, the only thing that can answer `requestIP`; unused behind the gateway. */
   static setHttpPeerResolver(resolve: HttpPeerResolver | null) {
     SignalContext.#httpPeer = resolve;
   }
-  // `use(env)` takes no context, so a handler is a function of (class, env) and is built once per process.
-  static #middlewareHandlers = new WeakMap<MiddlewareCls, WeakMap<object, Promise<MiddlewareHandler>>>();
-  static #getMiddlewareHandler(MiddlewareCls: MiddlewareCls, env: BackendEnv): Promise<MiddlewareHandler> {
-    const byEnv =
-      SignalContext.#middlewareHandlers.get(MiddlewareCls) ?? new WeakMap<object, Promise<MiddlewareHandler>>();
-    SignalContext.#middlewareHandlers.set(MiddlewareCls, byEnv);
-    const cached = byEnv.get(env);
-    if (cached) return cached;
-    // A rejected setup is evicted, not cached, so the next request retries instead of the endpoint staying poisoned.
-    const handler = Promise.resolve(new MiddlewareCls().use(env) as PromiseOrObject<MiddlewareHandler>).catch(
-      (error: unknown) => {
-        byEnv.delete(env);
-        throw error;
-      },
-    );
-    byEnv.set(env, handler);
-    return handler;
-  }
   async exec() {
     if (!this.trace || getCurrentTrace() === this.trace) return await this.#exec();
     return await runTraced(this.trace, async () => await this.#exec());
+  }
+  // Spans are recorded only in full mode; a context-mode trace carries attrs and the log context, not timings.
+  get #spanned() {
+    return this.trace?.mode === "full";
   }
   async #exec() {
     if (!this.endpointInfo.execFn) throw new Exception.Error("Exec function is not set");
     const coreExec = async () => {
       if (!this.endpointInfo.execFn) throw new Exception.Error("Exec function is not set");
-      await EndpointRateLimit.admit(this, "account");
+      const admitting = EndpointRateLimit.admit(this, "account");
+      if (admitting) await admitting;
+      if (this.#spanned) await traceSpan("guards", () => this.#checkGuards("account"));
+      else await this.#checkGuards("account");
       if (this.trace) {
-        await traceSpan("guards", () => this.#checkGuards("account"));
         const account = this.get<{ id?: unknown }>("account");
         if (typeof account?.id === "string") this.trace.setAttr("userId", account.id);
-      } else await this.#checkGuards("account");
+      }
       // Parsed only now: a caller the account guards refused never reaches an argument parser.
       this.#args ??= this.#parseArgs();
-      if (this.trace) await traceSpan("resourceGuards", () => this.#checkGuards("resource"));
+      if (this.#spanned) await traceSpan("resourceGuards", () => this.#checkGuards("resource"));
       else await this.#checkGuards("resource");
       if (this.endpointInfo.internalArgs.length > 0) {
         this.internalArgs = await Promise.all(
@@ -299,23 +298,21 @@ export class SignalContext<
         );
       }
       const handle = async () => await this.endpointInfo.execFn?.call(this.adaptor, ...this.args, ...this.internalArgs);
-      const traced = this.trace ? () => traceSpan("handler", handle) : handle;
-      return await EndpointIdempotency.through(
-        this,
-        () => EndpointCache.through(this, traced),
-        async (result) => {
-          const resolved = await this.#resolve(result);
-          return await traceSpan("serialize", async () => HttpExecutionContext.wireOf(resolved, this.endpointInfo));
-        },
-      );
+      const traced = this.#spanned ? () => traceSpan("handler", handle) : handle;
+      const run = EndpointCache.declares(this.endpointInfo) ? () => EndpointCache.through(this, traced) : traced;
+      if (!EndpointIdempotency.applies(this)) return await run();
+      return await EndpointIdempotency.through(this, run, async (result) => {
+        const resolved = await this.#resolve(result);
+        return await traceSpan("serialize", async () => HttpExecutionContext.wireOf(resolved, this.endpointInfo));
+      });
     };
     const next = this.#withMiddleware(coreExec);
-    const result = this.trace ? await traceSpan("execChain", () => next()) : await next();
+    const result = this.#spanned ? await traceSpan("execChain", () => next()) : await next();
     // A pubsub's return is not sent; a live slice's exec returns the resolved query its room is routed by.
     if (this.endpointInfo.type === "pubsub") return result;
     if (result instanceof Response) return result;
     const resolved = await this.#resolve(result);
-    if (!this.trace) return this.ctx.makeResponse(resolved, this.endpointInfo);
+    if (!this.#spanned) return this.ctx.makeResponse(resolved, this.endpointInfo);
     return await traceSpan("serialize", async () => this.ctx.makeResponse(resolved, this.endpointInfo));
   }
   async #resolve(result: unknown) {
@@ -326,7 +323,7 @@ export class SignalContext<
       registry: this.#registry,
       live: this.#live,
     };
-    const resolved = this.trace
+    const resolved = this.#spanned
       ? await traceSpan("resolveReturn", () => SignalContext.resolveReturn(result, resolveOption))
       : await SignalContext.resolveReturn(result, resolveOption);
     return this.#settle(resolved);
@@ -364,13 +361,14 @@ export class SignalContext<
     key: string,
     origin: TraceOrigin,
     fn: () => Promise<T>,
-    { trace = true }: { trace?: boolean } = {},
   ): Promise<T> {
-    return await runTraced(trace ? SignalTrace.create(key, endpointInfo.type, origin) : null, async () => {
+    return await runTraced(SignalTrace.create(key, endpointInfo.type, origin), async () => {
       try {
         return await fn();
       } catch (error) {
-        if (!isExceptionLike(error)) {
+        if (isExceptionLike(error))
+          EndpointErrorContract.checkThrown(endpoint, endpointInfo, key, (error as unknown as Error).message);
+        else {
           const message = error instanceof Error ? error.message : String(error);
           const stack = error instanceof Error ? error.stack : undefined;
           endpoint.logger.error(`Error ${endpointInfo.type}-${key}:\n${stack ?? message}`);
@@ -385,10 +383,9 @@ export class SignalContext<
     endpointInfo: EndpointInfo,
     key: string,
     fn: () => Promise<Response | undefined>,
-    options: { trace?: boolean } = {},
   ): Promise<Response | undefined> {
     try {
-      return await SignalContext.run(endpoint, endpointInfo, key, "http", fn, options);
+      return await SignalContext.run(endpoint, endpointInfo, key, "http", fn);
     } catch (error) {
       if (endpointInfo.type === "message" || endpointInfo.type === "pubsub") throw error;
       if (isExceptionLike(error)) {
@@ -432,6 +429,8 @@ export class SignalContext<
   ): Promise<unknown> {
     if (value === null || value === undefined) return value;
     if (PrimitiveRegistry.has(returnRef as Cls)) return value;
+    const plan = FieldPlan.of(returnRef as ConstantCls);
+    if (!plan.resolvesAsync) return SignalContext.#resolveSync(value, plan, arrDepth);
     else if (arrDepth)
       return await Promise.all(
         (value as unknown[]).map((v) =>
@@ -456,10 +455,14 @@ export class SignalContext<
           resolvedValue[key] = v;
         }),
       );
-    for (const [key, field] of Object.entries((returnRef as ConstantCls)[FIELD_META])) {
+    for (const { key, field, kind } of plan.entries) {
+      if (kind === "masked") continue;
+      if (kind === "value") {
+        resolvedValue[key] = valueRecord[key];
+        continue;
+      }
       const fieldPath = path ? `${path}.${key}` : key;
-      if (field.fieldType === "hidden" || field.fieldType === "secret") continue;
-      else if (field.fieldType === "resolve")
+      if (kind === "computed")
         assign(
           key,
           SignalContext.#resolveComputed(key, valueRecord, {
@@ -472,21 +475,24 @@ export class SignalContext<
             path: fieldPath,
           }),
         );
-      else if (!field.isClass) resolvedValue[key] = valueRecord[key];
-      else if (field.isScalar)
-        assign(
-          key,
-          SignalContext.resolveReturn(valueRecord[key], {
-            signalContext,
-            returnRef: field.modelRef,
-            arrDepth: field.arrDepth,
-            registry,
-            live,
-            cache,
-            path: fieldPath,
-          }),
-        );
-      else
+      else if (kind === "scalar") {
+        const scalarPlan = FieldPlan.of(field.modelRef as unknown as ConstantCls);
+        if (!scalarPlan.resolvesAsync)
+          resolvedValue[key] = SignalContext.#resolveSync(valueRecord[key], scalarPlan, field.arrDepth);
+        else
+          assign(
+            key,
+            SignalContext.resolveReturn(valueRecord[key], {
+              signalContext,
+              returnRef: field.modelRef,
+              arrDepth: field.arrDepth,
+              registry,
+              live,
+              cache,
+              path: fieldPath,
+            }),
+          );
+      } else
         assign(
           key,
           SignalContext.#resolveRelation(valueRecord[key], {
@@ -502,6 +508,23 @@ export class SignalContext<
         );
     }
     if (pending.length) await Promise.all(pending);
+    return resolvedValue;
+  }
+  // The same walk as `resolveReturn` for a class whose plan holds no relation or resolve field, in one pass.
+  static #resolveSync(value: unknown, plan: FieldPlan, arrDepth: number): unknown {
+    if (value === null || value === undefined) return value;
+    if (arrDepth) return (value as unknown[]).map((item) => SignalContext.#resolveSync(item, plan, arrDepth - 1));
+    const valueRecord = value as RuntimeRecord;
+    const resolvedValue = {} as RuntimeRecord;
+    for (const { key, field, kind } of plan.entries) {
+      if (kind === "value") resolvedValue[key] = valueRecord[key];
+      else if (kind === "scalar")
+        resolvedValue[key] = SignalContext.#resolveSync(
+          valueRecord[key],
+          FieldPlan.of(field.modelRef as unknown as ConstantCls),
+          field.arrDepth,
+        );
+    }
     return resolvedValue;
   }
   static async #resolveComputed(

@@ -376,7 +376,10 @@ orchestration in `service`, client state in `store`; `Template` is forms, `Unit`
   without `connect: true`, retries through `retry`, and rethrows a remote `Err` as is — never wrapped or re-keyed.
 - **Body types**: `.body()` / `.param()` take scalars, model refs, or `enumOf(...)`; `Int` / `Float`, never
   `Number` (`pkgs/akanjs/signal/endpointInfo.ts`); `Upload` only in a `fileUpload: true` mutation; bytes are
-  `Binary`, never `Any`.
+  `Binary`, never `Any`. A model or scalar argument is checked against the request schema on every transport: a
+  wrong JSON type, a value outside its enum or a missing required field answers 400 with `data.name` naming the
+  path (`data.items.2.price`); a defaulted field may be left out, an undeclared key is dropped, and a stored model's
+  input keeps an absent field absent.
 - **Reserved names**: generated CRUD (`create<Model>`, `update<Model>`, `remove<Model>`, …) exists for every model.
   The service layer reports a collision as a typecheck error, but a colliding signal name can pass sync, typecheck
   and build and fail at runtime — treat it as an error.
@@ -419,6 +422,10 @@ orchestration in `service`, client state in `store`; `Template` is forms, `Unit`
 
 - State-machine preconditions throw in `document.ts`, cross-document rules in `service.ts`, request policy in
   `signal.ts` guards. Best-effort code returns a sentinel (`null`, `undefined`, `[0, 0]`, `{}`) — no Result types.
+- An endpoint names the errors it throws on purpose — `errors: { 409: ["ticket.error.locked"] }` in its signal
+  option, with keys its dictionary defines and never `base.error.*`. That is the status's OpenAPI response and a line
+  of the MCP tool's description; outside production a thrown key it leaves out warns once. A caller narrows with
+  `Err.is(error, "ticket.error.locked")`.
 - `try/catch` turns an exception into a decision: guards → `logger.warn` → `false`; adapters → `logger.error` →
   `null`; UI `try/finally` resets a spinner. A bodyless `catch {}` needs a one-line reason.
 - Store actions do not `try/catch` (the framework toasts the `Err`); client validation is `msg.error("<key>")` plus
