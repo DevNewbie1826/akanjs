@@ -24,6 +24,30 @@
       "!benchmarks/sample-app-productivity/workspaces"
     ]
   },
+  "linter": {
+    "rules": {
+      "complexity": {
+        "noBannedTypes": "error",
+        "noCommaOperator": "error",
+        "noExtraBooleanCast": "error",
+        "noUselessFragments": "error",
+        "useArrayFind": "error",
+        "useIndexOf": "error",
+        "useLiteralKeys": "error",
+        "useOptionalChain": "error"
+      },
+      "correctness": {
+        "noUnusedPrivateClassMembers": "error",
+        "noUnusedVariables": "error"
+      },
+      "suspicious": {
+        "noConfusingVoidType": "error",
+        "noFocusedTests": "error",
+        "noTemplateCurlyInString": "error",
+        "useArraySortCompare": "error"
+      }
+    }
+  },
   "overrides": [
     {
       "includes": [
