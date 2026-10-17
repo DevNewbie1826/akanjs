@@ -24,7 +24,7 @@ export default page()
         <div className="flex animate-fadeIn items-center gap-4 px-4 pt-4">
           <div className="font-bold text-lg md:text-4xl">{l("${dict.model}.modelName")}</div>
           <Model.New
-            trigger={<button className={buttonRecipe({ size: "sm", variant: "ghost" })}>{l("base.new")}</button>}
+            trigger={<button type="button" className={buttonRecipe({ size: "sm", variant: "ghost" })}>{l("base.new")}</button>}
             slice={fetch.slice.${dict.model}InPublic}
             renderTitle="id"
           >

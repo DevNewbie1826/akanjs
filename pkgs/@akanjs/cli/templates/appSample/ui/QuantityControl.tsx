@@ -30,7 +30,7 @@ export const QuantityControl = ({
 }: QuantityControlProps) => {
   return (
     <div className={cn("inline-flex items-center gap-1", className)}>
-      <button
+      <button type="button"
         className={jellyButtonRecipe({ variant: "default", size: "icon" }, "size-7")}
         disabled={value <= min}
         onClick={() => onChange(Math.max(min, value - 1))}
@@ -38,7 +38,7 @@ export const QuantityControl = ({
         −
       </button>
       <span className="w-8 text-center font-medium tabular-nums">{value}</span>
-      <button
+      <button type="button"
         className={jellyButtonRecipe({ variant: "default", size: "icon" }, "size-7")}
         disabled={value >= max}
         onClick={() => onChange(Math.min(max, value + 1))}

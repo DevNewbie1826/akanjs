@@ -70,6 +70,7 @@ const DefaultToggleSelect = <I extends string | number | boolean | null>({
           <Fragment key={idx}>{renderItem(option, { selected: isSelected, disabled: isDisabled, onToggle })}</Fragment>
         ) : (
           <button
+            type="button"
             key={idx}
             disabled={isDisabled}
             className={cn(toggleBtn, isSelected && selectedCls, isDisabled && "cursor-not-allowed", btnClassName)}
@@ -128,6 +129,7 @@ const DefaultMulti = ({
         const isDisabled = (disabled ?? false) || (option.disabled ?? false);
         return (
           <button
+            type="button"
             key={idx}
             disabled={isDisabled}
             className={cn(toggleBtn, isSelected && selectedCls, isDisabled && "cursor-not-allowed", btnClassName)}

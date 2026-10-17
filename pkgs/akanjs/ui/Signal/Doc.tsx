@@ -74,7 +74,10 @@ export const DocSetting = ({ fetch = runtimeFetch, search, onSearch }: DocSettin
     <Toolbar>
       <ToolbarField label={l.trans(signalText.baseUrl)}>
         <Copy text={fetch.origin}>
-          <button className={buttonRecipe({ variant: "ghost", size: "sm" }, "font-mono text-foreground/80")}>
+          <button
+            type="button"
+            className={buttonRecipe({ variant: "ghost", size: "sm" }, "font-mono text-foreground/80")}
+          >
             {fetch.origin}
             <AiOutlineCopy className="text-foreground/40" />
           </button>
@@ -173,6 +176,7 @@ export const DocAuthModal = ({ children }: DocAuthModalProps) => {
         title={l.trans(signalText.setJwtTitle)}
         action={
           <button
+            type="button"
             className={buttonRecipe({ variant: "primary" }, "w-full")}
             onClick={() => {
               st.set(

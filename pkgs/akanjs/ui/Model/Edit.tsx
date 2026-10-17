@@ -24,7 +24,7 @@ export default function Edit({ trigger, children, slice, modelId, modal, renderT
     <>
       <EditWrapper className="contents" slice={slice} modelId={modelId} modal={modal} draft={draft}>
         {trigger ?? (
-          <button className={buttonRecipe({ variant: "primary" })}>
+          <button type="button" className={buttonRecipe({ variant: "primary" })}>
             <AiOutlineEdit /> {l("base.edit")}
           </button>
         )}

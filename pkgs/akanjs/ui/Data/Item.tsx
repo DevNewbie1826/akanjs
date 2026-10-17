@@ -195,6 +195,7 @@ export const Action = <T extends string, M extends { id: string }, L extends { i
   };
   return action === "edit" ? (
     <button
+      type="button"
       className={buttonRecipe({ variant: outline ? "outline" : "ghost", size: "icon" }, [
         "m-1 size-8 text-center",
         outline && "border-dashed",
@@ -205,6 +206,7 @@ export const Action = <T extends string, M extends { id: string }, L extends { i
     </button>
   ) : action === "view" ? (
     <button
+      type="button"
       className={buttonRecipe({ variant: outline ? "outline" : "ghost", size: "icon" }, [
         "m-1 size-8 text-center",
         outline && "border-dashed",
@@ -220,6 +222,7 @@ export const Action = <T extends string, M extends { id: string }, L extends { i
       onConfirm={() => void storeDo[namesOfSlice.removeModel](model.id)}
     >
       <button
+        type="button"
         className={buttonRecipe({ variant: outline ? "outline" : "ghost", size: "icon" }, [
           "m-1 size-8 text-center",
           outline && "border-dashed",

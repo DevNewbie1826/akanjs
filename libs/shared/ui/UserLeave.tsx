@@ -110,6 +110,7 @@ export const LeaveTypeStep = ({ className, value, onChange }: LeaveTypeStepProps
         ))}
       </Radio>
       <button
+        type="button"
         className={buttonRecipe({ variant: "primary" }, "w-full")}
         onClick={() => {
           onChange(type);
@@ -166,6 +167,7 @@ export const Reason = ({ className, leaveReasons, comeBackReasons, value, onChan
         ))}
       </Radio>
       <button
+        type="button"
         className={buttonRecipe({ variant: "primary" }, "w-full")}
         disabled={!reason}
         onClick={() => {
@@ -212,6 +214,7 @@ export const Satisfaction = ({ className, value, onChange }: SatisfactionProps) 
         ))}
       </Radio>
       <button
+        type="button"
         className={buttonRecipe({ variant: "primary" }, "w-full")}
         disabled={satisfaction === null}
         onClick={() => {
@@ -254,6 +257,7 @@ export const Voc = ({ className, value, onChange, redirect }: VocProps) => {
         }}
       />
       <button
+        type="button"
         className={buttonRecipe({ variant: "secondary" }, "w-full")}
         onClick={async () => {
           await st.do.setLeaveInfoOfSelf();

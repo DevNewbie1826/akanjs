@@ -84,6 +84,7 @@ export const SubmitPhone = ({ className = "", userId, redirect, hash }: SubmitPh
   const phone = st.use.phone();
   return (
     <button
+      type="button"
       className={cn(buttonRecipe({ variant: "primary" }), className)}
       disabled={!isPhoneNumber(phone)}
       onClick={() => {
@@ -161,6 +162,7 @@ export const SubmitName = ({ userId, redirect, className }: SubmitNameProps) => 
   const userForm = st.use.userForm();
   return (
     <button
+      type="button"
       className={cn(buttonRecipe({ variant: "primary" }), className)}
       disabled={!userForm.name || userForm.name.length < 2}
       onClick={async () => {
@@ -222,6 +224,7 @@ export const GeneratePrepareUserWithAccountId = ({
   const accountId = st.use.accountId();
   return (
     <button
+      type="button"
       className={buttonRecipe({ variant: "primary" })}
       disabled={!accountId || !isEmail(accountId)}
       onClick={() => {
@@ -243,6 +246,7 @@ export const SubmitAccountId = ({ userId, redirect }: SubmitAccountIdProps) => {
   const accountId = st.use.accountId();
   return (
     <button
+      type="button"
       className={buttonRecipe({ variant: "primary" })}
       disabled={!accountId || !isEmail(accountId)}
       onClick={() => {
@@ -294,6 +298,7 @@ export const SubmitPassword = ({ userId, redirect }: SubmitPasswordProps) => {
   const passwordConfirm = st.use.passwordConfirm();
   return (
     <button
+      type="button"
       className={buttonRecipe({ variant: "primary" })}
       disabled={!accountId || !password || !passwordConfirm || password !== passwordConfirm}
       onClick={() => {
@@ -319,6 +324,7 @@ export const SubmitPolicy = ({
   const agreePolicies = st.use.agreePolicies();
   return (
     <button
+      type="button"
       className={buttonRecipe({ variant: "primary" })}
       disabled={!mandatoryPolicies.every((policy) => agreePolicies.includes(policy))}
       onClick={() => {
@@ -363,6 +369,7 @@ export const SubmitNicknameOfPrepareUser = ({ redirect, userId, className }: Sub
   const userForm = st.use.userForm();
   return (
     <button
+      type="button"
       className={cn(buttonRecipe({ variant: "default" }, "border-primary-light bg-primary-light"), className)}
       disabled={!userForm.nickname || userForm.nickname.length < 2 || userForm.nickname.length > 20}
       onClick={() => {
@@ -383,6 +390,7 @@ export const SubmitNickname = ({ redirect, className }: SubmitNicknameProps) => 
   const userForm = st.use.userForm();
   return (
     <button
+      type="button"
       className={cn(buttonRecipe({ variant: "default" }, "border-primary-light bg-primary-light"), className)}
       disabled={!userForm.nickname || userForm.nickname.length < 2 || userForm.nickname.length > 20}
       onClick={() => {
@@ -499,6 +507,7 @@ export const ActivateByAdmin = ({ userId, className }: ActivateByAdminProps) => 
   const { l } = usePage();
   return (
     <button
+      type="button"
       className={buttonRecipe({ variant: "primary" }, className)}
       onClick={() => {
         void st.do.activateUserByAdmin(userId);

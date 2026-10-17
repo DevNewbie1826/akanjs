@@ -89,6 +89,7 @@ export default function SureToRemove({
         bodyClassName="border-destructive"
         action={
           <button
+            type="button"
             className={buttonRecipe({ variant: "destructive" }, "w-full")}
             disabled={typeNameToRemove && repeatName !== name}
             onClick={async () => {

@@ -50,6 +50,7 @@ export const List = <Item,>({
               {renderItem(item, idx)}
               <div className="flex gap-2 border-border border-l pl-2">
                 <button
+                  type="button"
                   className={recipe(
                     { variant: "outline", size: "icon" },
                     "size-6 border-destructive p-0 text-destructive hover:bg-destructive hover:text-destructive-foreground",
@@ -66,6 +67,7 @@ export const List = <Item,>({
           </Fragment>
         ))}
         <button
+          type="button"
           className={recipe({ variant: "outline" })}
           onClick={() => {
             onAdd();
@@ -151,6 +153,7 @@ export const TextList = ({
                     disabled={disabled}
                   />
                   <button
+                    type="button"
                     className={recipe(
                       { variant: "outline", size: "icon" },
                       "size-6 border-destructive p-0 text-destructive hover:bg-destructive hover:text-destructive-foreground",
@@ -169,6 +172,7 @@ export const TextList = ({
         <div className="my-5 h-[0.5px] bg-foreground/20" />
         {texts.length < maxlength ? (
           <button
+            type="button"
             className={recipe({ variant: "outline" }, "w-full")}
             onClick={() => {
               onChange([...texts, ""]);

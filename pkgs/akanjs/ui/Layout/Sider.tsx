@@ -127,7 +127,7 @@ export const LeftSider = ({ className, children, open, width, close, onCancel }:
           }}
         >
           {close ?? (
-            <button className={buttonRecipe({ variant: "ghost", size: "icon" })}>
+            <button type="button" className={buttonRecipe({ variant: "ghost", size: "icon" })}>
               <BiX />
             </button>
           )}

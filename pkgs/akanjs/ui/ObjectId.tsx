@@ -26,7 +26,11 @@ export const ObjectId = ({ id }: ObjectIdProps) => {
       <Tooltip content={id} variant="primary">
         <div className="font-semibold text-xs">{shortenedId}</div>
       </Tooltip>
-      <button className={recipe({ variant: "ghost", size: "icon" }, "size-6 rounded-full")} onClick={handleCopyClick}>
+      <button
+        type="button"
+        className={recipe({ variant: "ghost", size: "icon" }, "size-6 rounded-full")}
+        onClick={handleCopyClick}
+      >
         {isCopied ? <AiOutlineCheck /> : <AiOutlineCopy />}
       </button>
     </div>

@@ -26,6 +26,7 @@ export const Clipboard = ({ text, className }: ClipboardProps): ReactElement => 
   };
   return (
     <button
+      type="button"
       onClick={async () => {
         await handleCopy();
       }}
