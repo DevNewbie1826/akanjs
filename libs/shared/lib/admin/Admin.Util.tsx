@@ -19,6 +19,7 @@ export const Auth = ({ logo, password, ssoTypes = [], redirect }: AuthProps) => 
   const ssoButtons: { [key in cnst.SsoType["value"]]: ReactNode } = {
     github: (
       <button
+        type="button"
         className={buttonRecipe(
           { variant: "default" },
           "relative flex h-11 w-full items-center border-none bg-black text-white shadow-sm",
@@ -30,6 +31,7 @@ export const Auth = ({ logo, password, ssoTypes = [], redirect }: AuthProps) => 
     ),
     google: (
       <button
+        type="button"
         className={buttonRecipe(
           { variant: "default" },
           "relative flex h-11 w-full items-center border border-border bg-white text-black shadow-sm",
@@ -41,6 +43,7 @@ export const Auth = ({ logo, password, ssoTypes = [], redirect }: AuthProps) => 
     ),
     facebook: (
       <button
+        type="button"
         className={buttonRecipe(
           { variant: "default" },
           "relative flex h-11 w-full items-center border-none bg-[var(--telegram)] text-white shadow-sm",
@@ -52,6 +55,7 @@ export const Auth = ({ logo, password, ssoTypes = [], redirect }: AuthProps) => 
     ),
     apple: (
       <button
+        type="button"
         className={buttonRecipe(
           { variant: "default" },
           "relative flex h-11 w-full items-center border-none bg-black text-white shadow-sm",
@@ -63,6 +67,7 @@ export const Auth = ({ logo, password, ssoTypes = [], redirect }: AuthProps) => 
     ),
     kakao: (
       <button
+        type="button"
         className={buttonRecipe(
           { variant: "default" },
           "relative flex h-11 w-full items-center border-none bg-[var(--kakao)] text-[var(--kakao-ink)] shadow-sm hover:text-white",
@@ -74,6 +79,7 @@ export const Auth = ({ logo, password, ssoTypes = [], redirect }: AuthProps) => 
     ),
     naver: (
       <button
+        type="button"
         className={buttonRecipe(
           { variant: "default" },
           "relative flex h-11 w-full items-center border-none bg-[var(--naver)] text-white shadow-sm hover:text-white",
@@ -120,6 +126,7 @@ export const Auth = ({ logo, password, ssoTypes = [], redirect }: AuthProps) => 
               />
             </label>
             <button
+              type="button"
               className="h-11 w-full rounded-field bg-white font-semibold text-black text-sm duration-200 hover:bg-white/85"
               onClick={() => void st.do.signinAdmin({ redirect })}
             >
@@ -195,6 +202,7 @@ export const ManageAdminRole = ({ className, id, roles }: ManageAdminRoleProps) 
   if (roles.includes("admin"))
     return (
       <button
+        type="button"
         className={buttonRecipe({ size: "sm", variant: "outline" }, className)}
         onClick={() => void st.do.subAdminRole(id, "admin")}
       >
@@ -204,6 +212,7 @@ export const ManageAdminRole = ({ className, id, roles }: ManageAdminRoleProps) 
   else
     return (
       <button
+        type="button"
         className={buttonRecipe({ size: "sm", variant: "warning" }, className)}
         onClick={() => void st.do.addAdminRole(id, "admin")}
       >
@@ -229,6 +238,7 @@ export const ManageSuperAdminRole = ({ className, id, roles }: ManageSuperAdminR
   if (roles.includes("superAdmin"))
     return (
       <button
+        type="button"
         className={buttonRecipe({ size: "sm", variant: "outline" }, className)}
         onClick={() => void st.do.subAdminRole(id, "superAdmin")}
       >
@@ -238,6 +248,7 @@ export const ManageSuperAdminRole = ({ className, id, roles }: ManageSuperAdminR
   else
     return (
       <button
+        type="button"
         className={buttonRecipe({ size: "sm", variant: "warning" }, className)}
         onClick={() => void st.do.addAdminRole(id, "superAdmin")}
       >
@@ -257,6 +268,7 @@ export const SetPassword = ({ className, id }: SetPasswordProps) => {
   return (
     <>
       <button
+        type="button"
         className={cn(buttonRecipe({ size: "sm", variant: "default" }), className)}
         onClick={() => {
           setPasswordState({ modalOpen: true, password: "" });
@@ -271,6 +283,7 @@ export const SetPassword = ({ className, id }: SetPasswordProps) => {
         }}
         action={
           <button
+            type="button"
             className={buttonRecipe({ variant: "primary" })}
             onClick={async () => {
               await st.do.setAdminPassword(id, passwordState.password);

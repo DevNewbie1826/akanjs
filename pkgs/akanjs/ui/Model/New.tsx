@@ -45,7 +45,7 @@ export default function New({
         draft={draft}
       >
         {trigger ?? (
-          <button className={buttonRecipe({ variant: "primary" })}>
+          <button type="button" className={buttonRecipe({ variant: "primary" })}>
             <AiOutlinePlus /> {l("base.new")}
           </button>
         )}

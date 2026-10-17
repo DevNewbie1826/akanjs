@@ -47,7 +47,12 @@ const EditAction = ({ modelName, label, onAct, closeView }: ActionProps) => {
     .desc(`Turn the open ${modelName} from its detail view into the edit form.`)
     .exec(onAct);
   return (
-    <button className={buttonRecipe({ variant: "primary" }, "w-full")} onClick={editModel} {...agentAttrs(editModel)}>
+    <button
+      type="button"
+      className={buttonRecipe({ variant: "primary" }, "w-full")}
+      onClick={editModel}
+      {...agentAttrs(editModel)}
+    >
       <AiOutlineEdit /> {label}
     </button>
   );
@@ -61,6 +66,7 @@ const SaveAction = ({ modelName, label, onAct, closeView }: ActionProps) => {
     .exec(onAct);
   return (
     <button
+      type="button"
       className={buttonRecipe({ variant: "primary" }, "w-full")}
       onClick={submitModel}
       {...agentAttrs(submitModel)}

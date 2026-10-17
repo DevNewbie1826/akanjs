@@ -12,6 +12,27 @@ beforeAll(async () => {
   ({ Input } = await import("./Input"));
 });
 
+describe("Input.Password", () => {
+  test("toggles visibility without submitting the form it sits in", () => {
+    let submits = 0;
+    const { container, unmount } = mount(
+      <form
+        onSubmit={(event) => {
+          event.preventDefault();
+          submits += 1;
+        }}
+      >
+        <Input.Password value="secret" onChange={() => undefined} validate={() => true} />
+      </form>,
+    );
+    const toggle = container.querySelector("button") as HTMLButtonElement;
+    act(() => toggle.click());
+    expect(container.querySelector("input")?.type).toBe("text");
+    expect(submits).toBe(0);
+    unmount();
+  });
+});
+
 describe("Input.TextArea", () => {
   test("attaches inputRef to the textarea instead of spreading it onto the DOM", () => {
     const inputRef = createRef<HTMLTextAreaElement>();

@@ -272,6 +272,7 @@ const DefaultPassword = ({
         />
         <div className="absolute top-1/2 right-2 flex -translate-y-1/2 items-center justify-center">
           <button
+            type="button"
             onClick={() => {
               setShowPassword(!showPassword);
             }}

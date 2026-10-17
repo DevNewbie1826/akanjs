@@ -184,6 +184,7 @@ const Item = ({
       {children}
       {removable && (
         <button
+          type="button"
           className={recipe({ variant: "outline", size: "xs" }, [
             "size-6 border-destructive p-0 text-destructive hover:bg-destructive hover:text-destructive-foreground",
             removeClassName,
