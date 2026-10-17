@@ -6,6 +6,13 @@ const externalTable: Array<[string, boolean]> = [
   ["HTTPS://example.com/x", true],
   ["Http://example.com/x", true],
   ["//example.com/x", true],
+  ["//", false],
+  ["///", false],
+  ["//?q", false],
+  ["//#h", false],
+  ["//[::1", false],
+  ["//bad%host/x", false],
+  ["//:80/x", false],
   ["mailto:a@b.co", true],
   ["MAILTO:a@b.co", true],
   ["tel:+82101234", true],
@@ -83,6 +90,12 @@ const toExternalUrlTable: Array<[string, string, string]> = [
   ["MAILTO:a@b.co", "app://localhost/en", "mailto:a@b.co"],
   ["kakaotalk://open", "app://localhost/en", "kakaotalk://open"],
   ["HTTPS://Example.com/x", "http://site.test/en/a", "https://example.com/x"],
+  ["https:example.com/x", "app://localhost/en/a", "https://example.com/x"],
+  ["HTTPS:example.com/x", "app://localhost/en/a", "https://example.com/x"],
+  ["https:/example.com/x", "app://localhost/en/a", "https://example.com/x"],
+  ["\thttps:example.com/x", "app://localhost/en/a", "https://example.com/x"],
+  ["http:example.com/x", "https://docs.example/base/", "http://example.com/x"],
+  ["https:example.com/x", "https://site.test/en/a", "https://site.test/en/example.com/x"],
 ];
 
 describe("Href.toExternalUrl", () => {
@@ -91,4 +104,19 @@ describe("Href.toExternalUrl", () => {
       expect(Href.toExternalUrl(href, base)).toBe(expected);
     });
   }
+});
+
+describe("Href without URL.canParse", () => {
+  test("classifies and resolves on engines without URL.canParse (iOS 16 Safari)", () => {
+    const canParse = URL.canParse;
+    Reflect.deleteProperty(URL, "canParse");
+    try {
+      expect(Href.isExternal("/faq")).toBe(false);
+      expect(Href.isExternal("HTTPS://x.test")).toBe(true);
+      expect(Href.isExternal("//x.test")).toBe(true);
+      expect(Href.toExternalUrl("//x.test/a", "app://localhost/")).toBe("https://x.test/a");
+    } finally {
+      Object.defineProperty(URL, "canParse", { value: canParse, writable: true, configurable: true });
+    }
+  });
 });

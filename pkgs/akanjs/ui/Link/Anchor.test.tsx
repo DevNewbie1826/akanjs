@@ -171,6 +171,36 @@ describe("CsrLink", () => {
     expect(opens).toEqual([]);
     unmount();
   });
+
+  test("resolves an external href against document.baseURI, honoring a <base> element", () => {
+    opens.length = 0;
+    pushes.length = 0;
+    const originalHref = window.location.href;
+    window.location.assign("http://page.test/cur");
+    const base = document.createElement("base");
+    base.setAttribute("href", "https://docs.example/base/");
+    document.head.appendChild(base);
+    try {
+      const { container, unmount } = mount(<CsrLink href="http:example.com/x">docs</CsrLink>);
+      click(container.querySelector("a"));
+      expect(opens).toEqual([["http://example.com/x", "_blank", "noopener,noreferrer"]]);
+      expect(pushes).toEqual([]);
+      unmount();
+    } finally {
+      base.remove();
+      window.location.assign(originalHref);
+    }
+  });
+
+  test("routes a hostless network path in-app instead of throwing", () => {
+    opens.length = 0;
+    pushes.length = 0;
+    const { container, unmount } = mount(<CsrLink href="//">hostless</CsrLink>);
+    expect(() => click(container.querySelector("a"))).not.toThrow();
+    expect(pushes).toEqual(["/en//"]);
+    expect(opens).toEqual([]);
+    unmount();
+  });
 });
 
 describe("Link", () => {
