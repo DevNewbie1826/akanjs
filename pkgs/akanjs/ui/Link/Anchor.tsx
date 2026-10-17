@@ -1,6 +1,6 @@
 "use client";
 import { getEnv } from "akanjs/base";
-import { cn, csrLocation, getPathInfo, router, usePage, usePathCtx } from "akanjs/client";
+import { cn, csrLocation, getPathInfo, Href, router, usePage, usePathCtx } from "akanjs/client";
 import { openExternalUrl } from "akanjs/client/native";
 import { Logger } from "akanjs/common";
 import { st } from "akanjs/store";
@@ -50,10 +50,12 @@ export const CsrLink = ({
       onClick={(event) => {
         props.onClick?.(event);
         if (event.defaultPrevented) return;
-        const isExternal = href.startsWith("http") || href.startsWith("mailto:") || href.startsWith("tel:");
+        const isExternal = Href.isExternal(href);
         const url = href.startsWith("#") ? `${csrLocation.pathname}#${hash}` : href;
-        if (isExternal) void openExternalUrl(href).catch(() => window.open(href, "_blank", "noopener,noreferrer"));
-        else if (replace) router.replace(url, { scrollToTop });
+        if (isExternal) {
+          const target = Href.toExternalUrl(href, window.location.href);
+          void openExternalUrl(target).catch(() => window.open(target, "_blank", "noopener,noreferrer"));
+        } else if (replace) router.replace(url, { scrollToTop });
         else router.push(url, { scrollToTop });
       }}
     >
@@ -78,7 +80,7 @@ export const SsrLink = ({
   const { lang } = usePage();
   const pathname = useCurrentPathname();
   const currentPath = getPathInfo(pathname, lang, prefix).path;
-  const isExternal = href.startsWith("http") || href.startsWith("mailto:") || href.startsWith("tel:");
+  const isExternal = Href.isExternal(href);
   const internalPathInfo = getPathInfo(href, lang, prefix);
   const requestHref = getEnv().operationMode === "local" ? internalPathInfo.href : getPathInfo(href, lang, "").href;
   const path = internalPathInfo.path;

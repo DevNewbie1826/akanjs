@@ -1,6 +1,7 @@
 import { getEnv } from "akanjs/base";
 import { getBasePathFromPathname, Logger, parseAkanI18nEnv, parseBasePaths, trimSlashes } from "akanjs/common";
 import { csrLocation } from "./csrLocation";
+import { Href } from "./href";
 import { isMcpView } from "./mcpView";
 
 export interface RouteOptions {
@@ -158,7 +159,8 @@ export const getPathInfo = (requestUrl: string, lang: string, prefix: string) =>
         ? pathWithSubRoute.slice(prefixLength)
         : pathWithSubRoute;
   const subRoute = prefix ? `/${prefix}` : "";
-  const pathname = path.startsWith("http") ? path : path === "/" ? `/${lang}${subRoute}` : `/${lang}${subRoute}${path}`;
+  //? Only explicit http(s) passes through; scheme-relative, backslash and script URLs stay /<lang> paths.
+  const pathname = Href.hasWebScheme(path) ? path : path === "/" ? `/${lang}${subRoute}` : `/${lang}${subRoute}${path}`;
   const href = `${pathname}${search ? `?${search}` : ""}${hash ? `#${hash}` : ""}`;
   return { path, pathname, hash, search, href };
 };

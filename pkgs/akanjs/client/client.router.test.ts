@@ -179,6 +179,11 @@ describe("router", () => {
     expect(getPathInfo("/en/admin", "en", "admin").path).toBe("/");
     expect(getPathInfo("/users", "ko", "").href).toBe("/ko/users");
     expect(getPathInfo("https://external.test/path", "en", "admin").pathname).toBe("https://external.test/path");
+    expect(getPathInfo("HTTPS://external.test/path", "en", "").href).toBe("HTTPS://external.test/path");
+    expect(getPathInfo("Http://external.test/p?q=1#h", "en", "").href).toBe("Http://external.test/p?q=1#h");
+    expect(getPathInfo("//evil.test/x", "en", "").href).toBe("/en//evil.test/x");
+    expect(getPathInfo("/\\evil.test/x", "en", "").href.startsWith("/en/")).toBe(true);
+    expect(getPathInfo("javascript:alert(1)", "en", "").href).toBe("/enjavascript:alert(1)");
     expect(getPathInfo("/en/officers", "en", "office").path).toBe("/officers");
     expect(getPathInfo("/officers?tab=a", "en", "office").href).toBe("/en/office/officers?tab=a");
     expect(getPathInfo("/en/office/officers", "en", "office").path).toBe("/officers");
