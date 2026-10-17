@@ -31,7 +31,7 @@ export const Card = ({ className, init }: CardProps) => {
         <div className="flex flex-col items-center gap-4 py-16 text-center">
           <div className="text-foreground/40 text-lg">{l("task.taskNoTasks")}</div>
           <Link href="/task/new">
-            <button className={jellyButtonRecipe({ variant: "primary", size: "sm" })}>
+            <button type="button" className={jellyButtonRecipe({ variant: "primary", size: "sm" })}>
               {l("task.taskCreateFirst")}
             </button>
           </Link>

@@ -20,7 +20,7 @@ interface StartProps {
 }
 
 export const Start = ({ taskId }: StartProps) => (
-  <button className={jellyButtonRecipe({ variant: "primary", size: "xs" })} onClick={() => st.do.startTask(taskId)}>
+  <button type="button" className={jellyButtonRecipe({ variant: "primary", size: "xs" })} onClick={() => st.do.startTask(taskId)}>
     {usePage().l("task.taskStart")}
   </button>
 );
@@ -30,7 +30,7 @@ interface CompleteProps {
 }
 
 export const Complete = ({ taskId }: CompleteProps) => (
-  <button className={jellyButtonRecipe({ variant: "success", size: "xs" })} onClick={() => st.do.completeTask(taskId)}>
+  <button type="button" className={jellyButtonRecipe({ variant: "success", size: "xs" })} onClick={() => st.do.completeTask(taskId)}>
     {usePage().l("task.taskComplete")}
   </button>
 );
@@ -41,7 +41,7 @@ interface RemoveProps {
 
 export const Remove = ({ taskId }: RemoveProps) => (
   <Model.Remove modelId={taskId} slice={fetch.slice.task}>
-    <button className={jellyButtonRecipe({ variant: "ghost", size: "xs" }, "text-destructive")}>
+    <button type="button" className={jellyButtonRecipe({ variant: "ghost", size: "xs" }, "text-destructive")}>
       {usePage().l("task.taskRemove")}
     </button>
   </Model.Remove>
@@ -63,16 +63,16 @@ export const Toolbox = ({ taskId, status }: ToolboxProps) => {
         <>
           {status === "todo" && (
             <li>
-              <button onClick={() => st.do.startTask(taskId)}>{l("task.taskStart")}</button>
+              <button type="button" onClick={() => st.do.startTask(taskId)}>{l("task.taskStart")}</button>
             </li>
           )}
           {status === "inProgress" && (
             <li>
-              <button onClick={() => st.do.completeTask(taskId)}>{l("task.taskComplete")}</button>
+              <button type="button" onClick={() => st.do.completeTask(taskId)}>{l("task.taskComplete")}</button>
             </li>
           )}
           <li>
-            <button className="text-destructive" onClick={() => st.do.removeTask(taskId)}>
+            <button type="button" className="text-destructive" onClick={() => st.do.removeTask(taskId)}>
               {l("task.taskRemove")}
             </button>
           </li>
@@ -93,7 +93,7 @@ export const Toolbox = ({ taskId, status }: ToolboxProps) => {
 // New Task Button: Model.NewWrapper — triggers new Task creation form
 // export const NewTask = () => (
 //   <Model.NewWrapper partial={{}}>
-//     <button className={jellyButtonRecipe({ variant: "primary", size: "sm" })}>+ New Task</button>
+//     <button type="button" className={jellyButtonRecipe({ variant: "primary", size: "sm" })}>+ New Task</button>
 //   </Model.NewWrapper>
 // );
 `,
