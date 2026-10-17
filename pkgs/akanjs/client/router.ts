@@ -159,7 +159,7 @@ export const getPathInfo = (requestUrl: string, lang: string, prefix: string) =>
         ? pathWithSubRoute.slice(prefixLength)
         : pathWithSubRoute;
   const subRoute = prefix ? `/${prefix}` : "";
-  //? Only an explicit http(s) scheme passes through; scheme-relative, backslash and script URLs stay /<lang> paths, so a caller-checked redirect cannot leave the site.
+  //? Only explicit http(s) passes through; scheme-relative, backslash and script URLs stay /<lang> paths.
   const pathname = Href.hasWebScheme(path) ? path : path === "/" ? `/${lang}${subRoute}` : `/${lang}${subRoute}${path}`;
   const href = `${pathname}${search ? `?${search}` : ""}${hash ? `#${hash}` : ""}`;
   return { path, pathname, hash, search, href };

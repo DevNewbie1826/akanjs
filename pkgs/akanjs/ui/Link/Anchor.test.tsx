@@ -79,6 +79,17 @@ describe("SsrLink", () => {
     });
   }
 
+  test("renders https:example.com/x unchanged and is not intercepted", () => {
+    pushes.length = 0;
+    const { container, unmount } = mount(<SsrLink href="https:example.com/x">docs</SsrLink>);
+    const anchor = container.querySelector("a");
+    expect(anchor?.getAttribute("href")).toBe("https:example.com/x");
+    const event = click(anchor);
+    expect(event.defaultPrevented).toBe(false);
+    expect(pushes).toEqual([]);
+    unmount();
+  });
+
   test("renders an in-app path under /<lang> and intercepts the click", () => {
     pushes.length = 0;
     const { container, unmount } = mount(<SsrLink href="/faq">faq</SsrLink>);
@@ -113,16 +124,30 @@ describe("CsrLink", () => {
   });
 
   for (const href of ["HTTPS://example.com/x", "//example.com/x"]) {
-    test(`opens ${JSON.stringify(href)} through window.open, not the router`, () => {
+    test(`opens ${JSON.stringify(href)} through window.open as an absolute URL, not the router`, () => {
       opens.length = 0;
       pushes.length = 0;
       const { container, unmount } = mount(<CsrLink href={href}>{href}</CsrLink>);
       click(container.querySelector("a"));
-      expect(opens).toEqual([[href, "_blank", "noopener,noreferrer"]]);
+      const target = new URL(href, window.location.href).href;
+      expect(target.startsWith("http")).toBe(true);
+      expect(opens).toEqual([[target, "_blank", "noopener,noreferrer"]]);
       expect(pushes).toEqual([]);
       unmount();
     });
   }
+
+  test("opens https:example.com/x through window.open, not the router", () => {
+    opens.length = 0;
+    pushes.length = 0;
+    const { container, unmount } = mount(<CsrLink href="https:example.com/x">docs</CsrLink>);
+    click(container.querySelector("a"));
+    const target = new URL("https:example.com/x", window.location.href).href;
+    expect(target.startsWith("http")).toBe(true);
+    expect(opens).toEqual([[target, "_blank", "noopener,noreferrer"]]);
+    expect(pushes).toEqual([]);
+    unmount();
+  });
 
   test("routes a script href in-app instead of opening it", () => {
     opens.length = 0;

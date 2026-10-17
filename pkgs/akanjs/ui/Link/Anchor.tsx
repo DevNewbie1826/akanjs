@@ -52,8 +52,10 @@ export const CsrLink = ({
         if (event.defaultPrevented) return;
         const isExternal = Href.isExternal(href);
         const url = href.startsWith("#") ? `${csrLocation.pathname}#${hash}` : href;
-        if (isExternal) void openExternalUrl(href).catch(() => window.open(href, "_blank", "noopener,noreferrer"));
-        else if (replace) router.replace(url, { scrollToTop });
+        if (isExternal) {
+          const target = Href.toExternalUrl(href, window.location.href);
+          void openExternalUrl(target).catch(() => window.open(target, "_blank", "noopener,noreferrer"));
+        } else if (replace) router.replace(url, { scrollToTop });
         else router.push(url, { scrollToTop });
       }}
     >
