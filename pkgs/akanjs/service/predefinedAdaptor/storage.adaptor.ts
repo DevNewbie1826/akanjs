@@ -1,4 +1,5 @@
 import { renameSync } from "node:fs";
+import { isAbsolute, parse, relative, resolve, sep } from "node:path";
 import { getApiPrefix, getEnv } from "akanjs/base";
 import { adapt } from "../adapt";
 
@@ -50,6 +51,13 @@ export interface StorageAdaptor {
   copyData(request: CopyRequest): Promise<string>;
   deleteData(url: string): Promise<boolean>;
   deleteDataByPath(path: string): Promise<boolean>;
+  /**
+   * Absolute path of a stored key on this machine's disk. `null` means the key is refused (rooted, NUL, or outside
+   * its root): reject the request, never fall back to `readData` for it. The method is absent on an adaptor that
+   * keeps no local files. Without `access`, a `private/` key resolves under the private root, so a caller serving
+   * an untrusted key passes `access: "public"`.
+   */
+  resolveLocalPath?(path: string, access?: "public" | "private"): string | null;
 }
 
 export interface BlobStorageOptions {
@@ -87,6 +95,17 @@ export class BlobStorage
   }
   #resolveFilePath(path: string) {
     return path.startsWith("private/") ? `${this.privateRoot}/${path}` : `${this.root}/${path}`;
+  }
+  resolveLocalPath(path: string, access?: "public" | "private") {
+    // A key is always joined under the root (`${root}/${path}`), so a rooted one (`/x`, `C:x`) names another file.
+    if (path.includes("\0") || parse(path).root) return null;
+    const isPrivate = access ? access === "private" : path.startsWith("private/");
+    const base = resolve(isPrivate ? this.privateRoot : this.root);
+    const target = resolve(base, path);
+    //? `relative` rather than a prefix check: it holds for either separator, so a Windows desktop server is covered.
+    const within = relative(base, target);
+    if (!within || within === ".." || within.startsWith(`..${sep}`) || isAbsolute(within)) return null;
+    return target;
   }
   async readData(path: string): Promise<ReadableStream> {
     const filePath = this.#resolveFilePath(path);

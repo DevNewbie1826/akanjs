@@ -651,13 +651,17 @@ export default page()
           en: (
             <>
               The default and the easiest to debug. Files land in <code>{"local/<app>/backend"}</code>, and{" "}
-              <code>localFile.getBlob</code> streams them back.
+              <code>localFile.getBlob</code> streams them back. For a key written through{" "}
+              <code>StorageAdaptorRole</code>, <code>resolveLocalPath(path, "public")</code> gives its disk path;{" "}
+              <code>null</code> means the key is refused, so answer 404 rather than fall back to <code>readData</code>.
             </>
           ),
           ko: (
             <>
               기본값이고 디버깅이 가장 쉽습니다. 파일은 <code>{"local/<app>/backend"}</code>에 쌓이고,{" "}
-              <code>localFile.getBlob</code>이 스트림으로 돌려줍니다.
+              <code>localFile.getBlob</code>이 스트림으로 돌려줍니다. <code>StorageAdaptorRole</code>로 쓴 키라면{" "}
+              <code>resolveLocalPath(path, "public")</code>이 디스크 경로를 줍니다. <code>null</code>은 거절된 키이므로
+              <code>readData</code>로 우회하지 말고 404로 답하세요.
             </>
           ),
         }),
@@ -669,13 +673,15 @@ export default page()
           en: (
             <>
               For production and shared access. Write an <code>adapt()</code> class that implements{" "}
-              <code>StorageAdaptor</code> and apply it in <code>lib/option.ts</code>.
+              <code>StorageAdaptor</code> and apply it in <code>lib/option.ts</code>. It leaves the optional{" "}
+              <code>resolveLocalPath</code> out, since its files are not on this disk.
             </>
           ),
           ko: (
             <>
               운영 환경과 여러 서버의 공유 접근에 맞습니다. <code>StorageAdaptor</code>를 구현한 <code>adapt()</code>{" "}
-              클래스를 만들어 <code>lib/option.ts</code>에 적용합니다.
+              클래스를 만들어 <code>lib/option.ts</code>에 적용합니다. 파일이 이 디스크에 없으므로 선택 메서드인{" "}
+              <code>resolveLocalPath</code>는 구현하지 않습니다.
             </>
           ),
         }),
