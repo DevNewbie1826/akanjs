@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import {
   Any,
   Binary,
+  type Dayjs,
   dayjs,
   ENDPOINT_META,
   ID,
@@ -18,6 +19,8 @@ import {
   adapt,
   CacheAdaptorRole,
   type DatabaseService,
+  EndpointCacheControl,
+  EndpointCacheKeys,
   getDefaultInjectRegistry,
   getDefaultLiveRegistry,
   type InjectRegistry,
@@ -304,18 +307,21 @@ const makeSignalContext = ({
 
 class FakeCacheAdaptor {
   readonly store = new Map<string, string>();
+  readonly expiries = new Map<string, Dayjs | undefined>();
   async get<T>(topic: string, key: string) {
     return this.store.get(`${topic}:${key}`) as T | undefined;
   }
-  async set(topic: string, key: string, value: string | number | Buffer) {
+  async set(topic: string, key: string, value: string | number | Buffer, option?: { expireAt?: Dayjs }) {
     this.store.set(`${topic}:${key}`, String(value));
+    this.expiries.set(`${topic}:${key}`, option?.expireAt);
   }
   async delete(topic: string, key: string) {
     this.store.delete(`${topic}:${key}`);
   }
-  async setIfAbsent(topic: string, key: string, value: string | number | Buffer) {
+  async setIfAbsent(topic: string, key: string, value: string | number | Buffer, option?: { expireAt?: Dayjs }) {
     if (this.store.has(`${topic}:${key}`)) return false;
     this.store.set(`${topic}:${key}`, String(value));
+    this.expiries.set(`${topic}:${key}`, option?.expireAt);
     return true;
   }
   async acquireLease(topic: string, key: string, owner: string) {
@@ -1122,6 +1128,94 @@ describe("SignalContext execution", () => {
     expect((await call(new Map())).status).toBe(403);
     expect(runs).toBe(1);
     expect(passes).toBe(3);
+  });
+
+  const livesAboutADay = (expireAt: Dayjs | undefined) =>
+    !!expireAt && Math.abs(expireAt.diff(dayjs()) - EndpointCacheKeys.generationTtlMs) < 60_000;
+
+  test("caps a cached answer at the generation's one-day life, however long the endpoint's TTL", async () => {
+    const info = buildEndpoint.query(String, { guards: [Public], cache: 7 * 86_400_000 }).exec(() => "week");
+    const cache = new FakeCacheAdaptor();
+    const context = makeSignalContext({ endpointInfo: info, registry: makeCacheRegistry(cache) });
+    await context.init();
+    await context.exec();
+
+    const entries = [...cache.expiries].filter(([key]) => key.startsWith(`${EndpointCacheKeys.topic}:`));
+    expect(entries).toHaveLength(1);
+    expect(livesAboutADay(entries[0]?.[1])).toBe(true);
+  });
+
+  test("drops an endpoint's cached answers before the TTL: every one, or the one for given args", async () => {
+    let runs = 0;
+    let holdNext = false;
+    let release = () => {};
+    let started = () => {};
+    const info = buildEndpoint
+      .query(String, { guards: [Public], cache: 60_000 })
+      .param("category", String)
+      .exec(async (category) => {
+        runs++;
+        const answer = `${category}-${runs}`;
+        if (holdNext) {
+          holdNext = false;
+          const held = new Promise<void>((resolve) => {
+            release = resolve;
+          });
+          started();
+          await held;
+        }
+        return answer;
+      });
+    const cache = new FakeCacheAdaptor();
+    const control = Object.assign(new EndpointCacheControl(), { cache });
+    const call = async (category: string) => {
+      const context = makeSignalContext({
+        endpointInfo: info,
+        request: makeHttpRequest({ params: { category } }),
+        registry: makeCacheRegistry(cache),
+      });
+      await context.init();
+      return await ((await context.exec()) as Response).json();
+    };
+
+    expect(await call("news")).toBe("news-1");
+    expect(await call("event")).toBe("event-2");
+    expect(await call("news")).toBe("news-1");
+    expect(livesAboutADay(cache.expiries.get("cacheGeneration:contextKey"))).toBe(true);
+
+    expect(await control.invalidate("contextKey", ["news"])).toBe(true);
+    expect(await call("news")).toBe("news-3");
+    expect(await call("event")).toBe("event-2");
+
+    expect(await control.invalidate("contextKey")).toBe(true);
+    expect(await call("news")).toBe("news-4");
+    expect(await call("event")).toBe("event-5");
+
+    holdNext = true;
+    const handlerStarted = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    const inFlight = call("sports");
+    await handlerStarted;
+    await control.invalidate("contextKey");
+    release();
+    expect(await inFlight).toBe("sports-6");
+    expect(await call("sports")).toBe("sports-7");
+
+    for (const key of cache.store.keys()) if (key.startsWith("cacheGeneration:")) cache.store.delete(key);
+    expect(await call("news")).toBe("news-8");
+
+    expect(await control.invalidate("noSuchEndpoint")).toBe(true);
+    expect(livesAboutADay(cache.expiries.get("cacheGeneration:noSuchEndpoint"))).toBe(true);
+
+    const broken = Object.assign(new EndpointCacheControl(), {
+      cache: {
+        set: async () => {
+          throw new Error("cache down");
+        },
+      },
+    });
+    expect(await broken.invalidate("contextKey")).toBe(false);
   });
 
   test("refuses a cache on a mutation and on a query that takes an internal argument", async () => {
