@@ -86,7 +86,7 @@ export class CascadeRunner {
 
   async #removeRef(edge: RefEdge, doc: Record<string, unknown>, seen: Set<string>) {
     const value = doc[edge.key];
-    const ids = (Array.isArray(value) ? value : [value]).filter(
+    const ids = [...new Set(Array.isArray(value) ? value : [value])].filter(
       (item): item is string => typeof item === "string" && !seen.has(`${edge.refName}:${item}`),
     );
     if (!ids.length) return;
@@ -96,7 +96,12 @@ export class CascadeRunner {
       return;
     }
     // Through the target's service, never its model: only that path runs the `_postRemove` side effects.
-    for (const id of ids) await service.__remove(id);
+    for (const id of ids) {
+      // Mark on removal, not up front: a repeat finds no live row, and a nested drain stops at a page of marked rows.
+      if (seen.has(`${edge.refName}:${id}`)) continue;
+      seen.add(`${edge.refName}:${id}`);
+      await service.__remove(id);
+    }
   }
 
   async #removeWith(edge: WithEdge, ownerRef: string, ownerId: string, seen: Set<string>) {
@@ -113,6 +118,7 @@ export class CascadeRunner {
       let removed = 0;
       for (const id of ids) {
         if (seen.has(`${edge.refName}:${id}`)) continue;
+        seen.add(`${edge.refName}:${id}`);
         await service.__remove(id);
         removed += 1;
       }
